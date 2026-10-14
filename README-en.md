@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.5.0**
+**Manuscript-driven video production · v2.5.1**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.5.0 provides seven workspaces:
+Version 2.5.1 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -124,6 +124,8 @@ Delete a manuscript project through **Project Management → select project → 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.5.1 documents the local subtitle timestamp model and synchronizes the independent repository release metadata.
 
 Version 2.5.0 adds Home, the bilingual NarraLens identity, new README files, and explicit upstream/license information. Prior project creation fixes and the persistent manual animation Add Node button remain in place.
 
