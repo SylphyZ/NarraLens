@@ -76,7 +76,14 @@ Configure services in Model Configuration. Filled fields do not verify connectiv
 
 Manuscript projects retain MiMo/Edge TTS support. The inherited Video Production workspace keeps its existing speech engines. Text and vision backups can use independent endpoints, credentials, and parameters.
 
-Local alignment uses a separate model environment. The current AMD ROCm setup exposes the GPU through the framework's cuda device interface. Opening Home does not load the alignment model. Disabling local alignment uses estimated text timing, which can introduce subtitle timing errors.
+### Subtitle timestamp model
+
+Long-form narration in the manuscript workflow uses [Qwen/Qwen3-ForcedAligner-0.6B-hf](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf) for local forced alignment. It takes synthesized speech and the corresponding manuscript, predicts spoken character/word boundaries, and maps them to subtitle timestamps. Chinese alignment primarily uses characters. The selected text/subtitle model plans semantic segmentation.
+
+- An independent worker loads the model only when unfinished blocks need alignment. Successful timestamp caches are reused; exiting the worker releases GPU resources.
+- Speech blocks longer than five minutes are located and split into alignment windows while retaining the existing speech audio.
+- Prepare a separate PyTorch/Transformers environment and local model weights. The current GPU worker uses BF16 and the cuda device interface; AMD GPUs require a working ROCm environment.
+- Local alignment is enabled by default. Turning it off keeps subtitles and estimates timing from audio duration and text weights, which can differ from actual speech.
 
 Explanatory animations use separately prepared Node, Remotion, and browser dependencies.
 
