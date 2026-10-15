@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.5.2**
+**Manuscript-driven video production · v2.5.3**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.5.2 provides seven workspaces:
+Version 2.5.3 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -124,6 +124,8 @@ Delete a manuscript project through **Project Management → select project → 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.5.3 allows chapter title animations from 2 seconds while flow and comparison animations require 4 seconds. The Production Workspace shows actual narration times and checks all manual nodes using the same duration rules as automatic planning.
 
 Version 2.5.2 fixes animation browser paths after directory moves, stores project-local browser paths relative to the Remotion directory, identifies missing runtime files, and removes unused .github configuration.
 

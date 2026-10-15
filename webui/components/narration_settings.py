@@ -23,7 +23,7 @@ from app.services.narration_task import (
 from app.services.narration_alignment import LEGACY_MODE, LONG_MODE
 from app.services.narration_bgm import bgm_libraries
 from app.services.narration_motion import (
-    TEMPLATES, PLACEMENTS, text_anchors, manual_motion_entries, manual_motion_ranges, motion_entry_from_animation,
+    TEMPLATES, PLACEMENTS, MIN_SECONDS, text_anchors, manual_motion_entries, inspect_manual_motion_ranges, motion_entry_from_animation,
 )
 from app.models.timeline import NarrationSegment
 from webui.components.library_settings import choose_library
@@ -326,6 +326,7 @@ def _render_manual_motion(tr, text, prefix):
         template = st.selectbox(tr("节点动画类型"), list(TEMPLATES),
             index=list(TEMPLATES).index(remembered_widget_value(stem + "_template", row.get("template", "chapter"))),
             format_func=lambda value: tr(TEMPLATES[value]), key=stem + "_template")
+        st.caption(tr("此模板最短时长：") + f"{MIN_SECONDS[template]} " + tr("秒；实际时间在配音完成后检查。"))
         mode = st.radio(tr("动画内容来源"), ("model", "manual"),
             index=("model", "manual").index(remembered_widget_value(stem + "_content_mode", row.get("content_mode", "model"))),
             format_func=lambda value: tr("模型概括固定范围") if value == "model" else tr("手工填写"), key=stem + "_content_mode")
@@ -385,18 +386,59 @@ def _render_manual_motion(tr, text, prefix):
             st.rerun()
         if prefix.startswith("narration_edit_"):
             directory = task_directory(prefix[len("narration_edit_"):])
-            signature = stable_hash((digest, draft))
-            if st.button(tr("查看当前范围的配音时间"), disabled=not bound, key=stem + "_timing"):
+            manifest = directory / "audio_manifest.json"
+            try:
+                revision = manifest.stat().st_mtime_ns
+            except OSError:
+                revision = None
+            signature = stable_hash((digest, draft, rows, revision))
+            current_col, all_col = st.columns(2)
+            check_current = current_col.button(tr("查看当前范围的配音时间"), disabled=not bound, key=stem + "_timing")
+            check_all = all_col.button(tr("检查全部节点"), disabled=not rows, key=prefix + "_motion_check_all")
+            st.caption(tr("全部检查包含已保存的节点草稿及当前所选节点的修改；新节点请先保存。"))
+            if check_current or check_all:
                 try:
-                    options = {"motion_enabled": True, "motion_placement": "manual", "motion_manual_entries": [{**draft, "enabled": True}]}
-                    ranges, method = manual_motion_ranges(_motion_segments(directory), text, directory, options)
-                    st.session_state[prefix + "_motion_time_preview"] = {"signature": signature, "start": ranges[0]["start"], "end": ranges[0]["end"], "method": method}
+                    if not manifest.is_file():
+                        raise ValueError(tr("配音完成后可检查实际时长；当前可以先保存节点草稿。"))
+                    current = draft if check_all else {**draft, "enabled": True}
+                    checking = [current if other["id"] == selected else other for other in rows]
+                    if check_current and selected is None:
+                        checking.append(current)
+                    options = {"motion_enabled": True, "motion_placement": "manual", "motion_manual_entries": checking}
+                    report = inspect_manual_motion_ranges(_motion_segments(directory), text, directory, options)
+                    if check_current:
+                        report["nodes"] = [node for node in report["nodes"] if node["id"] == draft["id"]]
+                    report.pop("ranges")
+                    st.session_state[prefix + "_motion_time_preview"] = {"signature": signature, "report": report, "all": check_all}
                 except (OSError, ValueError, KeyError, TypeError) as exc:
+                    st.session_state.pop(prefix + "_motion_time_preview", None)
                     st.warning(tr("配音时间尚不可用：") + str(exc))
             preview = st.session_state.get(prefix + "_motion_time_preview", {})
             if preview.get("signature") == signature:
-                st.caption(f"{preview['start']:.3f}–{preview['end']:.3f}s · " + tr({"aligned_words": "本地字词对齐", "text_estimate": "文字估时"}.get(preview["method"], "字幕插值")))
-                _motion_listen(tr, directory, preview["start"], preview["end"], stem + "_range_preview")
+                report = preview["report"]
+                st.caption(tr({"aligned_words": "本地字词对齐", "text_estimate": "文字估时"}.get(report["method"], "字幕插值")))
+                if report["nodes"]:
+                    st.dataframe([{
+                        tr("序号"): node["number"], tr("节点"): str(node["id"])[7:15],
+                        tr("类型"): node["template_name"],
+                        tr("原文"): node["text"],
+                        tr("开始（秒）"): round(node["start"], 3) if node["time_valid"] else None,
+                        tr("结束（秒）"): round(node["end"], 3) if node["time_valid"] else None,
+                        tr("时长（秒）"): round(node["end"]-node["start"], 3) if node["time_valid"] else None,
+                        tr("最短（秒）"): node["minimum_seconds"],
+                        tr("检查结果"): "；".join(node["issues"]) if node["issues"] else tr("通过"),
+                    } for node in report["nodes"]], hide_index=True, width="stretch")
+                    for node in report["nodes"]:
+                        if node["issues"]:
+                            st.warning(node["label"] + "：" + "；".join(node["issues"]))
+                    if not any(node["issues"] for node in report["nodes"]):
+                        st.success(tr("原文范围与配音时间检查通过。"))
+                    st.caption(tr("本次只检查原文与时间；动画内容仍在生成阶段校验。"))
+                    if not preview["all"] and report["nodes"][0]["time_valid"]:
+                        node = report["nodes"][0]
+                        _motion_listen(tr, directory, node["start"], node["end"], stem + "_range_preview")
+                else:
+                    st.info(tr("没有启用的手动节点。"))
         else:
             st.caption(tr("时间将在配音对齐后确定；模型概括内容可在方案预览中载入手工编辑。"))
     remember_widget_values(prefix)
