@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 
@@ -262,47 +263,193 @@ def _sentences(segments, text, directory, *, points=None, method=None):
                             "start": start, "end": end})
     return catalog, method
 
-def _content(row, template, by_id, *, sid=None, label=None):
+def _motion_error(issues):
+    error = ModelFormatError("动画格式校验未通过：\n" + "\n".join(dict.fromkeys(item["message"] for item in issues)))
+    error.issues = issues
+    return error
+
+
+def _merge_motion_content(previous, current, paths, by_id):
+    """Apply only failed content fields, retaining all other text and bindings."""
+    if not isinstance(current, dict):
+        raise ModelFormatError("纠错结果需要完整动画对象。")
+    if () in paths:
+        return deepcopy(current)
+    result = deepcopy(previous)
+    fields = {path[0] for path in paths if len(path) == 1}
+    for field in fields:
+        if field in current:
+            result[field] = deepcopy(current[field])
+        else:
+            result.pop(field, None)
+    if "items" not in fields:
+        indices = {path[1] for path in paths if len(path) > 1 and path[0] == "items"}
+        if indices:
+            old_items, new_items = previous.get("items"), current.get("items")
+            if not isinstance(new_items, list) or len(new_items) != len(old_items):
+                raise ModelFormatError("修正条目字段时请保留原条目数量及顺序。")
+            for index in indices:
+                allowed = {path[2] for path in paths if len(path) == 3 and path[:2] == ("items", index)}
+                old, new = old_items[index], new_items[index]
+                if ("items", index) in paths:
+                    result["items"][index] = deepcopy(new)
+                    continue
+                if not isinstance(new, dict):
+                    raise ModelFormatError(f"纠错第{index+1}条需要完整条目对象。")
+                for field in ("sentence_id", "column"):
+                    default = "left" if field == "column" else None
+                    if field not in allowed and new.get(field, default) != old.get(field, default):
+                        raise ModelFormatError(f"纠错第{index+1}条改变了已合格的{field}，请保留原绑定与所在侧。")
+                for field in allowed:
+                    if field in new:
+                        result["items"][index][field] = deepcopy(new[field])
+                    else:
+                        result["items"][index].pop(field, None)
+    if "items" in fields and not fields.intersection({"start_sentence", "end_sentence", "template"}):
+        original_ids = [previous.get(field) for field in ("start_sentence", "end_sentence")]
+        if all(isinstance(identifier, str) and identifier in by_id for identifier in original_ids):
+            order = {identifier: index for index, identifier in enumerate(by_id)}
+            old_items = previous.get("items") if isinstance(previous.get("items"), list) else []
+            original_ids += [item.get("sentence_id") for item in old_items if isinstance(item, dict)
+                             and isinstance(item.get("sentence_id"), str) and item["sentence_id"] in by_id
+                             and by_id[item["sentence_id"]].get("segment_id") == previous.get("segment_id")]
+            first, last = min(order[key] for key in original_ids), max(order[key] for key in original_ids)
+            for item in result.get("items", []) if isinstance(result.get("items"), list) else ():
+                key = item.get("sentence_id") if isinstance(item, dict) else None
+                if isinstance(key, str) and key in order and not first <= order[key] <= last:
+                    raise ModelFormatError("修正条目集合时不能扩大已合格的原文范围，请保留原范围内的分句绑定。")
+    return result
+
+
+def _motion_validator(validate, by_id, *, batch=False):
+    """One in-memory snapshot for a gateway call; cached validation stays stateless."""
+    previous, issues = None, []
+
+    def candidates(rows, *, allow_unbound=False):
+        # Match the planner's first valid candidate per segment. Keep the first
+        # invalid candidate only when that segment still needs correction.
+        selected, qualified = {}, set()
+        for index, row in enumerate(rows):
+            sid = row.get("segment_id") if isinstance(row, dict) else None
+            if not isinstance(sid, str):
+                if not allow_unbound:
+                    raise ModelFormatError("纠错动画缺少段落ID，无法可靠对应上一版。")
+                selected[("unbound", index)] = (index, row)
+                continue
+            if sid in qualified:
+                continue
+            try:
+                validate({"animations": [row]})
+            except ModelFormatError:
+                selected.setdefault(sid, (index, row))
+            else:
+                selected[sid] = (index, row)
+                qualified.add(sid)
+        return sorted(selected.values(), key=lambda pair: pair[0])
+
+    def check(value):
+        nonlocal previous, issues
+        candidate = value
+        try:
+            if previous is not None:
+                paths = [tuple(item["path"]) for item in issues]
+                if batch and "animations" in previous and ("animations",) not in paths and () not in paths:
+                    incoming = value.get("animations")
+                    if not isinstance(incoming, list):
+                        raise ModelFormatError("纠错结果需要完整animations数组。")
+                    replacements = {row["segment_id"]: row for _, row in candidates(incoming)}
+                    original_ids = {row["segment_id"] for row in previous["animations"]
+                                    if isinstance(row, dict) and isinstance(row.get("segment_id"), str)}
+                    merged, seen = [], set()
+                    for index, row in candidates(previous["animations"], allow_unbound=True):
+                        prefix = ("animations", index)
+                        allowed = [path[2:] for path in paths if path[:2] == prefix]
+                        if not allowed:
+                            merged.append(deepcopy(row))
+                            continue
+                        sid = row.get("segment_id") if isinstance(row, dict) else None
+                        matched = sid if isinstance(sid, str) and sid in replacements else None
+                        if matched is None and (() in allowed or ("segment_id",) in allowed):
+                            keys = [row.get(field) for field in ("start_sentence", "end_sentence")] if isinstance(row, dict) else []
+                            owners = {by_id[key]["segment_id"] for key in keys if isinstance(key, str) and key in by_id}
+                            choices = [key for key in replacements if key not in original_ids and key not in seen
+                                       and (not owners or key in owners)]
+                            if len(choices) == 1:
+                                matched = choices[0]
+                        if matched is None or matched in seen:
+                            raise ModelFormatError("纠错动画无法按原段落ID对应，请保留原段落ID与完整对象。")
+                        seen.add(matched)
+                        merged.append(_merge_motion_content(row, replacements[matched], allowed, by_id))
+                    candidate = {"animations": merged}
+                else:
+                    candidate = _merge_motion_content(previous, value, paths, by_id)
+        except ModelFormatError as exc:
+            error = _motion_error([*issues, {"path": [], "message": str(exc)}])
+            error.repair_context = {"previous": previous, "issues": error.issues,
+                                    "allowed_paths": [item["path"] for item in issues]}
+            raise error from None
+        try:
+            return validate(candidate)
+        except ModelFormatError as exc:
+            previous = deepcopy(candidate)
+            issues = getattr(exc, "issues", [{"path": [], "message": str(exc)}])
+            exc.repair_context = {"previous": previous, "issues": issues, "allowed_paths": [item["path"] for item in issues]}
+            raise
+
+    return check
+
+
+def _content(row, template, by_id, *, sid=None, label=None, issues=None, path=()):
     label = label or f"段落{sid}"
+    problems = [] if issues is None else issues
+    add = lambda field, message: problems.append({"path": [*path, *field], "message": f"{label}：{message}"})
     order = {identifier: index for index, identifier in enumerate(by_id)}
     result = {}
     for field, limit in (("title", 32 if template == "chapter" else 20), ("reason", 160), ("left_title", 8), ("right_title", 8)):
         content = row.get(field, "")
         if not isinstance(content, str) or len(re.sub(r"\s", "", content)) > limit or \
-                (field in {"title", "reason"} and not content.strip()):
-            raise ModelFormatError(f"{label}的{TEMPLATES[template]}字段{field}应为不超过{limit}字的有效字符串。")
-        result[field] = content.strip()
+                ((field in {"title", "reason"} or template == "compare") and not content.strip()):
+            add((field,), f"{TEMPLATES[template]}字段{field}应为不超过{limit}字的有效字符串。")
+        result[field] = content.strip() if isinstance(content, str) else ""
     items = row.get("items")
     if not isinstance(items, list):
-        raise ModelFormatError(f"{label}的{TEMPLATES[template]}需要items数组。")
+        add(("items",), f"{TEMPLATES[template]}需要items数组。")
     lower, upper = (0, 2) if template == "chapter" else (2, 4) if template == "flow" else (2, 6)
-    if not lower <= len(items) <= upper:
-        raise ModelFormatError(f"{label}的{TEMPLATES[template]}返回{len(items)}条，允许{lower}–{upper}条；"
-                               "请保留原文关键观点并重输本批完整animations。")
+    if isinstance(items, list) and not lower <= len(items) <= upper:
+        add(("items",), f"{TEMPLATES[template]}返回{len(items)}条，允许{lower}–{upper}条，请保留原文关键观点。")
     result["items"] = []
-    for index, item in enumerate(items):
-        if not isinstance(item, dict) or not isinstance(item.get("sentence_id"), str) or item["sentence_id"] not in by_id:
-            raise ModelFormatError(f"{label}第{index+1}条缺少给定原文分句ID，请使用本段给定sentence_id。")
-        if sid is not None and by_id[item["sentence_id"]]["segment_id"] != sid:
-            raise ModelFormatError(f"{label}第{index+1}条引用{item['sentence_id']}，属于其他段落，请改为本段真实ID。")
+    for index, item in enumerate(items if isinstance(items, list) else []):
+        item_path = ("items", index)
+        if not isinstance(item, dict):
+            add(item_path, f"第{index+1}条需要条目对象。")
+            continue
+        identifier = item.get("sentence_id")
+        bound = isinstance(identifier, str) and identifier in by_id
+        if not bound or (sid is not None and by_id[identifier]["segment_id"] != sid):
+            add((*item_path, "sentence_id"), f"第{index+1}条绑定{identifier!r}无效，请使用本段给定sentence_id。")
+            bound = False
         content = item.get("text")
         column = item.get("column", "left")
         if not isinstance(column, str) or column not in {"left", "right"}:
-            raise ModelFormatError(f"{label}第{index+1}条的column应为left或right。")
+            add((*item_path, "column"), f"第{index+1}条的column应为left或right。")
         if not isinstance(content, str) or not content.strip():
-            raise ModelFormatError(f"{label}第{index+1}条的text应为非空字符串。")
-        length = len(re.sub(r"\s", "", content))
-        limit = 32 if template == "chapter" else 10
-        if length > limit:
-            raise ModelFormatError(f"{label}第{index+1}条文字{content!r}长{length}字，{TEMPLATES[template]}最多{limit}字，"
-                                   "请概括该条标签并保留绑定ID。")
-        result["items"].append({"text": content.strip(), "sentence_id": item["sentence_id"], "column": column})
+            add((*item_path, "text"), f"第{index+1}条的text应为非空字符串。")
+        else:
+            length = len(re.sub(r"\s", "", content))
+            limit = 32 if template == "chapter" else 10
+            if length > limit:
+                add((*item_path, "text"), f"第{index+1}条文字{content!r}长{length}字，{TEMPLATES[template]}最多{limit}字，"
+                    f"请概括标签（建议6–8字）并保留绑定ID {identifier}。")
+        if bound:
+            result["items"].append({"text": content.strip() if isinstance(content, str) else "", "sentence_id": identifier, "column": column})
     result["items"].sort(key=lambda item: order[item["sentence_id"]])
-    if template == "compare":
-        counts = {column: sum(item["column"] == column for item in result["items"]) for column in ("left", "right")}
-        if any(not 1 <= count <= 3 for count in counts.values()) or not result["left_title"] or not result["right_title"]:
-            raise ModelFormatError(f"{label}的观点对照left={counts['left']}条、right={counts['right']}条，"
-                                   "每侧应有1–3条及有效标题；调整本段后重输完整animations。")
+    if template == "compare" and isinstance(items, list) and all(isinstance(item, dict) and
+            isinstance(item.get("column", "left"), str) and item.get("column", "left") in {"left", "right"} for item in items):
+        counts = {column: sum(item.get("column", "left") == column for item in items) for column in ("left", "right")}
+        if any(not 1 <= count <= 3 for count in counts.values()):
+            add(("items",), f"观点对照left={counts['left']}条、right={counts['right']}条，每侧应有1–3条，请保持原文绑定。")
+    if issues is None and problems:
+        raise _motion_error(problems)
     return result
 
 
@@ -314,31 +461,56 @@ def _page_plan(page, catalog, overview, options, gateway, directory):
 
     def validate(value):
         animations = value.get("animations")
-        if not isinstance(animations, list) or len(animations) > len(page) * 3:
-            raise ModelFormatError(f"animations应为候选列表，本批最多{len(page)*3}处；每段最终保留一处。")
+        issues = []
+        add = lambda path, message: issues.append({"path": list(path), "message": message})
+        if not isinstance(animations, list):
+            raise _motion_error([{"path": ["animations"], "message": "animations应为候选列表。"}])
+        if len(animations) > len(page) * 3:
+            add(("animations",), f"本批animations最多{len(page)*3}处；每段最终保留一处。")
         clean, seen = [], set()
-        for row in animations:
+        page_ids = {segment.id for segment in page}
+        for index, row in enumerate(animations):
+            path = ("animations", index)
             if not isinstance(row, dict):
-                raise ModelFormatError("解释动画条目应为对象。")
+                add(path, f"第{index+1}个动画应为对象。")
+                continue
             sid, template = row.get("segment_id"), row.get("template")
-            if any(not isinstance(row.get(field), str) for field in ("segment_id", "template", "start_sentence", "end_sentence")):
-                raise ModelFormatError("动画类型、段落和原文分句ID必须为字符串。")
-            first, last = by_id.get(row.get("start_sentence")), by_id.get(row.get("end_sentence"))
-            if sid in seen:
+            if isinstance(sid, str) and sid in seen:
                 logger.info("解释动画段落{}已有有效候选，省略后续{}候选；每段保留模型原顺序中的第一处。", sid, template)
                 continue
-            if template not in options["motion_templates"] or not first or not last or \
-                    first["segment_id"] != sid or last["segment_id"] != sid or order[first["id"]] > order[last["id"]]:
-                raise ModelFormatError(f"段落{sid}的{template}类型或原文范围{row['start_sentence']}–{row['end_sentence']}无效，"
-                                       "请使用本段给定ID，保持起止顺序，每段只允许一处。")
+            before = len(issues)
+            valid_sid = isinstance(sid, str) and sid in page_ids
+            valid_template = isinstance(template, str) and template in options["motion_templates"]
+            if not valid_sid:
+                add((*path, "segment_id"), f"动画段落{sid!r}无效，请使用本批给定段落ID。")
+            if not valid_template:
+                add((*path, "template"), f"段落{sid}的模板{template!r}无效，请使用allowed_templates。")
+            endpoints = []
+            for field in ("start_sentence", "end_sentence"):
+                key = row.get(field)
+                sentence = by_id.get(key) if isinstance(key, str) else None
+                if sentence is None or (valid_sid and sentence["segment_id"] != sid):
+                    add((*path, field), f"段落{sid}的{field}={key!r}无效，请使用本段真实分句ID。")
+                    sentence = None
+                endpoints.append(sentence)
+            first, last = endpoints
+            if not valid_template:
+                continue
+            content = _content(row, template, by_id, sid=sid if valid_sid else None, issues=issues, path=path)
+            if not valid_sid or not first or not last:
+                continue
+            if order[first["id"]] > order[last["id"]]:
+                for field in ("start_sentence", "end_sentence"):
+                    add((*path, field), f"段落{sid}原文范围倒序，请保持起止顺序。")
+                continue
             result = {"segment_id": sid, "template": template, "start_sentence": first["id"], "end_sentence": last["id"]}
-            result.update(_content(row, template, by_id, sid=sid))
+            result.update(content)
+            if not isinstance(row.get("items"), list) or len(content["items"]) != len(row["items"]):
+                continue
             minimum = MIN_SECONDS[template]
             anchors = [by_id[item["sentence_id"]] for item in result["items"]]
             if anchors:
-                # IDs, content and columns are already validated. Resolve the
-                # display interval from all actual anchors instead of rejecting
-                # a usable comparison because its independent range hint missed one.
+                # Known bindings resolve the interval independently of text errors.
                 first = min([first, *anchors], key=lambda sentence: order[sentence["id"]])
                 last = max([last, *anchors], key=lambda sentence: order[sentence["id"]])
                 if not minimum-.001 <= last["end"] - first["start"] <= maximum + .1:
@@ -348,10 +520,18 @@ def _page_plan(page, catalog, overview, options, gateway, directory):
             if not minimum-.001 <= seconds <= maximum + .1:
                 endings = [sentence["id"] for sentence in rows if sentence["segment_id"] == sid and
                            order[sentence["id"]] >= order[first["id"]] and minimum-.001 <= sentence["end"] - first["start"] <= maximum + .1][:8]
-                raise ModelFormatError(f"段落{sid}全部条目需要覆盖{first['id']}–{last['id']}，实际{seconds:.3f}秒，{TEMPLATES[template]}允许{minimum}–{maximum:.1f}秒。"
-                                       f"保持起点时可选结束ID：{endings}；请改选满足时长的节点和范围，每段只一处，重输完整animations。")
-            seen.add(sid)
-            clean.append(result)
+                for field in ("start_sentence", "end_sentence"):
+                    add((*path, field), f"段落{sid}全部条目需要覆盖{first['id']}–{last['id']}，实际{seconds:.3f}秒，{TEMPLATES[template]}允许{minimum}–{maximum:.1f}秒。"
+                        f"保持起点时可选结束ID：{endings}；请改选满足时长的原文范围。")
+                if anchors:
+                    add((*path, "items"), f"段落{sid}条目绑定的整体跨度不满足时长，请同步精简或重选items及sentence_id，"
+                        "所有绑定须位于新起止范围内，并遵守原模板的条目数和左右栏要求。")
+                    add((*path, "reason"), f"段落{sid}的reason须与修正后的条目和原文范围一致，保留真实原文依据。")
+            if len(issues) == before:
+                seen.add(sid)
+                clean.append(result)
+        if issues:
+            raise _motion_error(issues)
         clean.sort(key=lambda row: order[row["start_sentence"]])
         return {"animations": clean}
 
@@ -387,7 +567,8 @@ def _page_plan(page, catalog, overview, options, gateway, directory):
                 pass
     gateway.context.update(stage="规划解释动画", segment=page[0].id)
     return _cached_json(cache, key,
-        lambda: gateway.json(prompt, model_kind="text", max_output=5000, required={"animations": list}, result_validator=validate,
+        lambda: gateway.json(prompt, model_kind="text", max_output=5000, required={"animations": list},
+            result_validator=_motion_validator(validate, by_id, batch=True), format_repair=True,
             request_metadata={"scope": "manuscript_explanation_motion", "segment_ids": [s.id for s in page]}),
         required={"animations": list}, validator=validate)["animations"]
 
@@ -541,7 +722,8 @@ reason为简短说明，最多160字。column只能left或right，对照必须�
     gateway.context.update(stage="规划解释动画", segment=entry["id"])
     return _cached_json(Path(directory) / "motion" / "planning" / ("manual-" + key + ".json"), key,
         lambda: gateway.json(prompt, model_kind="text", max_output=5000, required={"title": str, "items": list},
-            result_validator=validator, request_metadata={"scope": "manuscript_manual_motion", "node_id": entry["id"],
+            result_validator=_motion_validator(validator, anchors), format_repair=True,
+            request_metadata={"scope": "manuscript_manual_motion", "node_id": entry["id"],
                 "text_start": entry["text_start"], "text_end": entry["text_end"], "template": entry["template"]}),
         required={"title": str, "items": list}, validator=validator)
 

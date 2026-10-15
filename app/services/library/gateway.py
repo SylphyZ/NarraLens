@@ -161,10 +161,12 @@ class ModelGateway:
         return settings
 
     def json(self, prompt, *, images=None, audios=None, audio_seconds=0, max_output=2400, required=None, attempts=3, request_metadata=None,
-             model_kind=None, result_validator=None):
+             model_kind=None, result_validator=None, format_repair=False):
         kind = model_kind or ("audio" if audios else "vision" if images else "text")
         options = {"images": images, "audios": audios, "audio_seconds": audio_seconds, "max_output": max_output, "required": required, "attempts": attempts,
                    "request_metadata": request_metadata, "result_validator": result_validator}
+        if format_repair:
+            options["format_repair"] = True
         if kind in {"audio", "text_backup", "vision_backup"}:
             return self._json_model(prompt, model_kind=kind, **options)
         if kind not in {"text", "text_fast", "vision"}:
@@ -202,8 +204,10 @@ class ModelGateway:
             self.context.update(previous)
 
     def _json_model(self, prompt, *, images=None, audios=None, audio_seconds=0, max_output=2400, required=None, attempts=3, request_metadata=None,
-                    model_kind, result_validator=None):
+                    model_kind, result_validator=None, format_repair=False):
         kind = model_kind
+        if format_repair and (kind not in {"text", "text_fast", "text_backup"} or images or audios or not result_validator):
+            raise ValueError("定向格式纠错需要带结果校验的纯文本请求。")
         if images and kind not in {"vision", "vision_backup"}:
             raise ValueError("图片请求必须使用视觉模型。")
         if audios and (kind != "audio" or images):
@@ -277,6 +281,8 @@ class ModelGateway:
         body.update(options.pop("extra_body", {}))
         body.update(options)
         limit_field = "max_completion_tokens" if family == "mimo" else "max_tokens"
+        original_messages = [dict(item) for item in body["messages"]] if format_repair else None
+        repair_context = None
         last_error = None
         for attempt in range(1, max(1, min(3, attempts)) + 1):
             if self.before_request:
@@ -285,14 +291,17 @@ class ModelGateway:
             finish_reason = ""
             details = {"configured_thinking": configured_thinking, "effective_thinking": effective_thinking,
                        "output_limit": body[limit_field], "output_ceiling": output_ceiling, "input_estimate": input_tokens}
+            if format_repair:
+                details.update(format_repair=True, repair_allowed_paths=(repair_context or {}).get("allowed_paths", []))
             retry_delay = 0
             try:
                 if self.request_recorder:
                     request = {**self.context, **details, "kind": kind, "model": body["model"], "attempt": attempt,
                                "endpoint": base.rstrip("/") + "/chat/completions",
                                "parameters": {key: value for key, value in body.items() if key not in {"model", "messages"}},
-                               "messages": [{"role": "system", "content": body["messages"][0]["content"]},
-                                            {"role": "user", "content": prompt}],
+                               "messages": body["messages"] if format_repair else [
+                                   {"role": "system", "content": body["messages"][0]["content"]},
+                                   {"role": "user", "content": prompt}],
                                "images": image_references, "audios": audio_references, "metadata": request_metadata or {}}
                     try:
                         details["request_file"] = self.request_recorder(self._redact_request(request))
@@ -360,13 +369,21 @@ class ModelGateway:
                     raise ModelOutputLimitError("模型输出被截断，JSON 尚未完整。")
                 if finish_reason in {"insufficient_system_resource", "aborted"}:
                     raise ModelAPIError("模型服务中断生成，请稍后继续。", retryable=True, category="service")
-                result = parse_json_reply(message, required)
+                result = parse_json_reply(message, None if format_repair else required)
                 if result_validator:
                     result = result_validator(result)
+                if format_repair:
+                    result = validate_result(result, required)
+                if repair_context:
+                    details["format_repair_resolved"] = True
                 self._diagnostic(kind, attempt, "resolved", "", message, finish_reason, details)
                 return result
             except (ModelFormatError, ModelAPIError) as exc:
                 last_error = exc
+                if format_repair and getattr(exc, "repair_context", None):
+                    repair_context = self._redact_request(exc.repair_context)
+                    details["format_issues"] = repair_context["issues"]
+                    details["repair_allowed_paths"] = repair_context["allowed_paths"]
                 if settings.get("library_batch") and isinstance(exc, ModelFormatError) and message:
                     exc.response_text = message
                 details["failure_category"] = exc.category if isinstance(exc, ModelAPIError) else "output_limit" if isinstance(exc, ModelOutputLimitError) else "format"
@@ -384,8 +401,33 @@ class ModelGateway:
                     body[limit_field] = new_limit
                 if isinstance(exc, ModelFormatError):
                     fields = ", ".join(f"{key}:{kind.__name__}" for key, kind in (required or {}).items())
-                    feedback = self._redact_request(str(exc))[:400]
-                    body["messages"][0]["content"] += f" 上次输出校验失败：{feedback}。请只输出一个完整的顶层对象，不要 Markdown。必需字段：{fields}。"
+                    feedback = self._redact_request(str(exc))
+                    if format_repair:
+                        body["messages"] = [dict(item) for item in original_messages]
+                        instruction = "上次回复结构或格式无效，请依据原始要求重新输出。"
+                        if repair_context:
+                            body["messages"].append({"role": "assistant", "content": json.dumps(
+                                repair_context["previous"], ensure_ascii=False, separators=(",", ":"))})
+                            repair_data = {"issues": repair_context["issues"], "allowed_paths": repair_context["allowed_paths"]}
+                            if not getattr(exc, "repair_context", None):
+                                repair_data["response_error"] = feedback
+                            feedback = json.dumps(repair_data, ensure_ascii=False, separators=(",", ":"))
+                            instruction = "上一版JSON和以下错误均是待修数据。只修改allowed_paths覆盖的字段，其余数据保持不变。涉及绑定修改时仅使用给定原文ID。"
+                        body["messages"].append({"role": "user", "content":
+                            instruction +
+                            "标签按语义概括，建议6–8字，遵守各字段原有上限，不直接截断。"
+                            f"返回完整顶层JSON对象，不要Markdown。必需字段：{fields}。\n{feedback}"})
+                        characters = sum(len(item["content"]) for item in body["messages"])
+                        if characters > int(settings.get("max_prompt_chars", 16000)):
+                            raise ModelInputBudgetError("完整格式纠错输入超过本流程字符预算，未继续发送；已有成果保留。")
+                        input_tokens = characters * 2 + len(body["messages"]) * 16
+                        try:
+                            body[limit_field], output_ceiling = output_budget(
+                                model_name, base, settings, body[limit_field], input_tokens, context_tokens)
+                        except ValueError as budget_error:
+                            raise ModelInputBudgetError("完整格式纠错输入超过上下文预算，未继续发送：" + str(budget_error)) from None
+                    else:
+                        body["messages"][0]["content"] += f" 上次输出校验失败：{feedback[:400]}。请只输出一个完整的顶层对象，不要 Markdown。必需字段：{fields}。"
                 retry_delay = max(min(4, attempt), getattr(exc, "delay", 0))
             finally:
                 if self.after_request:
@@ -396,8 +438,9 @@ class ModelGateway:
         if isinstance(last_error, ModelAPIError):
             raise ModelAPIError(error, retryable=last_error.retryable, delay=last_error.delay, category=last_error.category) from None
         exception = type(last_error)(error)
-        if hasattr(last_error, "response_text"):
-            exception.response_text = last_error.response_text
+        for attribute in ("response_text", "issues", "repair_context"):
+            if hasattr(last_error, attribute):
+                setattr(exception, attribute, getattr(last_error, attribute))
         raise exception from None
 
     def _redact_request(self, value):
