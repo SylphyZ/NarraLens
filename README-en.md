@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.5.1**
+**Manuscript-driven video production · v2.5.2**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.5.1 provides seven workspaces:
+Version 2.5.2 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -124,6 +124,8 @@ Delete a manuscript project through **Project Management → select project → 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.5.2 fixes animation browser paths after directory moves, stores project-local browser paths relative to the Remotion directory, identifies missing runtime files, and removes unused .github configuration.
 
 Version 2.5.1 documents the local subtitle timestamp model and synchronizes the independent repository release metadata.
 

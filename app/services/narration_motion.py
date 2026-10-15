@@ -79,8 +79,14 @@ def _runtime():
     record = read_json(REMOTION / ".cache" / "runtime.json", default={})
     node = Path(os.environ.get("NARRATO_NODE_BINARY") or PROJECT.parent / ".tools" / "node" / "node.exe")
     browser = Path(record.get("browser") or REMOTION / ".cache" / "missing-browser")
-    if not node.is_file() or not browser.is_file() or not (REMOTION / "node_modules" / "@remotion" / "renderer" / "package.json").is_file():
-        raise ValueError("本地解释动画环境未就绪，请按docs/2.0解释动画施工方案.md安装Node、Remotion及浏览器。")
+    if not browser.is_absolute():
+        browser = REMOTION / browser
+    required = {"Node": node, "动画浏览器": browser,
+                "Remotion依赖": REMOTION / "node_modules" / "@remotion" / "renderer" / "package.json"}
+    missing = [f"{label}：{path}" for label, path in required.items() if not path.is_file()]
+    if missing:
+        raise ValueError("本地解释动画环境缺少文件：\n" + "\n".join(missing) +
+                         "\n请核对已安装的Node、浏览器位置与Remotion依赖。")
     return node, browser
 
 
