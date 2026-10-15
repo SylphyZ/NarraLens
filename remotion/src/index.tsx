@@ -52,31 +52,52 @@ const Explanation: React.FC<Props> = (props) => {
   }, [fontHandle, props.fontData]);
 
   const bottom = props.showSubtitles
-    ? Math.min(height * .65, Math.max(height * .18, props.subtitleFontSize * 2 + height * .08))
+    ? Math.max(height * .18, props.subtitleFontSize * 2 + height * .08)
     : height * .07;
   const padding = width * .06;
-  const available = height - bottom - height * .08;
-  const titleHeight = Math.min(available * .24, height * .16);
-  const bodyHeight = available - titleHeight - height * .05;
-  const rows = portrait ? props.items.length : Math.ceil(props.items.length / 2);
+  const contentWidth = width - padding * 2;
+  const contentTop = height * .08;
+  const progressHeight = Math.max(3, height * .003);
+  const progressTop = height - bottom - progressHeight;
+  // Cards end before a separate progress row; subtitle space is never shared.
+  const available = progressTop - height * .025 - contentTop;
+  if (!Number.isFinite(available) || available < height * .22) {
+    throw new Error('字幕字号过大，解释动画没有足够空间；请减小字幕字号或关闭解释动画。');
+  }
+  const titleHeight = Math.min(available * .22, height * .14);
+  const titleGap = Math.min(height * .035, available * .06);
+  const bodyHeight = available - titleHeight - titleGap;
+  const rows = Math.max(1, portrait ? props.items.length : Math.ceil(props.items.length / 2));
   const gap = Math.min(height * .035, bodyHeight * .04);
-  const cardPadding = Math.min(32, bodyHeight * .035);
+  const cardHeight = (bodyHeight - (rows - 1) * gap) / rows;
+  const cardPadding = Math.min(28, cardHeight * .12);
+  const numberGap = Math.min(12, cardHeight * .04);
+  const boxes = props.items.map((_, index) => {
+    const fullWidth = portrait || (props.items.length === 3 && index === 2);
+    const row = portrait ? index : Math.floor(index / 2);
+    const column = !portrait && props.items.length === 4 && index >= 2 ? 3 - index : index % 2;
+    const cardWidth = fullWidth ? contentWidth : (contentWidth - gap) / 2;
+    return {left: fullWidth ? 0 : column * (cardWidth + gap), top: row * (cardHeight + gap),
+      width: cardWidth, height: cardHeight};
+  });
   const comparisonRows = Math.max(1, ...(['left', 'right'] as const).map((column) =>
     props.items.filter((item) => item.column === column).length));
   const panelGap = Math.min(22, bodyHeight * .02);
   const panelHeight = portrait ? (bodyHeight - gap) / 2 : bodyHeight;
-  const comparisonFontSize = (panelHeight - cardPadding * 2 - comparisonRows * panelGap)
+  const comparisonPadding = Math.min(28, panelHeight * .08);
+  const comparisonFontSize = (panelHeight - comparisonPadding * 2 - comparisonRows * panelGap)
     / ((comparisonRows + .8) * 1.3);
   const fontSize = Math.min(portrait ? 74 : 68,
     props.template === 'compare' ? comparisonFontSize
-      : bodyHeight / (props.template === 'flow' ? Math.max(1, rows) * 3.3 : 3.3));
+      : props.template === 'flow' ? (cardHeight - cardPadding * 2 - numberGap - 4 - Math.min(12, gap * .2) * 2) / 2
+        : available / 3.3);
   const opacity = interpolate(frame, [0, 7, durationInFrames - 8, durationInFrames - 1],
     [0, 1, 1, 0], {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'});
   const entrance = (at: number) => spring({frame: frame - at, fps, config: {damping: 22, stiffness: 130}});
   const itemStyle = (item: Item): React.CSSProperties => ({
     opacity: interpolate(frame - item.atFrame, [0, 7], [0, 1],
       {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}),
-    transform: `translateY(${(1 - entrance(item.atFrame)) * 20}px)`,
+    transform: `translateY(${(1 - Math.min(1, entrance(item.atFrame))) * Math.min(12, gap * .2)}px)`,
   });
   const line = (text: string, room: number, preferred: number, lines = 1): React.CSSProperties => ({
     fontSize: textSize(text, room * lines, preferred), whiteSpace: lines === 1 ? 'nowrap' : 'normal',
@@ -88,7 +109,7 @@ const Explanation: React.FC<Props> = (props) => {
     fontFamily: 'NarratoMotion, "Microsoft YaHei", sans-serif'}}>
     <div style={{position: 'absolute', top: height * .04, left: padding,
       width: 90, height: 6, backgroundColor: props.accent}} />
-    <div style={{position: 'absolute', top: height * .08, left: padding, right: padding,
+    <div style={{position: 'absolute', top: contentTop, left: padding, right: padding,
       height: available, opacity, display: 'flex', flexDirection: 'column'}}>
       {props.template === 'chapter'
         ? <div style={{margin: 'auto 0'}}>
@@ -104,39 +125,49 @@ const Explanation: React.FC<Props> = (props) => {
         </div>
         : <>
           <div style={{height: titleHeight, flexShrink: 0,
-            ...line(props.title, width - padding * 2, Math.min(portrait ? 84 : 88, titleHeight * .65)), fontWeight: 700}}>{props.title}</div>
+            marginBottom: titleGap,
+            ...line(props.title, contentWidth, Math.min(portrait ? 84 : 88, titleHeight * .65)), fontWeight: 700}}>{props.title}</div>
           {props.template === 'flow'
-            ? <div style={{display: 'grid', gap, flex: 1, minHeight: 0,
-              gridTemplateColumns: portrait ? '1fr' : '1fr 1fr',
-              gridAutoRows: '1fr'}}>
-              {props.items.map((item, index) => <div key={index} style={{...itemStyle(item),
+            ? <div style={{position: 'relative', height: bodyHeight, flexShrink: 0}}>
+              {props.items.map((item, index) => <div key={index} style={{...boxes[index],
+                opacity: itemStyle(item).opacity, boxSizing: 'border-box',
                 border: `2px solid ${props.accent}70`, borderRadius: 22, backgroundColor: '#152233',
-                position: 'relative', padding: cardPadding, display: 'flex', flexDirection: 'column', justifyContent: 'center',
-                gridColumn: !portrait && props.items.length === 3 && index === 2 ? '1 / -1'
-                  : !portrait && props.items.length === 4 && index >= 2 ? (index === 2 ? 2 : 1) : undefined,
-                gridRow: !portrait && props.items.length === 4 && index >= 2 ? 2 : undefined}}>
-                <div style={{color: props.accent, fontSize: fontSize * .52, marginBottom: Math.min(12, bodyHeight * .02)}}>{String(index + 1).padStart(2, '0')}</div>
-                <div style={line(item.text, (width - padding * 2) / (portrait || (props.items.length === 3 && index === 2) ? 1 : 2) - 90,
-                  fontSize)}>{item.text}</div>
-                {index < props.items.length - 1 && <div style={{position: 'absolute', color: props.accent,
-                  fontSize: Math.min(fontSize * .5, gap * .8), zIndex: 1,
-                  opacity: interpolate(frame - props.items[index + 1].atFrame, [0, 7], [0, 1],
-                    {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}),
-                  ...(portrait || index % 2 === 1
-                    ? {left: '50%', bottom: -gap / 2, transform: 'translate(-50%, 50%)'}
-                    : index === 2 ? {left: -gap / 2, top: '50%', transform: 'translate(-50%, -50%)'}
-                      : {right: -gap / 2, top: '50%', transform: 'translate(50%, -50%)'})}}>
-                  {portrait || index % 2 === 1 ? '↓' : index === 2 ? '←' : '→'}
-                </div>}
+                position: 'absolute', padding: cardPadding, display: 'flex', justifyContent: 'center', flexDirection: 'column'}}>
+                <div style={{transform: itemStyle(item).transform}}>
+                  <div style={{color: props.accent, fontSize: fontSize * .52, lineHeight: 1.3, marginBottom: numberGap}}>{String(index + 1).padStart(2, '0')}</div>
+                  <div style={line(item.text, boxes[index].width - cardPadding * 2 - 4, fontSize)}>{item.text}</div>
+                </div>
               </div>)}
+              <svg width={contentWidth} height={bodyHeight} style={{position: 'absolute', inset: 0, pointerEvents: 'none'}}>
+                {boxes.slice(0, -1).map((box, index) => {
+                  const next = boxes[index + 1];
+                  const vertical = next.top > box.top;
+                  const direction = vertical || next.left > box.left ? 1 : -1;
+                  const x = box.left + box.width / 2;
+                  const y = box.top + box.height / 2;
+                  const x1 = vertical ? x : direction > 0 ? box.left + box.width + gap * .22 : box.left - gap * .22;
+                  const x2 = vertical ? x : direction > 0 ? next.left - gap * .22 : next.left + next.width + gap * .22;
+                  const y1 = vertical ? box.top + box.height + gap * .22 : y;
+                  const y2 = vertical ? next.top - gap * .22 : y;
+                  const head = Math.min(8, gap * .18);
+                  const tip = vertical ? `${x2-head},${y2-head} ${x2},${y2} ${x2+head},${y2-head}`
+                    : `${x2-direction*head},${y2-head} ${x2},${y2} ${x2-direction*head},${y2+head}`;
+                  return <g key={index} stroke={props.accent} strokeWidth={Math.min(2, gap * .08)} fill="none"
+                    opacity={itemStyle(props.items[index + 1]).opacity}>
+                    <line x1={x1} y1={y1} x2={x2} y2={y2} />
+                    <polyline points={tip} />
+                  </g>;
+                })}
+              </svg>
             </div>
-            : <div style={{display: 'grid', flex: 1, minHeight: 0, gap,
-              gridTemplateColumns: portrait ? '1fr' : '1fr 1fr'}}>
+            : <div style={{display: 'grid', height: bodyHeight, flexShrink: 0, gap,
+              gridTemplateColumns: portrait ? '1fr' : '1fr 1fr',
+              gridTemplateRows: portrait ? 'repeat(2, minmax(0, 1fr))' : 'minmax(0, 1fr)'}}>
               {(['left', 'right'] as const).map((column) => {
                 const heading = column === 'left' ? props.leftTitle : props.rightTitle;
-                const room = (width - padding * 2) / (portrait ? 1 : 2) - 80;
+                const room = (portrait ? contentWidth : (contentWidth - gap) / 2) - comparisonPadding * 2;
                 return <div key={column} style={{backgroundColor: '#152233', borderRadius: 22,
-                  padding: cardPadding, display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: panelGap}}>
+                  boxSizing: 'border-box', padding: comparisonPadding, display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: panelGap}}>
                   <div style={{...line(heading, room, fontSize * .8), color: props.accent}}>{heading}</div>
                   {props.items.filter((item) => item.column === column).map((item, index) =>
                     <div key={index} style={{...itemStyle(item), ...line(item.text, room, fontSize)}}>{item.text}</div>)}
@@ -146,7 +177,7 @@ const Explanation: React.FC<Props> = (props) => {
         </>}
     </div>
     <div style={{position: 'absolute', left: padding, right: padding,
-      bottom: bottom + height * .02, height: 3, backgroundColor: '#263447'}}>
+      top: progressTop, height: progressHeight, backgroundColor: '#263447'}}>
       <div style={{height: '100%', width: `${100 * frame / Math.max(1, durationInFrames - 1)}%`, backgroundColor: props.accent}} />
     </div>
   </AbsoluteFill>;

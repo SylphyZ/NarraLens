@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.5.4**
+**Manuscript-driven video production · v2.6.0**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.5.4 provides seven workspaces:
+Version 2.6.0 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -119,11 +119,15 @@ Moving or deleting originals affects later reads. Update registrations or use th
 
 Use the general continue action or numbered stages 1–5. Each stage validates its prerequisites and can reuse matching saved output. Use the workspace copy actions to apply changes to existing speech, subtitles, animations, or music.
 
+After upgrading to 2.6, resume old timelines from **3. Find footage** to apply the new selection policy, reusing narration, captions, and alignment. The previous video and timeline are retained under the project's `history/visual-*` directory. Disabling visual relevance confirmation still requires a vision model for the independent credits/usability check.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.6.0 prohibits reuse of the same source shot within one output using content fingerprints and detected cut boundaries, expands retrieval when footage runs short, and checks actual source ranges to exclude credits, mixed footage, and uncertain results. Range checks are cached. Animation cards, arrows, progress, and subtitle space use separate layout regions. Visual near-duplicates across episodes or differently encoded files are not detected; sampled-frame checks also depend on model accuracy.
 
 Version 2.5.4 reports animation format issues together and uses the previous JSON to repair failed fields while retaining valid content and original-text bindings. Correction messages are recorded and included in input budgets.
 
