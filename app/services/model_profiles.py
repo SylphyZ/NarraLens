@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from math import isfinite
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 import re
@@ -22,18 +23,44 @@ TTS_GROUPS = {"mimo_tts": "mimo_tts", "edge_tts": "", "azure_speech": "azure", "
               "qwen3_tts": "tts_qwen", "soulvoice": "soulvoice", "doubaotts": "doubaotts", "indextts": "indextts",
               "indextts_macos": "indextts_macos", "indextts2": "indextts2", "omnivoice": "omnivoice",
               "voxcpm_05b": "voxcpm_05b", "voxcpm_2b": "voxcpm_2b"}
-_PRIVATE = {"key", "api_key", "secret_key", "secret_id", "token", "access_token", "speech_key", "ak", "sk"}
+_PRIVATE = {"key", "api_key", "apikey", "secret_key", "secret_id", "token", "access_token", "speech_key", "ak", "sk",
+            "password", "authorization", "headers", "cookies", "subscription_key", "client_secret", "x_api_key"}
+_PRIVATE_COMPACT = {name.replace("_", "") for name in _PRIVATE}
 _ID = re.compile(r"[a-zA-Z0-9_-]{1,100}\Z")
 _lock = threading.RLock()
 _runtime = ContextVar("narrato_model_runtime", default=None)
 
 
+def _private_key(key):
+    name = str(key).lower().replace("-", "_")
+    return name.replace("_", "") in _PRIVATE_COMPACT or name.endswith(("_api_key", "_secret", "_token", "_password"))
+
+
 def public_values(value):
     if isinstance(value, dict):
-        return {k: public_values(v) for k, v in value.items() if k not in _PRIVATE and k != "proxy"}
+        return {k: public_values(v) for k, v in value.items() if not _private_key(k) and k != "proxy"}
     if isinstance(value, list):
         return [public_values(v) for v in value]
     return deepcopy(value)
+
+
+def with_private_values(value, active):
+    """Overlay credentials recursively without replacing saved public parameters."""
+    if isinstance(active, list):
+        if public_values(value) != public_values(active):
+            raise ValueError("含凭据的参数列表结构已改变，请保留其公开结构或新建配置。")
+        return [with_private_values(old, new) if isinstance(new, (dict, list)) else deepcopy(old) for old, new in zip(value, active)]
+    result = deepcopy(value)
+    for key, item in active.items():
+        if _private_key(key):
+            result[key] = deepcopy(item)
+        elif isinstance(item, dict):
+            nested = with_private_values(result.get(key, {}) if isinstance(result.get(key), dict) else {}, item)
+            if nested:
+                result[key] = nested
+        elif isinstance(item, list) and public_values(item) != item:
+            result[key] = with_private_values(result.get(key, []), item)
+    return result
 
 
 def legacy_catalog():
@@ -396,11 +423,121 @@ def tts_profile(identifier=None, *, engine=None, historical=False):
         settings.update(model=row["model"], base_url=row["base"], api_key=row["key"])
     elif row["engine"] == "qwen3_tts":
         settings.update(model_name=row["model"], api_key=row["key"])
+        if row["base"]:
+            settings["api_url"] = row["base"]
     elif "api_url" in settings or row["base"]:
         settings["api_url"] = row["base"]
     if row["engine"] not in {"edge_tts", "mimo_tts", "qwen3_tts"} and row["key"]:
         settings["api_key"] = row["key"]
-    return {"engine": row["engine"], "settings": settings, "proxy": deepcopy(config.proxy)}
+    if row["engine"] == "soulvoice":
+        settings["model"] = row["model"]
+    return {"engine": row["engine"], "settings": settings, "proxy": deepcopy(config.proxy),
+            "profile_id": row["id"], "model": row["model"], "base_url": row["base"]}
+
+
+def validate_narration_voice(profile, *, require_credentials=True):
+    """Shared, local-only checks for a manuscript project's saved speech choice."""
+    if not isinstance(profile, dict) or profile.get("engine") not in TTS_GROUPS:
+        raise ValueError("请选择已接入的配音服务配置。")
+    if profile.get("schema") == 1:
+        if not isinstance(profile.get("settings"), dict):
+            raise ValueError("配音服务快照不完整。")
+        for address in (profile.get("base_url"), profile["settings"].get("api_url"), profile["settings"].get("base_url")):
+            if address:
+                parsed = urlsplit(address)
+                if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                    raise ValueError("配音接口地址不能内嵌凭据或查询参数，请在中央配置填写服务凭据。")
+    for field in ("rate", "pitch"):
+        number = profile.get(field, 1.0 if field == "rate" else 0.0)
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not isfinite(number) or (field == "rate" and not .5 <= number <= 2):
+            raise ValueError("配音语速需在0.5至2倍之间，音调需为有效数字。")
+    if not require_credentials:
+        return
+    engine = profile["engine"]
+    if engine == "mimo_tts":
+        from app.services.mimo_tts import MODELS, VOICES
+        if not profile.get("api_key"):
+            raise ValueError("请填写小米语音 API Key。")
+        if profile.get("model") not in MODELS:
+            raise ValueError("请选择已支持的MiMo配音模型。")
+        if profile["model"] == MODELS[0] and profile.get("voice") not in VOICES:
+            raise ValueError("请选择有效MiMo音色。")
+        if profile["model"] == MODELS[1] and not str(profile.get("instruction") or "").strip():
+            raise ValueError("请填写音色设计描述。")
+        if profile["model"] == MODELS[2] and not Path(profile.get("reference_audio") or "__missing__").is_file():
+            raise ValueError("请选择有效参考音频。")
+        return
+    if engine == "edge_tts":
+        if not str(profile.get("voice", "")).strip():
+            raise ValueError("请填写Edge音色。")
+        return
+    if profile.get("schema") != 1 or not isinstance(profile.get("settings"), dict):
+        raise ValueError("配音服务快照不完整，请重新选择配置或创建配音副本。")
+    settings = profile["settings"]
+    row = {"id": profile.get("profile_id", ""), "name": profile.get("profile_id", ""), "kind": "tts", "engine": engine,
+           "model": profile.get("model", ""), "base": profile.get("base_url", ""), "key": settings.get("api_key", ""), "settings": settings}
+    missing = profile_summary(row)["missing"]
+    if missing:
+        raise ValueError("配音配置待完善：" + "、".join(missing))
+    if not str(profile.get("voice", "")).strip():
+        raise ValueError("请填写所选服务的音色／说话人ID，或参考音频路径。")
+    reference = str(profile.get("voice", ""))
+    if engine in {"indextts", "indextts2", "indextts_macos"}:
+        if reference.startswith(engine + ":"):
+            reference = reference[len(engine) + 1:]
+        if not Path(reference).is_file():
+            raise ValueError("所选IndexTTS需要本机可读取的参考音频路径。")
+    if engine == "tencent_tts" and not reference.removeprefix("tencent:").isdigit():
+        raise ValueError("腾讯音色ID需为数字，例如101001。")
+    if engine in {"azure_speech", "tencent_tts"} and profile.get("base_url"):
+        raise ValueError("Azure／腾讯SDK通过服务区域选择接口，请将中央配置的接口地址留空并填写区域。")
+    if (engine == "voxcpm_2b" and settings.get("mode", "design") == "clone") or (engine == "omnivoice" and settings.get("mode") == "voice_clone"):
+        reference = reference if Path(reference).is_file() else settings.get("reference_audio", "")
+        if not Path(reference or "__missing__").is_file():
+            raise ValueError("所选克隆模式需要有效参考音频。")
+
+
+def restore_narration_voice(recorded, current, *, profile_id=None):
+    """Restore only credentials; recorded non-secret sound parameters stay immutable."""
+    saved = deepcopy(recorded)
+    if saved.get("schema") == 1:
+        identifier = profile_id or saved.get("profile_id")
+        service = tts_profile(identifier, historical=True)
+        if any(service.get(k) != saved.get(k) for k in ("engine", "model")) or \
+                service.get("base_url", "").rstrip("/") != saved.get("base_url", "").rstrip("/") or \
+                service["profile_id"] != saved.get("profile_id"):
+            raise ValueError("历史配音配置的引擎、模型或接口已改变，请恢复对应配置或创建副本。")
+        saved["settings"] = with_private_values(saved["settings"], service["settings"])
+    elif saved.get("engine", "mimo_tts") == "mimo_tts":
+        saved["api_key"] = credentials_for(saved, "tts", identifier=profile_id, current=current)
+    saved["proxy"] = deepcopy(current.get("proxy", config.proxy))
+    return saved
+
+
+def redact_tts_error(value, service=None):
+    """Remove active task credentials from provider exceptions and legacy logs."""
+    message = str(value)
+    service = service if service is not None else (current_tts() or {})
+    def scrub(data, secret=False):
+        nonlocal message
+        if isinstance(data, dict):
+            for key, item in data.items():
+                scrub(item, secret or _private_key(key))
+        elif isinstance(data, list):
+            for item in data:
+                scrub(item, secret)
+        elif secret and isinstance(data, str) and len(data) >= 4:
+            message = message.replace(data, "[REDACTED]")
+    scrub(service.get("settings", {}))
+    def hide_url(match):
+        try:
+            parsed = urlsplit(match.group())
+            return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path,
+                               "[REDACTED]" if parsed.query else "", ""))
+        except ValueError:
+            return "[REDACTED URL]"
+    message = re.sub(r"https?://[^\s'\"<>]+", hide_url, message)
+    return message
 
 
 def alignment_profile(identifier=None, *, historical=False):

@@ -84,7 +84,7 @@ def check_model_choices(prefix, roles):
         profiles.get_profile(bindings.get(role, ""), role)
 
 
-def render_model_choice(tr, prefix, role, *, engines=None):
+def render_model_choice(tr, prefix, role, *, engines=None, show_pending_default=False):
     key = prefix + "_profile_" + role
     current = selected_bindings(prefix).get(role, "")
     summaries = {row["id"]: profiles.profile_summary(row) for row in profiles.catalog()["profiles"]}
@@ -94,7 +94,7 @@ def render_model_choice(tr, prefix, role, *, engines=None):
     if pending:
         show_key = key + "_show_pending"
         if show_key not in st.session_state:
-            st.session_state[show_key] = bool(remembered_widget_value(show_key, False))
+            st.session_state[show_key] = bool(remembered_widget_value(show_key, show_pending_default))
         show_pending = st.checkbox(tr("显示此用途的待完善配置"), key=show_key,
             help=tr("仅显示字段状态，不代表服务可用；选择后仍需完善必要字段。"))
     identifiers = [row["id"] for row in compatible if show_pending or summaries[row["id"]]["complete"]]
@@ -368,8 +368,7 @@ def _render_model_editor(tr, prefix, registry, selected, creating):
             edited = json.loads(raw)
             if not isinstance(edited, dict):
                 raise ValueError("服务参数应为JSON对象。")
-            private = {key: value for key, value in settings.items() if key in profiles._PRIVATE}
-            draft["settings"] = {**edited, **private}
+            draft["settings"] = profiles.with_private_values(edited, settings)
         except (ValueError, TypeError) as exc:
             st.error(str(exc))
             return

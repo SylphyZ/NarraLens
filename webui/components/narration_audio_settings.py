@@ -7,12 +7,16 @@ import streamlit as st
 from app.config import config
 from app.services.library import runner
 from app.services.mimo_tts import DEFAULT_BASE_URL, MAX_TTS_HAN, MODELS, VOICES
-from app.services.narration_audio import audio_break_candidates, manual_audio_ranges
+from app.services.narration_audio import audio_break_candidates, manual_audio_ranges, tts_request_limits, tts_request_parts
+from app.services.model_profiles import TTS_GROUPS, validate_narration_voice as validate_voice
 from app.services.library.store import stable_hash
 from app.services.narration_alignment import LEGACY_MODE, LONG_MODE, default_alignment_options
 from webui.utils.file_utils import remembered_widget_value, remembered_expander, remember_widget_values
 from webui.components.model_settings import render_model_choice, selected_bindings, model_config_link
 from app.services.model_profiles import alignment_profile
+
+
+_RATE_ENGINES = {"tencent_tts", "soulvoice", "doubaotts", "omnivoice", "indextts_macos", "indextts2"}
 
 
 def audio_mode_label(mode):
@@ -101,7 +105,8 @@ def _manual_blocks(tr, manuscript, prefix="narration"):
         if preview.open and rows:
             try:
                 for index, block in enumerate(manual_audio_ranges(manuscript, options["tts_break_after"]), 1):
-                    st.markdown(f"**{tr('配音块')} {index} · {block['han']} {tr('汉字')}**")
+                    requests = len(tts_request_parts(block["text"], voice_values(prefix)))
+                    st.markdown(f"**{tr('配音块')} {index} · {block['han']} {tr('汉字')} · {requests} {tr('次服务请求')}**")
                     st.text(block["text"].strip())
             except ValueError as exc:
                 st.error(str(exc))
@@ -121,7 +126,7 @@ def _audio_options(tr, manuscript, prefix="narration"):
             format_func=lambda value: tr({"manual": "手动：按空行与句末选择", "auto": "自动：按目标字符组合"}[value]), key=prefix + "_tts_chunking")
         options["alignment_enabled"] = st.checkbox(tr("启用本地字幕对齐"), value=remembered_widget_value(prefix + "_alignment_enabled", True), key=prefix + "_alignment_enabled",
             help=tr("默认启用，以原文定位发声时间。关闭后保留字幕，按音频时长和文字权重估算，可能与实际发声有误差。"))
-        st.caption(tr("单次配音最多12000汉字。"))
+        st.caption(tr("每个逻辑配音块最多12000汉字；服务请求按所选接口限制拆分。内部拼接不加停顿，逻辑块之间保留3秒。"))
         if options["alignment_enabled"]:
             st.caption(tr("超过5分钟的配音会自动定位边界，再用原速短窗口对齐，已生成配音继续复用；全文仍须满足模型文本上下文限制。"))
         else:
@@ -157,25 +162,42 @@ def _clear_reference_upload(prefix):
 
 
 def _voice_profile(tr, prefix="narration"):
-    render_model_choice(tr, prefix, "tts", engines={"mimo_tts", "edge_tts"})
+    render_model_choice(tr, prefix, "tts", engines=TTS_GROUPS, show_pending_default=True)
     profile = voice_values(prefix)
     engine = profile["engine"]
     model_config_link(tr, prefix + "_tts")
-    if engine not in {"mimo_tts", "edge_tts"}:
-        st.warning(tr("文案项目支持MiMo或Edge配音，请选择对应配置。"))
+    if engine not in TTS_GROUPS:
+        st.warning(tr("请选择已配置的配音服务。"))
         return profile
+    prefix = _voice_scope(prefix)
     if engine == "edge_tts":
         voices = ("zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunjianNeural")
-        profile["voice"] = st.selectbox(tr("音色"), voices, index=voices.index(remembered_widget_value(prefix + "_edge_voice", voices[0])), key=prefix + "_edge_voice")
-        profile["rate"] = st.slider(tr("语速"), .5, 2.0, float(remembered_widget_value(prefix + "_edge_rate", 1.0)), .05, key=prefix + "_edge_rate")
+        selected = remembered_widget_value(prefix + "_edge_voice", profile.get("voice", voices[0]))
+        profile["voice"] = st.selectbox(tr("音色"), voices, index=voices.index(selected) if selected in voices else 0, key=prefix + "_edge_voice")
+        profile["rate"] = st.slider(tr("语速"), .5, 2.0, float(remembered_widget_value(prefix + "_edge_rate", profile.get("rate", 1.0))), .05, key=prefix + "_edge_rate")
         return profile
-    saved = config.mimo_tts
+    if engine != "mimo_tts":
+        st.text_input(tr("音色／说话人ID或参考音频路径"), value=profile["voice"], key=prefix + "_service_voice",
+            help=tr("填写所选服务的原生音色ID；IndexTTS等克隆服务填写参考音频完整路径。高级参数在模型配置中设置。"))
+        if engine in _RATE_ENGINES:
+            rate = profile.get("rate", 1.0)
+            if not isinstance(rate, (int, float)) or not .5 <= rate <= 2:
+                rate = 1.0
+            st.slider(tr("语速"), .5, 2.0, float(rate), .05, key=prefix + "_service_rate")
+        try:
+            chars, byte_count = tts_request_limits(profile)
+            st.caption(tr("每次服务请求限制：") + f"{chars} {tr('字符')}" + (f" / {byte_count} UTF-8 {tr('字节')}" if byte_count else "")
+                + tr("；此限制可在中央服务参数 request_max_chars／request_max_bytes 中调低。"))
+        except ValueError as exc:
+            st.error(str(exc))
+        st.caption(tr("服务配置已接入，不代表接口已连通；生成时使用所选服务，不自动改用其他引擎。"))
+        return profile
     st.caption(profile["model"] + " · " + profile["base_url"])
-    profile["voice"] = remembered_widget_value(prefix + "_mimo_voice", saved.get("voice", "冰糖"))
+    profile["voice"] = remembered_widget_value(prefix + "_mimo_voice", profile.get("voice", "冰糖"))
     if profile["model"] == MODELS[0]:
         profile["voice"] = st.selectbox(tr("音色"), VOICES, index=VOICES.index(profile["voice"]) if profile["voice"] in VOICES else 0, key=prefix + "_mimo_voice")
     if profile["model"] == MODELS[2]:
-        profile["reference_audio"] = st.text_input(tr("参考音频完整路径（MP3/WAV）"), value=remembered_widget_value(prefix + "_reference_path", saved.get("reference_audio", "")), key=prefix + "_reference_path").strip().strip('"')
+        profile["reference_audio"] = st.text_input(tr("参考音频完整路径（MP3/WAV）"), value=remembered_widget_value(prefix + "_reference_path", profile.get("reference_audio", "")), key=prefix + "_reference_path").strip().strip('"')
         upload = st.file_uploader(tr("或上传参考音频"), type=["mp3", "wav"], key=prefix + "_reference_upload", on_change=_clear_reference_upload, args=(prefix,))
         if upload:
             data = upload.getvalue()
@@ -194,38 +216,51 @@ def _voice_profile(tr, prefix="narration"):
             profile["reference_audio"] = remembered_widget_value(prefix + "_reference_uploaded_path", "")
         st.session_state[prefix + "_reference_selected_path"] = profile["reference_audio"]
         st.caption(tr("MiMo Reference Audio Help"))
-    profile["instruction"] = st.text_area(tr("MiMo Voice Instructions"), value=remembered_widget_value(prefix + "_voice_instruction", saved.get("instruction", "")), help=tr("MiMo Voice Instructions Help"), key=prefix + "_voice_instruction")
+    profile["instruction"] = st.text_area(tr("MiMo Voice Instructions"), value=remembered_widget_value(prefix + "_voice_instruction", profile.get("instruction", "")), help=tr("MiMo Voice Instructions Help"), key=prefix + "_voice_instruction")
     return profile
 
 
-def validate_voice(profile, *, require_credentials=True):
-    if profile.get("engine") not in {"mimo_tts", "edge_tts"}:
-        raise ValueError("文案项目请选择MiMo或Edge配音配置。")
-    if profile["engine"] == "mimo_tts":
-        if require_credentials and not profile.get("api_key"):
-            raise ValueError("请填写小米语音 API Key。")
-        if profile["model"] == MODELS[1] and not profile.get("instruction", "").strip():
-            raise ValueError("请填写音色设计描述。")
-        if profile["model"] == MODELS[2] and not Path(profile.get("reference_audio") or "__missing__").is_file():
-            raise ValueError("请选择有效参考音频。")
+def _voice_scope(prefix):
+    identifier = selected_bindings(prefix).get("tts", "")
+    return prefix + "_tts_service_" + stable_hash(identifier)[:12]
 
 
 def voice_values(prefix="narration"):
     """Business voice options overlay a centrally selected service snapshot."""
-    from app.services.model_profiles import tts_profile, legacy_catalog
+    from app.services.model_profiles import tts_profile
     from webui.components.model_settings import selected_bindings
-    value = lambda name, default=None: default if prefix is None else remembered_widget_value(prefix + "_" + name, default)
     identifier = selected_bindings(prefix)["tts"] if prefix else None
+    scope = _voice_scope(prefix) if prefix else ""
+    recorded = remembered_widget_value(prefix + "_saved_voice", {}) if prefix else {}
+    recorded_id = remembered_widget_value(prefix + "_saved_tts_profile", identifier) if prefix else None
+    same = bool(prefix and recorded_id == identifier)
+    old_names = {"mimo_voice": "voice", "edge_voice": "voice", "edge_rate": "rate", "voice_instruction": "instruction",
+                 "reference_path": "reference_audio", "service_voice": "voice", "service_rate": "rate"}
+    def value(name, default=None):
+        fallback = recorded.get(old_names.get(name), default) if same else default
+        if same and name not in {"service_voice", "service_rate"}:
+            fallback = remembered_widget_value(prefix + "_" + name, fallback)
+        return remembered_widget_value(scope + "_" + name, fallback) if prefix else default
     try:
         service = tts_profile(identifier, historical=True)
         engine, saved = service["engine"], service["settings"]
+        same = same and recorded.get("engine") == engine
     except ValueError:
-        recorded = value("saved_voice", {})
-        legacy = next(row for row in legacy_catalog()["profiles"] if row["id"] == "legacy_tts_mimo_tts")
-        engine, saved = recorded.get("engine", "mimo_tts"), {**legacy["settings"], **recorded, "api_key": ""}
+        return {**recorded, "engine": recorded.get("engine", ""), "api_key": "", "proxy": dict(config.proxy)} if same and recorded else {"engine": "", "proxy": dict(config.proxy)}
     profile = {"engine": engine, "proxy": dict(config.proxy)}
     if engine not in {"mimo_tts", "edge_tts"}:
-        return profile
+        default_voice = saved.get("voice", saved.get("voice_name", saved.get("voice_type", "")))
+        if not default_voice:
+            default_voice = {"qwen3_tts": "Cherry", "tencent_tts": "101001", "azure_speech": "zh-CN-XiaoxiaoNeural"}.get(engine, saved.get("reference_audio") or "default")
+        if engine == "doubaotts" and default_voice == "default":
+            default_voice = ""
+        settings = dict(saved)
+        rate = value("service_rate", saved.get("speed", 1.0)) if engine in _RATE_ENGINES else 1.0
+        if engine in {"indextts_macos", "indextts2"}:
+            settings["speed"] = rate
+        return {**profile, "schema": 1, "profile_id": service["profile_id"], "model": service["model"],
+                "base_url": service["base_url"], "settings": settings, "voice": str(value("service_voice", default_voice) or "").strip().strip('"'),
+                "rate": rate, "pitch": 0.0}
     if engine == "edge_tts":
         return {**profile, "voice": value("edge_voice", "zh-CN-XiaoxiaoNeural"), "rate": float(value("edge_rate", 1.0))}
     profile.update(api_key=saved.get("api_key", ""), base_url=saved.get("base_url") or DEFAULT_BASE_URL,

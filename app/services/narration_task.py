@@ -324,15 +324,8 @@ def normalized_audio_options(options):
 
 def restore_voice(recorded, current, *, profile_id=None):
     """Refresh credentials only for the recorded provider endpoint."""
-    saved = dict(recorded)
-    from app.services.model_profiles import credentials_for
-    if saved.get("engine", "mimo_tts") == "mimo_tts":
-        from app.services.mimo_tts import DEFAULT_BASE_URL
-        base = (saved.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
-        active_base = (current.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
-        saved["api_key"] = credentials_for(saved, "tts", identifier=profile_id, current=current)
-    saved.update(proxy=current.get("proxy", {}))
-    return saved
+    from app.services.model_profiles import restore_narration_voice
+    return restore_narration_voice(recorded, current, profile_id=profile_id)
 
 
 def restore_models(recorded, current, require_vision=True, *, required_kinds=None):
@@ -438,8 +431,8 @@ def update_project_settings(task_id, selected_libraries, options, voice_profile,
             options = _task_options(text, options, draft=not for_start)
             if for_start:
                 manual_motion_entries(text, options, complete=True)
-            if not isinstance(voice_profile, dict) or voice_profile.get("engine", "mimo_tts") not in {"mimo_tts", "edge_tts"}:
-                raise ValueError("配音服务配置无效。")
+            from app.services.model_profiles import validate_narration_voice
+            validate_narration_voice(voice_profile, require_credentials=for_start)
             updated = {**saved, "library_id": selected_libraries[0], "library_ids": selected_libraries,
                        "options": options, "voice": public_profile(voice_profile), "models": public_models(model_profile),
                        "project_version": (TASK_ROOT.parent.parent / "project_version").read_text(encoding="utf-8").strip()}

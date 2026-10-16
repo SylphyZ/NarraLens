@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.6.0**
+**Manuscript-driven video production · v2.6.1**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.6.0 provides seven workspaces:
+Version 2.6.1 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -74,7 +74,13 @@ Media, projects, and generated outputs are managed locally. Text, vision, audio 
 
 Configure services in Model Configuration. Filled fields do not verify connectivity or input capabilities; use the explicit checks and supported workflow to verify them.
 
-Manuscript projects retain MiMo/Edge TTS support. The inherited Video Production workspace keeps its existing speech engines. Text and vision backups can use independent endpoints, credentials, and parameters.
+Manuscript projects can select registered MiMo, Edge, Doubao, Tencent, Qwen3 TTS, Azure, SoulVoice, IndexTTS, OmniVoice, and VoxCPM adapters under **Production Workspace → TTS settings**. Incomplete configurations are visible and must be completed in Model Configuration. Local TTS runs through its existing HTTP service; NarraLens does not install or start those models. Connectivity and voice quality still require provider-specific validation.
+
+Logical speech blocks retain the 12,000-Han-character limit and three-second gaps. Provider requests may be split further and joined without additional gaps: Qwen uses 600 characters, Tencent conservatively uses 150 for mixed text, the existing Doubao v1 route uses 1,024 UTF-8 bytes, and other new adapters default to 500 characters. Advanced service parameters `request_max_chars` / `request_max_bytes` adjust request sizes within known hard limits. Long-form subtitle alignment continues to use the actual audio.
+
+To change speech for an existing project, choose the new service and voice, open **Reuse copy**, uncheck **Keep historical speech settings**, and create the copy. Ordinary resume retains recorded speech settings. New speech requires fresh alignment and dependent visual, animation, and music timing; the original project remains available.
+
+Azure and Tencent SDKs select their endpoints by region; leave the interface address empty. A custom Qwen address uses the native DashScope API root. Doubao reuses the existing v1 adapter; v3 / 2.0 voice protocols were not added. Advanced parameters follow each existing adapter's capabilities. Text and vision backups retain their independent endpoints and credentials.
 
 ### Subtitle timestamp model
 
@@ -126,6 +132,8 @@ Delete a manuscript project through **Project Management → select project → 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.6.1 connects manuscript projects to the existing TTS adapters, with per-configuration voice drafts, provider-sized requests, cached internal audio, task-scoped credentials, and recursive credential removal from saved snapshots. Existing MiMo/Edge caches, three-second logical block gaps, and local alignment remain supported. Provider connectivity and voice quality have not been validated for every service.
 
 Version 2.6.0 prohibits reuse of the same source shot within one output using content fingerprints and detected cut boundaries, expands retrieval when footage runs short, and checks actual source ranges to exclude credits, mixed footage, and uncertain results. Range checks are cached. Animation cards, arrows, progress, and subtitle space use separate layout regions. Visual near-duplicates across episodes or differently encoded files are not detected; sampled-frame checks also depend on model accuracy.
 

@@ -576,6 +576,8 @@ def _seed_project_widgets(prefix, saved=None):
     values = {}
     if saved:
         options, voice = saved["options"], saved["voice"]
+        memory.setdefault(prefix + "_saved_tts_profile", saved.get("models", {}).get("_bindings", {}).get("tts")
+                          or voice.get("profile_id") or remembered_widget_value(prefix + "_profile_tts", ""))
         values.update({field: options[field] for field in fields if field in options})
         values.update({name: options[field] for field, name in aliases.items() if field in options})
         values.update(audio_mode=audio_mode(options), tts_chunking=options.get("tts_chunking", "auto"),
@@ -994,6 +996,8 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
             if st.button(tr("创建复用副本并生成"), disabled=task_busy or busy or not has_scenes, key="fork_narration_" + task_id):
                 try:
                     fork_voice = restore_voice(saved_settings["voice"], voice_profile, profile_id=saved_settings.get("models", {}).get("_bindings", {}).get("tts")) if keep_audio else voice_profile
+                    if not keep_audio:
+                        check_model_choices(prefix, ["tts"])
                     validate_voice(fork_voice)
                     fork_options = dict(options)
                     if keep_audio:

@@ -23,13 +23,21 @@ except ImportError:
     MOVIEPY_AVAILABLE = False
     logger.warning("moviepy 未安装，将使用估算方法计算音频时长")
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
+from ipaddress import ip_address
 
 from app.config import config
-from app.services.model_profiles import tts_settings, runtime_configuration, current_tts, tts_profile, TTS_GROUPS
+from app.services.model_profiles import tts_settings, runtime_configuration, current_tts, tts_profile, TTS_GROUPS, redact_tts_error
 from copy import deepcopy
 from contextvars import copy_context
 from app.utils import utils
+
+
+def _redact_tts_log(record):
+    record["message"] = redact_tts_error(record["message"])
+
+
+logger = logger.patch(_redact_tts_log)
 
 
 def mktimestamp(time_seconds: float) -> str:
@@ -1152,7 +1160,7 @@ def doubaotts_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.
     使用豆包语音 TTS 生成语音
     """
     # 读取配置
-    doubaotts_cfg = getattr(config, "doubaotts", {}) or {}
+    doubaotts_cfg = tts_settings("doubaotts")
     api_key = (doubaotts_cfg.get("api_key", "") or doubaotts_cfg.get("apikey", "")).strip()
     appid = doubaotts_cfg.get("appid", "")
     token = doubaotts_cfg.get("token", "")
@@ -1209,7 +1217,7 @@ def doubaotts_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.
         payload["audio"]["silence_duration"] = float(silence_duration)
 
     # API 地址
-    url = "https://openspeech.bytedance.com/api/v1/tts"
+    url = doubaotts_cfg.get("api_url") or "https://openspeech.bytedance.com/api/v1/tts"
     
     # 构建请求头。新版控制台优先使用 API Key，旧配置继续使用 Token。
     headers = {
@@ -1276,6 +1284,8 @@ def tts(
 ) -> Union[SubMaker, None]:
     if service_profile is not None:
         requested = config.normalize_tts_engine_name(tts_engine)
+        if service_profile.get("strict") and requested not in TTS_GROUPS:
+            raise ValueError("所选配音引擎尚未接入，不会自动改用其他服务。")
         effective = requested if requested in TTS_GROUPS else "edge_tts"
         if service_profile["engine"] != effective:
             raise ValueError("配音服务与任务选择不一致。")
@@ -1301,7 +1311,7 @@ def tts(
         return soulvoice_tts(text, voice_name, voice_file, speed=voice_rate)
 
     if tts_engine == "azure_speech":
-        if should_use_azure_speech_services(voice_name):
+        if (current_tts() or {}).get("strict") or should_use_azure_speech_services(voice_name):
             logger.info("分发到 Azure Speech Services (V2)")
             return azure_tts_v2(text, voice_name, voice_file)
         logger.info("分发到 Edge TTS (Azure V1)")
@@ -1485,7 +1495,7 @@ def azure_tts_v1(
 def azure_tts_v2(text: str, voice_name: str, voice_file: str) -> Union[SubMaker, None]:
     # 直接使用官方音色名称，不需要V2后缀验证
     # Azure Speech Services 的音色名称如: zh-CN-YunzeNeural, en-US-AvaMultilingualNeural
-    processed_voice_name = voice_name.strip()
+    processed_voice_name = parse_voice_name(voice_name).removesuffix("-V2").strip()
     if not processed_voice_name:
         logger.error(f"invalid voice name: {voice_name} (empty)")
         raise ValueError(f"invalid voice name: {voice_name} (empty)")
@@ -1530,11 +1540,15 @@ def azure_tts_v2(text: str, voice_name: str, voice_file: str) -> Union[SubMaker,
             speech_key = tts_settings("azure").get("speech_key", "")
             service_region = tts_settings("azure").get("speech_region", "")
             audio_config = speechsdk.audio.AudioOutputConfig(
-                filename=voice_file, use_default_speaker=True
+                filename=voice_file
             )
             speech_config = speechsdk.SpeechConfig(
                 subscription=speech_key, region=service_region
             )
+            proxy_url = _get_configured_proxies().get("https")
+            if proxy_url:
+                proxy = urlsplit(proxy_url)
+                speech_config.set_proxy(proxy.hostname, proxy.port or 80, proxy.username, proxy.password)
             speech_config.speech_synthesis_voice_name = processed_voice_name
             # speech_config.set_property(property_id=speechsdk.PropertyId.SpeechServiceResponse_RequestSentenceBoundary,
             #                            value='true')
@@ -2000,7 +2014,7 @@ def qwen3_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.0) -
     使用通义千问 Qwen3 TTS 生成语音（仅使用 DashScope SDK）
     """
     # 读取配置
-    tts_qwen_cfg = getattr(config, "tts_qwen", {}) or {}
+    tts_qwen_cfg = tts_settings("tts_qwen")
     api_key = tts_qwen_cfg.get("api_key", "")
     model_name = tts_qwen_cfg.get("model_name", "qwen3-tts-flash")
     if not api_key:
@@ -2033,15 +2047,16 @@ def qwen3_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.0) -
             logger.info(f"=== Qwen3 TTS 请求参数 (第 {i+1} 次调用) ===")
 
             # 官方推荐：使用 MultiModalConversation.call
-            result = dashscope.MultiModalConversation.call(
-                # 仅支持 qwen-tts 系列模型
-                model=(model_name or "qwen3-tts-flash"),
-                # 同时显式传入 api_key，并兼容示例中从环境变量读取
-                api_key=api_key,
-                text=text,
-                voice=mapped_voice
-            )
-            logger.info(f"Qwen3 TTS API 响应: {result}")
+            with requests.Session() as client:
+                proxy = tts_settings("proxy")
+                client.trust_env = proxy.get("enabled") is not False and not (proxy.get("http") or proxy.get("https"))
+                client.proxies.update(_get_configured_proxies())
+                result = dashscope.MultiModalConversation.call(
+                    model=(model_name or "qwen3-tts-flash"), api_key=api_key,
+                    text=text, voice=mapped_voice, session=client,
+                    **({"base_address": tts_qwen_cfg["api_url"]} if tts_qwen_cfg.get("api_url") else {}),
+                )
+            logger.info(f"Qwen3 TTS 响应状态: {getattr(result, 'status_code', None)}，请求ID: {getattr(result, 'request_id', '')}")
         
 
             audio_bytes: bytes | None = None
@@ -2056,7 +2071,7 @@ def qwen3_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.0) -
     
                 if audio_url:
                     # 直接下载音频文件
-                    response = requests.get(audio_url, timeout=30)
+                    response = requests.get(audio_url, timeout=30, proxies=_get_configured_proxies())
                     response.raise_for_status()
                     audio_bytes = response.content
                 else:
@@ -2132,6 +2147,7 @@ def tencent_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.0)
             # 创建 HTTP 配置
             httpProfile = HttpProfile()
             httpProfile.endpoint = "tts.tencentcloudapi.com"
+            httpProfile.proxy = _get_configured_proxies().get("https")
             
             # 创建客户端配置
             clientProfile = ClientProfile()
@@ -2637,11 +2653,26 @@ def indextts_macos_tts(text: str, voice_name: str, voice_file: str) -> Union[Sub
 
 
 def _get_configured_proxies() -> dict:
-    if not tts_settings("proxy").get("http"):
+    service = current_tts() or {}
+    if service.get("strict"):
+        settings = service.get("settings", {})
+        address = settings.get("api_url") or settings.get("base_url") or ""
+        host = urlsplit(address).hostname or ""
+        try:
+            parsed_ip = ip_address(host)
+            local = parsed_ip.is_private or parsed_ip.is_loopback
+        except ValueError:
+            local = host == "localhost"
+        if local:
+            return {"http": None, "https": None}
+    proxy = tts_settings("proxy")
+    if proxy.get("enabled") is False:
+        return {"http": None, "https": None}
+    if not (proxy.get("http") or proxy.get("https")):
         return {}
     return {
-        "http": tts_settings("proxy").get("http"),
-        "https": tts_settings("proxy").get("https", tts_settings("proxy").get("http")),
+        "http": proxy.get("http") or proxy.get("https"),
+        "https": proxy.get("https") or proxy.get("http"),
     }
 
 
@@ -2815,7 +2846,7 @@ def _normalize_voxcpm_api_url(api_url: str) -> str:
 
 def voxcpm_tts(text: str, voice_name: str, voice_file: str) -> Union[SubMaker, None]:
     """使用 VoxCPM-0.5B-Pack 的 multipart /tts 接口生成 WAV。"""
-    voxcpm_config = getattr(config, "voxcpm_05b", {}) or {}
+    voxcpm_config = tts_settings("voxcpm_05b")
     api_url = _normalize_voxcpm_api_url(voxcpm_config.get("api_url", "http://127.0.0.1:7864"))
     reference_audio = parse_voxcpm_voice(voice_name)
     if reference_audio in ("", "default") or not os.path.isfile(reference_audio):
@@ -2882,7 +2913,7 @@ def _normalize_voxcpm2_api_url(api_url: str) -> str:
 
 def voxcpm2_tts(text: str, voice_name: str, voice_file: str) -> Union[SubMaker, None]:
     """使用 VoxCPM-2B-Pack 的 /tts 接口进行音色设计或参考音频克隆。"""
-    pack_config = getattr(config, "voxcpm_2b", {}) or {}
+    pack_config = tts_settings("voxcpm_2b")
     api_url = _normalize_voxcpm2_api_url(pack_config.get("api_url", "http://127.0.0.1:7863"))
     mode = str(pack_config.get("mode", "design"))
     parsed_voice = parse_voxcpm2_voice(voice_name)
@@ -2975,7 +3006,7 @@ def _download_omnivoice_audio(response: requests.Response, api_url: str, voice_f
 
 
 def _optional_omnivoice_generation_data(voice_speed: float) -> dict:
-    omnivoice_config = getattr(config, "omnivoice", {}) or {}
+    omnivoice_config = tts_settings("omnivoice")
     data = {
         "speed": voice_speed or omnivoice_config.get("speed", 1.0),
     }
@@ -3001,7 +3032,7 @@ def omnivoice_tts(text: str, voice_name: str, voice_file: str, speed: float = 1.
     使用 OmniVoice-Pack FastAPI 服务进行语音合成。
     支持自动音色、指令音色和参考音频克隆三种模式。
     """
-    omnivoice_config = getattr(config, "omnivoice", {}) or {}
+    omnivoice_config = tts_settings("omnivoice")
     api_url = _normalize_omnivoice_api_url(omnivoice_config.get("api_url", "http://127.0.0.1:7866/tts"))
     mode = omnivoice_config.get("mode", "auto")
     language = (omnivoice_config.get("language", "zh") or "").strip()
