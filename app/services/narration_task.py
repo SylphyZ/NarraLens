@@ -896,7 +896,12 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                     if not extended:
                         write_matches("incomplete", gaps)
                         identifiers = "、".join(row["visual_unit_id"] for row in gaps[:8])
+                        unconfirmed = sum(retriever.statistics.get(identifier, {}).get("unconfirmed", 0)
+                                          for identifier in {row["visual_unit_id"] for row in gaps})
+                        detail = (f"其中有{unconfirmed}个候选因引用或条目格式错误未确认，请查看画面匹配记录；"
+                                  "这些候选尚不能判定为内容不足，可从第3阶段重新评选。") if unconfirmed else ""
                         raise JobPaused(f"画面匹配有{len(gaps)}处素材缺口（{identifiers}），共缺少{shortage.missing_seconds:.2f}秒。"
+                            + detail +
                             "请查看画面匹配详情，补充素材或为合适的抽象范围增加解释动画后，从3. 寻找画面继续。"
                             "原配音、字幕、有效候选与旧成片已保留。") from None
             used = []
@@ -908,7 +913,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                     and item["source_end"] >= shot.source_end-.000001)
                 used.append({key: selected[key] for key in ("asset_id", "scene_id", "fingerprint", "fps", "natural_start", "natural_end",
                     "source_start", "source_end", "usable", "content_kind", "visual_policy", "match_policy", "visual_unit_id",
-                    "relation", "facts_match", "evidence", "conflicts", "subtitle_quotes", "visual_checked", "confidence")})
+                    "relation", "facts_match", "evidence", "conflicts", "subtitle_quotes", "visual_checked", "confidence",
+                    "subtitle_ids", "visual_evidence", "evidence_protocol")})
             update("编排镜头", 70, "校验句意对应、全片来源去重与实际范围画面检查记录")
             policy = make_visual_policy(assets, boundaries, used, retriever.forbidden, visual_plan=visual_plan)
             validate_timeline(segments, shots, assets, policy=policy)

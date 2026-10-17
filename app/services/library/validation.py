@@ -60,7 +60,7 @@ def validate_result(value, required=None):
         if not isinstance(clips, list):
             raise ModelFormatError("模型 clips 应为列表。")
         normalized = []
-        for item in clips[:6]:
+        for item in clips:
             if not isinstance(item, dict) or not isinstance(item.get("scene_id"), str) or not item["scene_id"]:
                 raise ModelFormatError("模型 clips 条目缺少有效的 scene_id。")
             selected_frame = frame_index(item.get("frame_index"), None)
