@@ -27,6 +27,7 @@ class VisualShot:
     segment_id: str
     reason: str = ""
     weak_match: bool = False
+    visual_unit_id: str = ""
 
 
 def timeline_dict(segments, shots):

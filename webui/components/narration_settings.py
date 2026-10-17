@@ -742,6 +742,7 @@ def _render_output_options(tr, prefix):
         st.checkbox(tr("遮盖原画面字幕"), value=options["mask_source_subtitles"], key=prefix + "_mask")
         st.slider(tr("目标镜头长度（秒）"), 3, 12, options["shot_seconds"], key=prefix + "_shot_seconds")
         st.checkbox(tr("确认候选画面"), value=options["verify_visual"], key=prefix + "_verify_visual")
+        st.caption(tr("始终按当前句意检查内容；关闭时使用已有描述与范围字幕判断，仍独立排除片尾名单。画面单元不改变TTS分段。"))
         st.caption(tr("文案与视觉模型调用不设任务总次数上限。"))
         st.caption(tr("字幕分段由文案生成设置中的高效率模型完成，结果会校验和缓存。"))
     remember_widget_values(prefix)
@@ -1140,20 +1141,84 @@ def _render_project_results(tr, task_id):
             subtitles = directory / "subtitles.srt"
             if subtitles.is_file():
                 st.download_button(tr("下载字幕"), subtitles.read_bytes(), file_name="subtitles.srt", mime="text/plain", key="project_subtitle_download_" + task_id)
-    timeline_file = task_directory(task_id) / "timeline.json"
-    if timeline_file.is_file():
+    directory = task_directory(task_id)
+    timeline_file, matches_file = directory / "timeline.json", directory / "visual_matches.json"
+    if timeline_file.is_file() or matches_file.is_file():
         matches_key = "narration_matches_open_" + task_id
         with remembered_expander(tr("画面匹配详情"), key=matches_key) as panel:
             if not panel.open:
                 return
-            timeline = read_json(timeline_file)
-            weak_only = st.checkbox(tr("只看匹配偏弱的镜头"), value=remembered_widget_value("weak_shots_" + task_id, True), key="weak_shots_" + task_id)
-            segment_map = {item["id"]: item for item in timeline["segments"]}
-            rows = [shot for shot in timeline["shots"] if not weak_only or shot["weak_match"]]
-            for shot in rows[:60]:
-                st.markdown(f"**{shot['segment_id']} · {shot['timeline_start']:.1f}–{shot['timeline_end']:.1f}s**")
-                st.write(segment_map[shot["segment_id"]]["text"])
+            timeline = read_json(timeline_file, default={})
+            report = read_json(matches_file, default={})
+            plan = read_json(directory / "visual_plan.json", default={})
+            document = timeline if timeline.get("segments") else read_json(directory / "document_plan.json", default={})
+            segment_map = {item["id"]: item for item in document.get("segments", [])}
+            matching = timeline.get("visual_policy", {}).get("matching", {})
+
+            def original(unit):
+                segment = segment_map.get(unit.get("segment_id"), {})
+                offset = segment.get("text_start", 0)
+                return segment.get("text", "")[unit.get("text_start", offset)-offset:unit.get("text_end", offset)-offset]
+
+            def paged(rows, label, suffix):
+                pages = max(1, (len(rows)+29)//30)
+                key = "narration_matches_" + suffix + "_" + task_id
+                st.session_state[key] = min(max(1, int(remembered_widget_value(key, 1))), pages)
+                page = st.number_input(tr(label), 1, pages, step=1, key=key)
+                st.caption(f"{len(rows)} · {page}/{pages}")
+                return rows[(page-1)*30:page*30]
+
+            if report:
+                timing_labels = {"aligned_words": "字词对齐", "text_estimate": "按文字估算", "subtitle_interpolation": "按已有字幕插值"}
+                st.caption(tr("画面时间来源：") + tr(timing_labels.get(report.get("timing_method"), "时间为估算")))
+                st.caption(tr("已排除名单／不明画面：") + str(report.get("excluded_windows", 0)) + " / " + str(report.get("excluded_ranges", 0)))
+                if report.get("state") != "complete":
+                    st.info(tr("本次画面匹配尚未完成；已有配音、字幕和旧成片保留。缺口会随补选更新。"))
+                gap_units = {unit["id"]: unit for unit in plan.get("units", [])}
+                gaps = report.get("gaps", [])
+                if gaps:
+                    st.warning(tr("尚缺内容匹配且未用的画面：") + str(len(gaps)))
+                    for gap in paged(gaps, "缺口页码", "gaps"):
+                        identifier = gap["visual_unit_id"]
+                        unit = gap_units.get(identifier, {})
+                        st.markdown(f"**{identifier} · {gap['start']:.1f}–{gap['end']:.1f}s · {gap['missing_seconds']:.2f}s**")
+                        st.write(original(unit))
+                        st.caption(gap.get("reason", ""))
+                        facts = unit.get("requirement", {}).get("required_facts", [])
+                        if facts:
+                            st.caption(tr("需要对应：") + "；".join(facts))
+                        stats = report.get("units", {}).get(identifier, {})
+                        st.caption(tr("已检查窗口：") + str(stats.get("examined_windows", 0)) + " · " +
+                                   "；".join(f"{name}: {count}" for name, count in stats.get("reasons", {}).items()))
+                st.download_button(tr("下载画面匹配记录"), matches_file.read_bytes(), file_name="visual_matches.json",
+                                   mime="application/json", key="visual_matches_download_" + task_id)
+            if not timeline:
+                return
+            if report and matching.get("plan_key") != report.get("plan_key"):
+                st.caption(tr("以下显示的是保留的旧时间线，本次新匹配尚未形成完整时间线。"))
+            units = {unit["id"]: unit for unit in matching.get("units", [])}
+            approved = timeline.get("visual_policy", {}).get("approved", [])
+            choices = {"all": "全部镜头", "supporting": "辅助匹配", "unchecked": "未视觉复核", "weak": "匹配偏弱（含旧版）"}
+            mode = st.selectbox(tr("匹配筛选"), list(choices), format_func=lambda item: tr(choices[item]), key="match_filter_" + task_id)
+            rows = []
+            for shot in timeline.get("shots", []):
+                review = next((item for item in approved if item.get("visual_unit_id") == shot.get("visual_unit_id")
+                    and item.get("asset_id") == shot["asset_id"] and item.get("scene_id") == shot["scene_id"]
+                    and item["source_start"] <= shot["source_start"]+.000001 and item["source_end"] >= shot["source_end"]-.000001), {})
+                if mode == "all" or (mode == "supporting" and review.get("relation") == "supporting") or \
+                        (mode == "unchecked" and review.get("visual_checked") is False) or (mode == "weak" and shot.get("weak_match")):
+                    rows.append((shot, review))
+            for shot, review in paged(rows, "镜头详情页码", "shots"):
+                unit = units.get(shot.get("visual_unit_id"), {})
+                st.markdown(f"**{shot.get('visual_unit_id') or shot['segment_id']} · {shot['timeline_start']:.1f}–{shot['timeline_end']:.1f}s**")
+                st.write(original(unit) if unit else segment_map.get(shot["segment_id"], {}).get("text", ""))
                 st.caption(f"{Path(shot['video_path']).name} · {shot['source_start']:.1f}–{shot['source_end']:.1f}s")
+                if review:
+                    st.caption(tr({"direct": "直接对应", "supporting": "辅助匹配"}.get(review.get("relation"), "旧版匹配")) +
+                               (" · " + tr("未进行本次视觉复核") if review.get("visual_checked") is False else ""))
+                    st.write("；".join(review.get("evidence", [])))
+                    if review.get("subtitle_quotes"):
+                        st.caption(tr("范围字幕依据：") + "；".join(review["subtitle_quotes"]))
                 st.write(shot["reason"])
             st.download_button(tr("下载剪辑时间线"), timeline_file.read_bytes(), file_name="timeline.json", mime="application/json", key="timeline_download_" + task_id)
 

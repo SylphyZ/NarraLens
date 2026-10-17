@@ -9,12 +9,33 @@ from app.models.timeline import VisualShot
 
 
 VISUAL_POLICY_VERSION = "unique-source-credits-v1"
+MATCH_POLICY_VERSION = "semantic-visual-units-v1"
 
 
 class VisualCapacityError(ValueError):
-    def __init__(self, segment_id, missing_seconds):
+    def __init__(self, segment_id, missing_seconds, *, gaps=()):
         self.missing_seconds = missing_seconds
-        super().__init__(f"段落 {segment_id} 缺少 {missing_seconds:.2f} 秒合格且未用的自然镜头；请增加素材后从3. 寻找画面继续。")
+        self.gaps = list(gaps)
+        super().__init__(f"画面单元 {segment_id} 缺少 {missing_seconds:.2f} 秒内容匹配且未用的自然镜头；请增加素材或调整动画后从3. 寻找画面继续。")
+
+
+def match_allowed(candidate, requirement):
+    """Content approval is independent of source usability and ranking scores."""
+    relation = candidate.get("relation")
+    evidence, conflicts = candidate.get("evidence"), candidate.get("conflicts")
+    score = candidate.get("confidence")
+    return (candidate.get("match_policy") == MATCH_POLICY_VERSION and
+            candidate.get("facts_match") is True and isinstance(conflicts, list) and not conflicts and
+            isinstance(evidence, list) and bool(evidence) and all(isinstance(x, str) and x.strip() for x in evidence) and
+            type(candidate.get("visual_checked")) is bool and type(score) in (int, float) and math.isfinite(score) and 0 < score <= 1 and
+            (relation == "direct" or (relation == "supporting" and requirement.get("kind") in {"state", "abstract", "transition"})))
+
+
+def matching_policy(plan):
+    return {"version": MATCH_POLICY_VERSION, "plan_key": plan["key"], "text_hash": plan["text_hash"],
+            "audio_key": plan["audio_key"], "timing_method": plan["timing_method"],
+            "units": [{**{k: unit[k] for k in ("id", "segment_id", "text_start", "text_end", "start", "end")},
+                       "requirement": {k: unit["requirement"][k] for k in ("kind", "required_facts")}} for unit in plan["units"]]}
 
 
 def source_shot_key(item):
@@ -48,10 +69,10 @@ def natural_candidates(candidates, scene_boundaries, assets):
     return result
 
 
-def make_visual_policy(assets, boundaries, approved, forbidden=()):
+def make_visual_policy(assets, boundaries, approved, forbidden=(), *, visual_plan):
     used_ids = {item["asset_id"] for item in approved}
     fingerprints = {item["fingerprint"] for item in approved}
-    return {"version": VISUAL_POLICY_VERSION, "approved": approved,
+    return {"version": VISUAL_POLICY_VERSION, "approved": approved, "matching": matching_policy(visual_plan),
             "forbidden": [item for item in forbidden if item["fingerprint"] in fingerprints],
             "sources": {asset["id"]: {**{key: asset[key] for key in ("fingerprint", "fps", "duration")},
                                       "boundaries": boundaries[asset["id"]]}
@@ -72,52 +93,100 @@ def _visual_intervals(segment, reservations):
     return intervals
 
 
-def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.0, scene_boundaries=None, *, reservations=(), used=()):
-    shots = []
-    # A failed attempt must not consume the caller's ledger.
+def visual_unit_intervals(unit, reservations):
+    intervals, position = [], unit["start"]
+    for shot in sorted(reservations, key=lambda row: row.timeline_start):
+        if shot.timeline_end <= position or shot.timeline_start >= unit["end"]:
+            continue
+        if shot.timeline_start > position:
+            intervals.append((position, min(shot.timeline_start, unit["end"])))
+        position = max(position, min(shot.timeline_end, unit["end"]))
+    if position < unit["end"] - .001:
+        intervals.append((position, unit["end"]))
+    return intervals
+
+
+def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.0, scene_boundaries=None, *, visual_units=(), reservations=(), used=()):
+    """Allocate scarce factual footage first; only a complete attempt is committed."""
+    shots, gaps = list(reservations), []
     allocated = list(used)
     if not math.isfinite(target_shot_seconds) or target_shot_seconds <= 0:
         raise ValueError("目标镜头时长必须是有效正数。")
-
+    if not visual_units:
+        raise ValueError("缺少句意画面单元，请从3. 寻找画面继续。")
+    owners = {s.id: s for s in segments}
     for segment in segments:
-        intervals = _visual_intervals(segment, reservations)
-        candidates = candidates_by_segment.get(segment.id, [])
-        candidates = [item for item in candidates if item.get("visual_policy") == VISUAL_POLICY_VERSION
-                      and item.get("usable") is True and item.get("content_kind") == "story"]
-        for start, end, reserved in intervals:
-            if reserved is not None:
-                shots.append(reserved)
-                continue
-            if end - start < min(1.0, segment.audio_end - segment.audio_start) - .01:
-                raise ValueError(f"段落 {segment.id} 仅剩 {end-start:.3f} 秒原片残段，请扩大相邻动画范围后重选。")
+        _visual_intervals(segment, reservations)
+    pools = {unit["id"]: [item for item in candidates_by_segment.get(unit["id"], [])
+             if item.get("visual_policy") == VISUAL_POLICY_VERSION and item.get("usable") is True
+             and item.get("content_kind") == "story" and item.get("visual_unit_id") == unit["id"]
+             and match_allowed(item, unit["requirement"])] for unit in visual_units}
+
+    def priority(unit):
+        needed = sum(right-left for left, right in visual_unit_intervals(unit, reservations))
+        unique = {source_shot_key(item): item for item in pools[unit["id"]]}
+        capacity = sum(min(target_shot_seconds, item["source_end"]-item["source_start"]) for item in unique.values())
+        return ({"evidence": 0, "state": 1, "abstract": 2, "transition": 3}[unit["requirement"]["kind"]],
+                capacity / max(.001, needed), unit["start"])
+
+    for unit in sorted(visual_units, key=priority):
+        segment = owners[unit["segment_id"]]
+        intervals = visual_unit_intervals(unit, reservations)
+        candidates = pools[unit["id"]]
+        trial, trial_used, failure = [], list(allocated), None
+        for interval_index, (start, end) in enumerate(intervals):
             position = start
             while position < end - .001:
                 remaining = end - position
-                pool = [item for item in candidates if unused_source(item, allocated)]
-                if not pool:
-                    missing = remaining + sum(right-left for left, right, row in intervals if left >= end and row is None)
-                    raise VisualCapacityError(segment.id, missing)
-                capacity = min(max(2, target_shot_seconds), max(item["source_end"] - item["source_start"] for item in pool))
-                desired = remaining / max(1, math.ceil(remaining / capacity))
-                eligible = [item for item in pool if item["source_end"] - item["source_start"] >= desired - .001]
-                candidate = max(eligible, key=lambda item: item.get("confidence", 0)) if eligible else \
-                    max(pool, key=lambda item: (item["source_end"] - item["source_start"], item.get("confidence", 0)))
-                available = candidate["source_end"] - candidate["source_start"]
-                length = min(desired, remaining, available)
-                if .001 < remaining - length < 1:
-                    length = remaining - 1
-                if length < .02:
-                    raise ValueError(f"段落 {segment.id} 的原片区间太短，请扩大相邻动画范围，避免几帧残段。")
+                minimum = min(1.0, segment.audio_end - segment.audio_start)
+                pool = sorted((item for item in candidates if unused_source(item, trial_used)),
+                              key=lambda item: (item["relation"] == "direct", item["confidence"]), reverse=True)
+                chosen = None
+                for candidate in pool:
+                    available = candidate["source_end"] - candidate["source_start"]
+                    other_capacity = sum(item["source_end"]-item["source_start"] for item in pool
+                                         if source_shot_key(item) != source_shot_key(candidate))
+                    # A rhythm target must not discard the only matching shot's usable seconds.
+                    minimum_length = max(minimum, remaining-other_capacity)
+                    length = min(max(minimum_length, target_shot_seconds), available, remaining)
+                    nearby = [point-position for point in unit.get("cut_times", []) if
+                              minimum_length <= point-position <= min(available, remaining) and abs(point-position-length) <= 1 and
+                              (end-point >= minimum-.001 or abs(end-point) <= .001)]
+                    if nearby:
+                        length = min(nearby, key=lambda value: abs(value-length))
+                    if .001 < remaining-length < minimum:
+                        length = remaining if available >= remaining else remaining-minimum
+                    if length >= minimum-.001:
+                        chosen = candidate, length
+                        break
+                if chosen is None:
+                    failure = {"visual_unit_id": unit["id"], "segment_id": unit["segment_id"], "start": position,
+                               "category": "short_interval" if remaining < minimum-.001 else "material",
+                               "end": unit["end"], "missing_seconds": round(remaining +
+                               sum(b-a for a, b in intervals[interval_index+1:]), 3),
+                               "reason": "原片残段不足1秒，请合并相邻句意范围或扩大相邻动画范围。" if remaining < minimum-.001 else
+                                         "缺少通过当前句意检查、事实对应且未使用的自然镜头。"}
+                    break
+                candidate, length = chosen
                 anchor = candidate.get("anchor", (candidate["source_start"] + candidate["source_end"]) / 2)
                 source_start = max(candidate["source_start"], min(anchor - length / 2, candidate["source_end"] - length))
-                shots.append(VisualShot(
+                trial.append(VisualShot(
                     candidate["asset_id"], candidate["scene_id"], candidate["video_path"], source_start, source_start + length,
                     position, position + length, segment.id,
-                    candidate.get("reason", ""), bool(candidate.get("weak_match", True)),
+                    candidate.get("reason", ""), bool(candidate.get("weak_match", True)), unit["id"],
                 ))
-                allocated.append(candidate)
+                trial_used.append(candidate)
                 position += length
-    return shots
+            if failure:
+                break
+        if failure:
+            gaps.append(failure)
+        else:
+            shots.extend(trial)
+            allocated = trial_used
+    if gaps:
+        raise VisualCapacityError(gaps[0]["visual_unit_id"], sum(row["missing_seconds"] for row in gaps), gaps=gaps)
+    return sorted(shots, key=lambda row: row.timeline_start)
 
 
 def coalesce_motion_shots(shots):
@@ -144,6 +213,10 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
             raise ValueError("镜头策略已更新，请从3. 寻找画面继续；已有配音与字幕可复用。")
         if not isinstance(policy.get("sources"), dict) or not isinstance(policy.get("approved"), list) or not isinstance(policy.get("forbidden", []), list):
             raise ValueError("镜头审核记录缺失，请从3. 寻找画面继续。")
+        matching = policy.get("matching", {})
+        if not isinstance(matching, dict) or matching.get("version") != MATCH_POLICY_VERSION or not isinstance(matching.get("units"), list):
+            raise ValueError("此时间轴尚未执行2.7句意匹配，请从3. 寻找画面继续；配音与字幕可复用。")
+        unit_map = {unit["id"]: unit for unit in matching["units"]}
         scene_boundaries = {identifier: source["boundaries"] for identifier, source in policy["sources"].items()}
     used = []
     source_ranges = {}
@@ -183,12 +256,16 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
                 raise ValueError(f"段落 {shot.segment_id} 重复使用同一来源画面，请从3. 寻找画面重新编排。")
             ranges.append((shot.source_start, shot.source_end))
             if policy is not None:
+                unit = unit_map.get(shot.visual_unit_id)
+                if not unit or unit["segment_id"] != shot.segment_id or shot.timeline_start < unit["start"]-.001 or shot.timeline_end > unit["end"]+.001:
+                    raise ValueError("镜头未绑定对应句意时间，请从3. 寻找画面继续。")
                 source = policy["sources"].get(shot.asset_id, {})
                 if not asset.get("fingerprint") or source.get("fingerprint") != asset["fingerprint"] or \
                         source.get("fps") != asset.get("fps") or abs(source.get("duration", 0) - asset["duration"]) > .01:
                     raise ValueError("素材身份与镜头审核记录不一致，请从3. 寻找画面继续。")
                 approved = next((item for item in policy["approved"] if item.get("asset_id") == shot.asset_id
                                  and item.get("scene_id") == shot.scene_id and item.get("usable") is True
+                                 and item.get("visual_unit_id") == shot.visual_unit_id and match_allowed(item, unit["requirement"])
                                  and item.get("content_kind") == "story" and item.get("visual_policy") == VISUAL_POLICY_VERSION
                                  and item["source_start"] <= shot.source_start + .000001
                                  and item["source_end"] >= shot.source_end - .000001), None)

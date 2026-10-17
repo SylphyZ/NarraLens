@@ -203,7 +203,7 @@ def motion_config_key(options):
     return stable_hash(("manual-motion-v1", {key: value for key, value in options.items() if key.startswith("motion_")}))
 
 
-def _timing_points(segments, text, directory):
+def timing_points(segments, text, directory):
     audio = read_json(Path(directory) / "audio_manifest.json")
     points = []
     blocks = audio.get("blocks", [])
@@ -248,7 +248,7 @@ def _timing_points(segments, text, directory):
 
 def _sentences(segments, text, directory, *, points=None, method=None):
     if points is None:
-        points, method = _timing_points(segments, text, directory)
+        points, method = timing_points(segments, text, directory)
     catalog = []
     for segment in segments:
         for index, anchor in enumerate(text_anchors(segment.text, segment.text_start), 1):
@@ -619,7 +619,7 @@ def inspect_manual_motion_ranges(segments, text, directory, options, *, points=N
     if not entries:
         return report
     if points is None:
-        points, method = _timing_points(segments, text, directory)
+        points, method = timing_points(segments, text, directory)
     report["method"] = method
     spoken = [p for p in points if any(char.isalnum() for char in text[p["a"]:p["b"]])]
     resolved = []
@@ -748,7 +748,7 @@ def motion_entry_from_animation(row, segments, text):
 def plan_motion(segments, text, overview, gateway, directory, options, stop=None, progress=None):
     options = motion_options(options)
     folder = _motion_directory(directory)
-    points, method = _timing_points(segments, text, directory)
+    points, method = timing_points(segments, text, directory)
     ranges, method = manual_motion_ranges(segments, text, directory, options, points=points, method=method)
     manual_motion_entries(text, options, complete=True)
     placement = options.get("motion_placement", "auto")

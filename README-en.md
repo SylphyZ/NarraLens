@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.6.1**
+**Manuscript-driven video production · v2.7.0**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -31,7 +31,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 - **Reusable media analysis:** register footage and music, save analysis, and reuse successful results in later projects.
 - **Complete manuscript input:** paste text or upload TXT/Markdown while retaining the source document.
-- **Shot planning:** retrieve from multiple libraries and arrange several shots under continuous speech.
+- **Meaning-based shot planning:** retrieve actual shots from multiple libraries, review their relationship to the current manuscript span, and arrange them under continuous speech. Missing coverage is reported.
 - **Long-form narration:** start with paragraph blocks and manually merge or split them. The current default pause between blocks is three seconds.
 - **Local alignment:** a separate Qwen3 ForcedAligner environment provides word timestamps. Text-based timing estimates remain available when local alignment is disabled.
 - **Single-line subtitles:** adjustable font size, measured text width, and available speech time guide subtitle changes.
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.6.1 provides seven workspaces:
+Version 2.7.0 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -102,6 +102,8 @@ Explanatory animations use separately prepared Node, Remotion, and browser depen
 5. **Configure and produce:** in Production Workspace, choose speech, blocks and pauses, model roles, subtitle style, output, BGM, and animation placement. Save and generate.
 6. **Review and adjust:** inspect the video, matching details, subtitle/animation plans, and project diagnostics. Apply changes through the available copy actions when earlier output exists.
 
+Visual units use existing narration timestamps and do not change TTS blocks. Paginated details show the corresponding manuscript span, source range, direct or supporting relationship, and evidence. Missing coverage remains visible before a complete timeline exists. Concrete events require direct support; supporting footage is restricted to suitable state or abstract units. Unselected footage no longer automatically fills gaps. Add suitable media or animations and resume while retaining speech, subtitles, and the previous video.
+
 Video and music originals normally remain at their registered paths. Libraries save analysis and derived data. Successful analysis can be reused, and interrupted runs can continue.
 
 
@@ -125,13 +127,15 @@ Moving or deleting originals affects later reads. Update registrations or use th
 
 Use the general continue action or numbered stages 1–5. Each stage validates its prerequisites and can reuse matching saved output. Use the workspace copy actions to apply changes to existing speech, subtitles, animations, or music.
 
-After upgrading to 2.6, resume old timelines from **3. Find footage** to apply the new selection policy, reusing narration, captions, and alignment. The previous video and timeline are retained under the project's `history/visual-*` directory. Disabling visual relevance confirmation still requires a vision model for the independent credits/usability check.
+After upgrading to 2.7, resume old timelines from **3. Find footage**, reusing narration, captions, and alignment. Stages 4 and 5 cannot bypass the new content checks. The previous video and timeline are retained under the project's `history/visual-*` directory. When candidate visual confirmation is disabled, content relationships are still reviewed using saved descriptions and range-specific subtitles and marked as not visually rechecked. The independent credits/usability check still uses a vision model.
 
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.7.0 adds visual units bound to existing narration timing, reviews content relationships for actual source ranges, and removes automatic admission of unselected fallback footage. Whole-video allocation reserves footage for concrete events and scarce evidence before arranging duration. Gap diagnostics and paginated details preserve long-form TTS, captions, manual animation nodes, source-shot deduplication, and credits filtering. The implementation is in place; improvements still require review of generated footage. Three-frame sampling and model judgments cannot guarantee correct identification in every case.
 
 Version 2.6.1 connects manuscript projects to the existing TTS adapters, with per-configuration voice drafts, provider-sized requests, cached internal audio, task-scoped credentials, and recursive credential removal from saved snapshots. Existing MiMo/Edge caches, three-second logical block gaps, and local alignment remain supported. Provider connectivity and voice quality have not been validated for every service.
 
