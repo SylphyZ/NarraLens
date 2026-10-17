@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.0**
+**Manuscript-driven video production · v2.7.1**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.0 provides seven workspaces:
+Version 2.7.1 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -129,11 +129,15 @@ Use the general continue action or numbered stages 1–5. Each stage validates i
 
 After upgrading to 2.7, resume old timelines from **3. Find footage**, reusing narration, captions, and alignment. Stages 4 and 5 cannot bypass the new content checks. The previous video and timeline are retained under the project's `history/visual-*` directory. When candidate visual confirmation is disabled, content relationships are still reviewed using saved descriptions and range-specific subtitles and marked as not visually rechecked. The independent credits/usability check still uses a vision model.
 
+Version 2.7.1 accepts valid zero-duration alignment entries and uses positive-duration speech anchors while retaining the full manuscript. Projects stopped by this issue can resume from stage 3 using existing narration and captions. Missing positive-duration anchors and invalid timing data still produce explicit errors.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
+
+Version 2.7.1 fixes visual planning rejecting otherwise valid alignment data containing zero-duration entries. The manuscript, audio, captions, and source caches are retained; only positive-duration points serve as speech anchors. Invalid ranges, malformed times, and missing voiced anchors remain errors. Existing valid 2.7 visual plans remain compatible. Source and static review are complete; actual task recovery has not yet been validated.
 
 Version 2.7.0 adds visual units bound to existing narration timing, reviews content relationships for actual source ranges, and removes automatic admission of unselected fallback footage. Whole-video allocation reserves footage for concrete events and scarce evidence before arranging duration. Gap diagnostics and paginated details preserve long-form TTS, captions, manual animation nodes, source-shot deduplication, and credits filtering. The implementation is in place; improvements still require review of generated footage. Three-frame sampling and model judgments cannot guarantee correct identification in every case.
 

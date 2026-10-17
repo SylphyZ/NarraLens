@@ -163,7 +163,9 @@ def _visual_time(position, points, segment, motion_edges=()):
 
 
 def _visual_plan_key(plan):
-    return stable_hash((MATCH_POLICY_VERSION, plan["text_hash"], plan["audio_key"], plan["model_signature"], plan["timing_method"], plan["units"]))
+    identity = (MATCH_POLICY_VERSION, plan["text_hash"], plan["audio_key"], plan["model_signature"], plan["timing_method"], plan["units"])
+    # Older valid plans retain their key; new plans bind the prepared timing anchors.
+    return stable_hash(identity + ((plan["timing_preparation"],) if "timing_preparation" in plan else ()))
 
 
 def validate_visual_plan(plan, segments, text, directory):
@@ -200,9 +202,27 @@ def plan_visual_units(segments, text, overview, gateway, directory, stop=None, p
 
     directory = Path(directory)
     points, method = timing_points(segments, text, directory)
-    if not points or any(not all(type(p[k]) in (int, float) and math.isfinite(p[k]) for k in ("a", "b", "start", "end"))
-                         or p["b"] <= p["a"] or p["end"] <= p["start"] for p in points):
-        raise ValueError("画面规划缺少有效原文时间，请从2. 字幕处理继续。")
+    if not points:
+        raise ValueError("画面规划没有原文时间记录；配音与字幕已保留，请检查现有字词／字幕时间后继续。")
+    for number, point in enumerate(points, 1):
+        if not isinstance(point, dict) or any(type(point.get(k)) is not int for k in ("a", "b")) or \
+                not 0 <= point["a"] < point["b"] <= len(text):
+            raise ValueError(f"画面时间第{number}条的原文范围无效；已有成果保留，请检查对应时间记录。")
+        if any(type(point.get(k)) not in (int, float) or not math.isfinite(point[k]) for k in ("start", "end")) or \
+                not 0 <= point["start"] <= point["end"]:
+            raise ValueError(f"画面时间第{number}条（原文{point['a']}–{point['b']}）不是有限、非负、正序的时间；"
+                             "已有成果保留，请检查对应时间记录。")
+    # Keep the full manuscript and original cache; only voiced points are timing anchors.
+    zero_points = [point for point in points if point["start"] == point["end"]]
+    source_count = len(points)
+    points = [point for point in points if point["end"] > point["start"]]
+    if not points:
+        raise ValueError("画面规划的原文时间全部为零时长，没有可用发声锚点；原配音、字幕与对齐缓存已保留，"
+                         "请检查现有字词／字幕时间，无法定位时从2. 字幕处理继续。")
+    preparation = {"version": "positive-duration-v1", "source_points": source_count,
+                   "zero_duration_points": len(zero_points), "anchor_points": len(points), "anchor_signature": stable_hash(points)}
+    if zero_points:
+        logger.info("画面时间准备：{}个零时长条目不作为发声锚点，原文与配音保留，使用{}个正时长锚点。", len(zero_points), len(points))
     signature = gateway.signature("text")
     motion_edges = [edge for shot in reservations for edge in (shot.timeline_start, shot.timeline_end)]
     units = []
@@ -214,10 +234,16 @@ def plan_visual_units(segments, text, overview, gateway, directory, stop=None, p
         if not catalog:
             raise ValueError(f"段落{segment.id}没有可绑定的画面原文。")
         relevant = [p for p in points if p["b"] > segment.text_start and p["a"] < segment.text_end]
+        if not relevant:
+            raise ValueError(f"段落{segment.id}（原文{segment.text_start}–{segment.text_end}）没有正时长发声记录，"
+                             "无法可靠绑定画面；原配音与字幕已保留，请检查该段现有时间结果。")
         times = [segment.audio_start] + [_visual_time(row["text_end"], relevant, segment, motion_edges) for row in catalog[:-1]] + [segment.audio_end]
         previous = segments[index-1].text[-160:] if index else ""
         following = segments[index+1].text[:160] if index+1 < len(segments) else ""
-        key = stable_hash((MATCH_POLICY_VERSION, signature, overview, segment.text, previous, following, times))
+        identity = (MATCH_POLICY_VERSION, signature, overview, segment.text, previous, following, times)
+        if any(point["b"] > segment.text_start and point["a"] < segment.text_end for point in zero_points):
+            identity += (preparation["version"], stable_hash(relevant))
+        key = stable_hash(identity)
         gateway.context.update(stage="规划句意画面单元", segment=segment.id)
         validator = lambda value: _validate_visual_groups(value, catalog, times)
         prompt = (
@@ -245,7 +271,8 @@ def plan_visual_units(segments, text, overview, gateway, directory, stop=None, p
                           "requirement": {k: v for k, v in row.items() if k != "end_after"}})
             prior, text_start = end, text_end
     plan = {"version": MATCH_POLICY_VERSION, "text_hash": stable_hash(text), "timing_method": method,
-            "audio_key": stable_hash(read_json(directory / "audio_manifest.json")), "model_signature": signature, "units": units}
+            "audio_key": stable_hash(read_json(directory / "audio_manifest.json")), "model_signature": signature,
+            "timing_preparation": preparation, "units": units}
     plan["key"] = _visual_plan_key(plan)
     validate_visual_plan(plan, segments, text, directory)
     write_json(directory / "visual_plan.json", plan)
