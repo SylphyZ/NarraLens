@@ -9,12 +9,14 @@ import wave
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from loguru import logger
+
 from app.services.library.gateway import ModelGateway, ModelUsage
 from app.services.library.retriever import MaterialRetriever
 from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
 from app.services.library import runner
 from app.services.library.store import LibraryStore, library_ids, stable_hash, write_json, read_json
-from app.services.narration_planner import plan_document, plan_subtitles, plan_visual_units, validate_visual_plan
+from app.services.narration_planner import BOUNDARY_ALIGNMENT_VERSION, plan_document, plan_subtitles, plan_visual_units, validate_visual_plan
 from app.services.narration_bgm import bgm_libraries, bgm_options, plan_bgm, prepare_bgm, validate_bgm
 from app.services.narration_motion import (
     motion_options, validate_motion, plan_motion, prepare_motion, load_motion_assets,
@@ -646,16 +648,23 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     verify = bool(options.get("verify_visual", True))
     target = float(options.get("shot_seconds", 7))
     no_gain_limit = int(options.get("visual_no_gain_rounds", 2))
-    key = stable_hash((PROPOSAL_VERSION, visual_plan["key"], retriever.version, verify, target,
-                      gateway.signature("text_fast"), gateway.signature("text"), gateway.signature("vision")))
+    search_identity = (retriever.version, verify, target, gateway.signature("text_fast"),
+                       gateway.signature("text"), gateway.signature("vision"))
+    key = stable_hash((PROPOSAL_VERSION, visual_plan["key"], *search_identity))
+    alignment = visual_plan.get("boundary_alignment", {})
+    base_key = alignment.get("base_plan_key") if alignment.get("version") == BOUNDARY_ALIGNMENT_VERSION else None
+    compatible_key = stable_hash((PROPOSAL_VERSION, base_key, *search_identity)) if base_key else key
     path = directory/"visual_search_state.json"
     try:
         saved = read_json(path, default={})
     except (OSError, ValueError):
         saved = {}
-    if not isinstance(saved, dict) or saved.get("key") != key or \
+    if not isinstance(saved, dict) or saved.get("key") not in (key, compatible_key) or \
             not isinstance(saved.get("pools", {}), dict) or not isinstance(saved.get("examined", {}), dict):
         saved = {}
+    migrated_from = saved.get("key") if saved and saved.get("key") != key else saved.get("migrated_from_key")
+    if migrated_from and migrated_from != saved.get("migrated_from_key"):
+        logger.info("仅画面共享边界变化，已核对原计划键并复用检索游标和候选池：{}", migrated_from)
     examined = {u["id"]: set(saved.get("examined", {}).get(u["id"], [])) for u in units}
     exhausted = set(saved.get("exhausted", []))
     no_gain = {u["id"]: 0 for u in units}  # Explicit continue grants another bounded expansion from the saved cursor.
@@ -710,7 +719,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     def save(status, gaps, proposal):
         write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": pools,
             "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
-            "no_gain": no_gain, "search_round": search_round})
+            "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from})
         write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
             "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
         write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
@@ -727,11 +736,27 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                   for u in units for a, b in visual_unit_intervals(u, reservations)
                   if b-a < min(1.0, visual_segments[u["id"]].audio_end-visual_segments[u["id"]].audio_start)-.001]
     if structural:
+        for gap in structural:
+            nearby = {s.asset_id for s in reservations if abs(s.timeline_end-gap["start"]) < .001 or
+                      abs(s.timeline_start-gap["end"]) < .001}
+            sources = {row["source"] for row in alignment.get("motions", []) if row["animation_id"] in nearby}
+            gap["animation_sources"] = sorted(sources)
+            reasons = [row["reason"] for row in alignment.get("rejected", []) if
+                       gap["visual_unit_id"] in row.get("unit_ids", []) or row.get("animation_id") in nearby or
+                       ("unit_ids" not in row and "animation_id" not in row)]
+            if not reasons:
+                reasons = ["父段或单元边界与动画原文绑定不一致，无法安全自动归并。"]
+            gap["reason"] = "；".join(dict.fromkeys(reasons))
         proposal, _ = propose_visual_timeline(segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         save("incomplete", structural, proposal)
         examples = "、".join(row["visual_unit_id"] for row in structural[:8])
+        reasons = "；".join(dict.fromkeys(row["reason"] for row in structural))
+        origins = {origin for row in structural for origin in row["animation_sources"]}
+        source_note = "、".join(label for value, label in (("manual", "手动"), ("auto", "自动")) if value in origins) or "未确认来源的"
         raise JobPaused(f"发现{len(structural)}处不足1秒的原片区间（{examples}），已在候选模型复核前暂停。"
-                        "请扩大相邻手动动画范围或合并相邻句意范围后从3. 寻找画面继续；原配音、字幕、合格候选与旧成片保留。")
+                        f"相邻{source_note}动画未能安全归并：{reasons}"
+                        "请查看画面缺口详情，调整对应动画原文范围或合并句意范围后从3. 寻找画面继续；"
+                        "原配音、字幕、合格候选与旧成片保留。")
 
     # Prepare all units locally before reserving scarce sources; this makes no provider calls.
     for index, unit in enumerate(units):
@@ -1008,7 +1033,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
             visual_start = 45 if options["motion_enabled"] else 40
             update("规划句意画面", visual_start, "保留原配音与字幕，按当前句意确定画面范围")
             visual_plan = plan_visual_units(segments, text, overview, gateway, directory, stop,
-                progress=lambda p, message: update("规划句意画面", visual_start + p*2, message), reservations=reservations)
+                progress=lambda p, message: update("规划句意画面", visual_start + p*2, message),
+                reservations=reservations, motion_plan=motion_plan)
             assets = store.assets(selected_libraries) + motion_assets
             shots, boundaries, candidates_by_unit = _find_visual_shots(
                 segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update)

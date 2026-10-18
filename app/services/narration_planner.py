@@ -16,6 +16,7 @@ from app.services.timeline_planner import MATCH_POLICY_VERSION
 
 
 VISUAL_REQUIREMENT_VERSION = "grounded-facts-v1"
+BOUNDARY_ALIGNMENT_VERSION = "motion-boundary-gap-v1"
 
 
 def split_document(text, limit=420):
@@ -187,7 +188,106 @@ def _visual_plan_key(plan):
     identity = (MATCH_POLICY_VERSION, plan["text_hash"], plan["audio_key"], plan["model_signature"], plan["timing_method"], plan["units"])
     # Older valid plans retain their key; new plans also bind their timing and fact contracts.
     identity += (plan["timing_preparation"],) if "timing_preparation" in plan else ()
-    return stable_hash(identity + ((plan["requirement_contract"],) if "requirement_contract" in plan else ()))
+    identity += (plan["requirement_contract"],) if "requirement_contract" in plan else ()
+    identity += (plan["boundary_alignment"],) if "boundary_alignment" in plan else ()
+    return stable_hash(identity)
+
+
+def _align_visual_boundaries(plan, segments, points, motion_plan, reservations, fps):
+    """Reconcile only shared text boundaries leaving a subsecond animation edge."""
+    from app.services.timeline_planner import visual_unit_intervals
+
+    if not reservations:
+        return
+    info = {"version": BOUNDARY_ALIGNMENT_VERSION, "fps": fps, "base_plan_key": _visual_plan_key(plan),
+            "motion_key": motion_plan.get("key") if isinstance(motion_plan, dict) else None,
+            "reservation_signature": stable_hash(sorted((s.asset_id, s.segment_id, s.timeline_start, s.timeline_end) for s in reservations)),
+            "motions": [], "adjustments": [], "rejected": []}
+    plan["boundary_alignment"] = info
+    if not isinstance(motion_plan, dict) or motion_plan.get("text_hash") != plan["text_hash"] or not info["motion_key"]:
+        info["rejected"].append({"reason": "当前动画身份或原文校验缺失，不能按时间接近归并。"})
+        return
+    owners = {s.id: s for s in segments}
+    animations = motion_plan.get("animations", [])
+    by_id = {}
+    for row in animations:
+        if isinstance(row, dict):
+            by_id.setdefault(row.get("id"), []).append(row)
+    edges = {}
+    for identifier in sorted({s.asset_id for s in reservations}):
+        rows = by_id.get(identifier, [])
+        if len(rows) != 1:
+            info["rejected"].append({"animation_id": identifier, "reason": "实际占用动画缺少唯一原文绑定。"})
+            continue
+        row = rows[0]
+        a, b = row.get("text_start"), row.get("text_end")
+        spans = sorted((s for s in reservations if s.asset_id == identifier), key=lambda s: s.timeline_start)
+        valid = type(a) is int and type(b) is int and 0 <= a < b <= segments[-1].text_end
+        for index, span in enumerate(spans):
+            owner = owners.get(span.segment_id)
+            valid = valid and owner is not None and span.scene_id == identifier and \
+                all(type(t) in (int, float) and math.isfinite(t) for t in (span.timeline_start, span.timeline_end)) and \
+                owner.audio_start <= span.timeline_start < span.timeline_end <= owner.audio_end and \
+                (not index or abs(spans[index-1].timeline_end-span.timeline_start) < .000001)
+        valid = valid and all(type(row.get(k)) in (int, float) and math.isfinite(row[k]) for k in ("start", "end")) and \
+            abs(spans[0].timeline_start-row["start"]) < .000001 and abs(spans[-1].timeline_end-row["end"]) < .000001
+        if not valid:
+            info["rejected"].append({"animation_id": identifier, "reason": "动画原文绑定与实际占用范围不一致。"})
+            continue
+        binding = {"animation_id": identifier, "source": "manual" if row.get("source") == "manual" else "auto",
+                   "text_start": a, "text_end": b, "start": spans[0].timeline_start, "end": spans[-1].timeline_end}
+        info["motions"].append(binding)
+        for side, position in (("start", a), ("end", b)):
+            edges.setdefault(position, []).append({**binding, "side": side, "time": binding[side]})
+    tolerance = .5/fps + .000001
+    for left_unit, right_unit in zip(plan["units"], plan["units"][1:]):
+        if left_unit["segment_id"] != right_unit["segment_id"]:
+            continue  # Parent audio boundaries remain fixed, including cross-paragraph animations.
+        owner = owners[left_unit["segment_id"]]
+        position, old = left_unit["text_end"], left_unit["end"]
+        matches = edges.get(position, [])
+        minimum = min(1.0, owner.audio_end-owner.audio_start)
+        residuals = [(a, b) for unit in (left_unit, right_unit) for a, b in visual_unit_intervals(unit, reservations)
+                     if b-a < minimum-.001]
+        candidates = [edge for edge in matches if any(
+            (edge["side"] == "end" and abs(a-edge["time"]) < .000001 and abs(b-old) < .000001) or
+            (edge["side"] == "start" and abs(a-old) < .000001 and abs(b-edge["time"]) < .000001)
+            for a, b in residuals)]
+        if not candidates:
+            continue
+        record = {"unit_ids": [left_unit["id"], right_unit["id"]], "text_position": position, "before": old,
+                  "animation_ids": [edge["animation_id"] for edge in matches]}
+        new = candidates[0]["time"]
+        record["after"] = new
+        relevant = [p for p in points if p["b"] > owner.text_start and p["a"] < owner.text_end]
+        before = [p["end"] for p in relevant if p["b"] <= position]
+        after = [p["start"] for p in relevant if p["a"] >= position]
+        reason = None
+        if any(abs(edge["time"]-new) > .000001 for edge in matches):
+            reason = "同一原文边界对应多个不同动画切点。"
+        elif not before or not after or any(p["a"] < position < p["b"] for p in relevant):
+            reason = "原文边界处于发声词内部或缺少两侧发声锚点。"
+        else:
+            low, high = max(before), min(after)
+            record.update(speech_left=low, speech_right=high, tolerance=tolerance)
+            if low > high+.000001 or not low-tolerance <= new <= high+tolerance:
+                reason = "动画切点超出发声间隙的半帧容差。"
+        if not reason and (abs(old-right_unit["start"]) > .000001 or position != right_unit["text_start"] or
+                not owner.audio_start < new < owner.audio_end):
+            reason = "画面共享边界不一致或涉及父配音段固定边界。"
+        proposed = ({**left_unit, "end": new}, {**right_unit, "start": new})
+        if not reason and any(unit["end"]-unit["start"] < minimum-.001 or
+                any(b-a < minimum-.001 for a, b in visual_unit_intervals(unit, reservations)) for unit in proposed):
+            reason = "归并后相邻画面区间仍不足最低时长，需保留预检。"
+        if reason:
+            info["rejected"].append({**record, "reason": reason})
+            continue
+        left_unit["end"], right_unit["start"] = new, new
+        for unit in (left_unit, right_unit):
+            unit["cut_times"] = [t for t in unit["cut_times"] if unit["start"] < t < unit["end"]]
+        info["adjustments"].append(record)
+    logger.info("动画与句意边界归并：{}处已调整，{}处保留诊断；配音、字幕与动画时间保持。",
+                len(info["adjustments"]), len(info["rejected"]))
 
 
 def validate_visual_plan(plan, segments, text, directory):
@@ -218,9 +318,9 @@ def validate_visual_plan(plan, segments, text, directory):
     return plan
 
 
-def plan_visual_units(segments, text, overview, gateway, directory, stop=None, progress=None, *, reservations=()):
+def plan_visual_units(segments, text, overview, gateway, directory, stop=None, progress=None, *, reservations=(), motion_plan=None):
     """Keep P/TTS/subtitle identities intact; derive independently timed visual units."""
-    from app.services.narration_motion import text_anchors, timing_points
+    from app.services.narration_motion import FPS, text_anchors, timing_points
 
     directory = Path(directory)
     points, method = timing_points(segments, text, directory)
@@ -301,6 +401,7 @@ def plan_visual_units(segments, text, overview, gateway, directory, stop=None, p
     plan = {"version": MATCH_POLICY_VERSION, "text_hash": stable_hash(text), "timing_method": method,
             "audio_key": stable_hash(read_json(directory / "audio_manifest.json")), "model_signature": signature,
             "timing_preparation": preparation, "requirement_contract": VISUAL_REQUIREMENT_VERSION, "units": units}
+    _align_visual_boundaries(plan, segments, points, motion_plan, reservations, FPS)
     plan["key"] = _visual_plan_key(plan)
     validate_visual_plan(plan, segments, text, directory)
     write_json(directory / "visual_plan.json", plan)
