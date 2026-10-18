@@ -14,7 +14,7 @@ from app.services.library.store import library_ids, stable_hash, write_json, rea
 from app.services.subtitle_segmentation import _tokenizer
 from app.services.library.validation import confidence, frame_index, ModelFormatError
 from app.services.timeline_planner import (
-    VISUAL_POLICY_VERSION, MATCH_POLICY_VERSION, match_allowed, natural_candidates, source_shot_key, unused_source,
+    VISUAL_POLICY_VERSION, MATCH_POLICY_VERSION, PROPOSAL_VERSION, match_allowed, natural_candidates, source_shot_key, unused_source,
 )
 
 
@@ -125,6 +125,8 @@ class MaterialRetriever:
         self.library_ids = sorted(library_ids(library_id))
         self.library_names = {item["id"]: item["name"] for item in store.list_libraries()}
         self.scenes = store.scenes(self.library_ids)
+        self.scene_map = {scene["id"]: scene for scene in self.scenes}
+        self.scene_indices = {scene["id"]: index for index, scene in enumerate(self.scenes)}
         if not self.scenes:
             raise ValueError("素材库尚无可用的成功场景，请先建立或继续分析素材库。")
         self.version = stable_hash((MATCH_POLICY_VERSION, self.library_ids,
@@ -133,6 +135,8 @@ class MaterialRetriever:
         self.subtitles = {}
         self.statistics = {}
         self.unconfirmed = set()
+        self.recorded = set()
+        self.rejected_matches = set()
         self.rejected_scenes = set()
         self.rejected_ranges = set()
         self.forbidden = []
@@ -264,132 +268,101 @@ class MaterialRetriever:
                    if text.strip() and start < end and end > candidate["source_start"] and start < candidate["source_end"]]
         return entries, identity, state
 
-    def select(self, segment, overview, gateway, directory, used=(), verify_visual=True, stop=None, *, candidates, scene_boundaries, assets):
-        """Every admitted natural shot receives an explicit review for this exact unit."""
-        assets = {asset["id"]: asset for asset in assets}
-        key = stable_hash((MATCH_POLICY_VERSION, SUBTITLE_EVIDENCE_VERSION, self.version, segment.id, segment.text, segment.requirement,
-                          gateway.signature("text"), gateway.signature("vision"), verify_visual,
-                          [(item["scene_id"], item["source_start"], item["source_end"]) for item in candidates]))
-        cache_file = Path(directory) / "candidates" / f"{segment.id}-{key[:20]}.json"
-        statistics = self.statistics.setdefault(segment.id, {"checked": 0, "approved": 0, "unconfirmed": 0, "reasons": {}, "examples": []})
-        try:
-            previous = read_json(cache_file, default={})
-        except (OSError, ValueError):
-            previous = {}
-        reviews = previous.get("reviews", []) if isinstance(previous, dict) and previous.get("key") == key else []
-        if not isinstance(reviews, list):
-            reviews = []
-        gateway.context.update(stage="检查句意与实际镜头", segment=segment.id)
+    @staticmethod
+    def unit_payload(segment):
+        requirement = segment.requirement
+        result = {"text": segment.text, "kind": requirement["kind"]}
+        for name in ("claim", "characters", "events", "required_facts", "avoid"):
+            if requirement.get(name) and requirement[name] != segment.text:
+                result[name] = requirement[name]
+        return result
+
+    def _remember(self, segment, candidate, judgment, *, cached=False):
+        key = candidate["_review_key"]
+        stats = self.statistics.setdefault(segment.id, {"checked": 0, "approved": 0, "unconfirmed": 0,
+                                                       "cache_hits": 0, "reasons": {}, "examples": []})
+        issues = judgment["_validation_issues"]
+        if not issues:
+            candidate.update({name: judgment[name] for name in ("relation", "facts_match", "evidence", "conflicts",
+                "subtitle_quotes", "subtitle_ids", "visual_evidence", "evidence_protocol")})
+            candidate.update(usable=judgment["usable"], content_kind=judgment["content_kind"],
+                visual_policy=VISUAL_POLICY_VERSION, match_policy=MATCH_POLICY_VERSION, visual_unit_id=segment.id,
+                visual_checked=candidate["_verify_visual"], confidence=confidence(judgment.get("confidence")),
+                reason=judgment["reason"], weak_match=judgment["relation"] != "direct" or not candidate["_verify_visual"])
+        accepted = not issues and candidate["usable"] and self.range_allowed(candidate) and match_allowed(candidate, segment.requirement)
+        if key not in self.recorded:
+            self.recorded.add(key)
+            stats["checked"] += 1
+            stats["cache_hits"] += int(cached)
+            if accepted:
+                stats["approved"] += 1
+            else:
+                if issues:
+                    stats["unconfirmed"] += 1
+                    category = "字幕引用未确认" if any(item["field"] == "subtitle_ids" for item in issues) else "候选格式未确认"
+                    reason = "; ".join(item["message"] for item in issues)
+                else:
+                    category = "画面不可用" if not candidate["usable"] else judgment["relation"] if judgment["facts_match"] else "事实未对应"
+                    reason = "; ".join(judgment["conflicts"]) or judgment["reason"]
+                stats["reasons"][category] = stats["reasons"].get(category, 0) + 1
+                if len(stats["examples"]) < 12:
+                    stats["examples"].append({"scene_id": candidate["scene_id"], "review_id": candidate["_review_id"],
+                        "source_start": candidate["source_start"], "source_end": candidate["source_end"],
+                        "relation": "unknown" if issues else judgment["relation"], "reason": reason, "validation_issues": issues})
+        if accepted:
+            candidate.update(pending_review=False, _screened=True)
+            selected = frame_index(judgment.get("frame_index", 1)) if candidate["_verify_visual"] else 1
+            candidate["anchor"] = candidate["source_start"] + (candidate["source_end"]-candidate["source_start"]) * (selected+.5)/3
+        elif issues:
+            self.unconfirmed.add(key)
+            candidate.update(pending_review=True, _unconfirmed=True)
+            candidate.pop("proposal_version", None)
+        else:
+            self.rejected_matches.add(key)
+            candidate["_rejected"] = True
+        return accepted
+
+    def prepare(self, segment, candidates, assets, gateway, verify_visual=True, *, scene_boundaries=None):
+        """Read exact-range caches and rank locally; this method makes no model calls."""
+        asset_map = {asset["id"]: asset for asset in assets}
+        if scene_boundaries is not None:
+            candidates = natural_candidates(candidates, scene_boundaries, assets)
         unique = {}
-        for candidate in natural_candidates(candidates, scene_boundaries, list(assets.values())):
-            if not unused_source(candidate, used):
+        for original in candidates:
+            candidate = dict(original)
+            asset, scene = asset_map.get(candidate.get("asset_id")), self.scene_map.get(candidate.get("scene_id"))
+            if not asset or not scene or scene["asset_id"] != asset["id"] or asset["library_id"] not in self.library_ids:
                 continue
-            identity = source_shot_key(candidate)
-            previous = unique.get(identity)
-            if previous is None or candidate["source_end"]-candidate["source_start"] > previous["source_end"]-previous["source_start"]:
-                unique[identity] = candidate
-
-        def review_batch(batch, *, relevance, with_images):
-            check_cancel(stop)
-            images = []
-            if with_images:
-                for candidate in batch:
-                    check_cancel(stop)
-                    output_dir = self.store.directory(candidate["library_id"]) / "frames" / candidate["asset_id"] / candidate["_review_id"]
-                    candidate["frame_paths"] = extract_frames(candidate["video_path"], candidate["source_start"], candidate["source_end"], 3, output_dir)
-                    images.extend(candidate["frame_paths"])
-            expected = {item["_review_id"]: item for item in batch}
-            prompt = (
-                "检查每个实际裁剪范围，逐一返回全部scene_id且每项仅一次。"
-                "任一给定图出现滚动职员表、演职员名单或制作/声优等演职员字幕，usable=false；混合或未知也为false。"
-                "普通对白字幕、歌词、剧情中的文字不因此禁用。content_kind为story/credits/mixed/unknown，仅story可usable=true。"
-                "usable只判断画面可用性，与原文不相关的剧情仍是story且usable=true；用relation判断相关性。"
-                + ("每个候选按顺序附3张实际范围图片，frame_index为该候选0至2。" if with_images else
-                   "本次不附新图片，已独立完成画面可用性检查；根据范围字幕和已有描述判断内容，无法确认的细节标unknown。")
-            )
-            fields = "scene_id,usable:true或false,content_kind,reason,confidence:0至1,frame_index:0至2"
-            if relevance:
-                prompt += (
-                    "内容关系与画面可用性分开判断。relation为direct(直接支持当前具体原文)/supporting(有具体联系的辅助)/unrelated/unknown。"
-                    "claim是当前论点，required_facts是原文明示的具体硬约束，不要求一个镜头证明整套作品理论。"
-                    "facts_match表示具体硬约束满足且情境方向无冲突；为空不等于自动通过。身份、事件、时期或关系不符为false，并在conflicts列出冲突。"
-                    "visual_evidence只列实际可见的动作、状态或环境，不放对白原句、对白改写或根据对白猜测的事实。对白依据只能选择subtitle_ids。"
-                    "只有同作品、出现同一个人、同样谈成长/责任，不足以证明具体事件。"
-                    "evidence类原文必须有直接证据，不能用情绪空镜代替。抽象论述可用有具体同向联系的辅助画面，但不能编造剧情事实。"
-                    "否认关系不能支持建立关系，逃避不能支持承担责任；关键词相同但方向相反必须列入conflicts并拒绝。"
-                    "人物在字幕中被提及不等于出现在画面；窗口描述只作背景，不能把窗口外事件当作本镜头发生的事。"
-                    "遵守avoid。subtitle_ids仅选本候选subtitle_entries中的完整id，不得使用别的候选编号、窗口台词或自编编号；不返回subtitle_quotes或evidence。"
-                    "字幕条目可能只与裁剪范围部分重叠，不能声称整句都在本镜头内说完。没有可引用字幕时subtitle_ids为空，不猜人物身份。"
-                    "未选中或相关性不足的内容不能以过渡名义放行；reason不超过120字，每项visual_evidence/conflicts/subtitle_ids最多3条。"
-                    f"\n当前原文：{segment.text}\n当前需求：{json.dumps(segment.requirement, ensure_ascii=False)}"
-                    f"\n全文背景（不用于替代当前原文）：{overview[:800]}"
-                )
-                fields += ",relation,facts_match:true或false,visual_evidence:[仅可见依据],conflicts:[],subtitle_ids:[]"
-            payload = [{"scene_id": item["_review_id"], "source_start": item["source_start"], "source_end": item["source_end"],
-                        "window_description": item["description"], "subtitle_entries": item["subtitle_entries"],
-                        "subtitle_state": item["subtitle_state"]} for item in batch]
-            requests, previous_after = [], gateway.after_request
-
-            def after_request(details):
-                requests.append({k: details[k] for k in ("request_file", "http_status", "failure_category") if k in details})
-                if previous_after:
-                    previous_after(details)
-
-            gateway.after_request = after_request
-            try:
-                result = gateway.json(prompt + f"\n返回JSON {{clips:[{{{fields}}}]}}。\n候选顺序：" + json.dumps(payload, ensure_ascii=False),
-                    images=images or None, model_kind="vision" if with_images else "text", max_output=3600,
-                    required={"clips": list}, result_validator=lambda value: _match_result(value, expected, with_images, relevance=relevance),
-                    request_metadata={"visual_unit_id": segment.id, "evidence_protocol": SUBTITLE_EVIDENCE_VERSION,
-                                      "candidate_file": cache_file.relative_to(directory).as_posix(),
-                                      "candidates": self._request_sources(batch, with_images=with_images),
-                                      "selected_scene_ids": [item["scene_id"] for item in batch]})
-            finally:
-                gateway.after_request = previous_after
-            reviews.append({"requests": requests, "relevance": relevance, "with_images": with_images,
-                "clips": [{"scene_id": row["scene_id"], "asset_id": expected[row["scene_id"]]["asset_id"],
-                    "source_start": expected[row["scene_id"]]["source_start"], "source_end": expected[row["scene_id"]]["source_end"],
-                    "allowed_subtitle_ids": [entry["id"] for entry in expected[row["scene_id"]]["subtitle_entries"]],
-                    "response": row["_raw_response"], "validation_issues": row["_validation_issues"]} for row in result["clips"]]})
-            # Persist each completed batch even if a later provider request fails.
-            write_json(cache_file, {"key": key, "version": MATCH_POLICY_VERSION, "evidence_protocol": SUBTITLE_EVIDENCE_VERSION,
-                                   "visual_unit_id": segment.id, "reviews": reviews, "value": [], "rejected": []})
-            return {row["scene_id"]: row for row in result["clips"]}
-
-        def remember_review(candidate, judgment, *, relevance, with_images):
-            if with_images and judgment["_usability_valid"]:
-                safety = {k: judgment[k] for k in ("scene_id", "usable", "content_kind", "reason")}
-                self.store.cache_put(candidate["library_id"], candidate["_safety_key"], safety)
-                candidate["_safety"] = safety
-                if not safety["usable"]:
-                    self._reject(candidate, safety, gateway)
-            if judgment["_validation_issues"]:
-                self.unconfirmed.add(candidate["_review_key"])
-            elif relevance:
-                self.store.cache_put(candidate["library_id"], candidate["_review_key"],
-                                     {k: v for k, v in judgment.items() if not k.startswith("_")})
-            if relevance or judgment["_validation_issues"]:
-                candidate["_judgment"] = judgment
-                selection.append(candidate)
-
-        pending, selection = [], []
-        for candidate in unique.values():
-            check_cancel(stop)
+            if candidate.get("fingerprint") != asset["fingerprint"] or candidate.get("fps") != asset["fps"] or \
+                    any(type(candidate.get(k)) not in (int, float) or not math.isfinite(candidate[k]) for k in
+                        ("source_start", "source_end", "natural_start", "natural_end")) or \
+                    not 0 <= candidate["natural_start"] <= candidate["source_start"] < candidate["source_end"] <= candidate["natural_end"] <= asset["duration"]+.01:
+                continue
+            candidate.update(video_path=asset["path"], library_id=asset["library_id"], description=self.documents[self.scene_indices[scene["id"]]][0][:1800])
             self._load_exclusions(candidate, gateway)
             if not self.range_allowed(candidate):
                 continue
             safety_key = "visual-usability:" + stable_hash((VISUAL_POLICY_VERSION, candidate["fingerprint"],
                 candidate["source_start"], candidate["source_end"], gateway.signature("vision")))
-            candidate.update(_safety_key=safety_key, _review_id=stable_hash(safety_key)[:24])
-            entries, subtitle_key, subtitle_state = self._range_subtitle(candidate, assets[candidate["asset_id"]])
-            review_key = "visual-unit-match:" + stable_hash((MATCH_POLICY_VERSION, SUBTITLE_EVIDENCE_VERSION, self.version, safety_key, segment.id,
-                segment.text, segment.requirement, subtitle_key, entries, verify_visual,
+            candidate.update(_safety_key=safety_key, _review_id=stable_hash(safety_key)[:24], _verify_visual=verify_visual,
+                             visual_unit_id=segment.id)
+            entries, subtitle_key, state = self._range_subtitle(candidate, asset)
+            legacy = "visual-unit-match:" + stable_hash((MATCH_POLICY_VERSION, SUBTITLE_EVIDENCE_VERSION, self.version,
+                safety_key, segment.id, segment.text, segment.requirement, subtitle_key, entries, verify_visual,
                 gateway.signature("text"), gateway.signature("vision")))
-            candidate.update(_review_key=review_key, subtitle_entries=entries, subtitle_state=subtitle_state)
-            if review_key in self.unconfirmed:
+            key = "visual-unit-match:" + stable_hash((MATCH_POLICY_VERSION, SUBTITLE_EVIDENCE_VERSION, "range-context-v2",
+                safety_key, segment.id, segment.text, segment.requirement, candidate["description"], entries, verify_visual,
+                gateway.signature("text"), gateway.signature("vision")))
+            if candidate.get("_review_key") != key:
+                candidate.pop("proposal_version", None)
+                candidate.pop("_screened", None)
+            candidate.update(_review_key=key, subtitle_entries=entries, subtitle_state=state)
+            candidate.pop("_rejected", None)
+            if candidate.pop("_unconfirmed", False):
+                candidate.pop("_screened", None)
+            if key in self.rejected_matches:
                 continue
             safety = self.store.cache_get(candidate["library_id"], safety_key)
-            judgment = self.store.cache_get(candidate["library_id"], review_key)
             try:
                 if safety is not None:
                     _review_result({"clips": [safety]}, {candidate["_review_id"]})
@@ -398,76 +371,286 @@ class MaterialRetriever:
                         continue
             except (ModelFormatError, TypeError, KeyError):
                 safety = None
-            if judgment is not None:
-                try:
-                    if not isinstance(judgment, dict) or judgment.get("evidence_protocol") != SUBTITLE_EVIDENCE_VERSION:
-                        raise ModelFormatError("旧字幕证据协议需重新确认。")
-                    judgment = _match_result({"clips": [judgment]}, {candidate["_review_id"]: candidate}, verify_visual)["clips"][0]
-                    if judgment["_validation_issues"]:
-                        judgment = None
-                except (ModelFormatError, TypeError, KeyError):
-                    judgment = None
             candidate["_safety"] = safety
-            if judgment is None or (not verify_visual and safety is None):
-                pending.append(candidate)
-            else:
-                candidate["_judgment"] = judgment
-                selection.append(candidate)
-        if not verify_visual:
-            safety_pending = [item for item in pending if item["_safety"] is None]
-            for offset in range(0, len(safety_pending), 6):
-                batch = safety_pending[offset:offset+6]
-                rows = review_batch(batch, relevance=False, with_images=True)
-                for candidate in batch:
-                    remember_review(candidate, rows[candidate["_review_id"]], relevance=False, with_images=True)
-        for offset in range(0, len(pending), 6):
-            batch = [item for item in pending[offset:offset+6] if self.range_allowed(item)
-                     and item["_review_key"] not in self.unconfirmed and (verify_visual or item["_safety"] is not None)]
+            judgment = self.store.cache_get(candidate["library_id"], key)
+            migrated = judgment is None
+            if judgment is None:
+                judgment = self.store.cache_get(candidate["library_id"], legacy)
+            valid = False
+            if isinstance(judgment, dict) and judgment.get("evidence_protocol") == SUBTITLE_EVIDENCE_VERSION:
+                try:
+                    checked = _match_result({"clips": [judgment]}, {candidate["_review_id"]: candidate}, verify_visual)["clips"][0]
+                except (ModelFormatError, TypeError, KeyError):
+                    checked = None
+                if checked is not None and not checked["_validation_issues"] and (verify_visual or safety is not None):
+                    valid = self._remember(segment, candidate, checked, cached=True)
+                    if migrated:
+                        self.store.cache_put(candidate["library_id"], key, {k: v for k, v in checked.items() if not k.startswith("_")})
+                    if not valid:
+                        continue
+            if not valid:
+                for name in ("match_policy", "visual_policy", "facts_match", "relation", "confidence", "usable", "content_kind"):
+                    candidate.pop(name, None)
+                candidate["pending_review"] = True
+                query = set(self.tokens(segment.text + " " + json.dumps(segment.requirement, ensure_ascii=False)))
+                observation = self.store.cache_get(candidate["library_id"], "visual-observation:" + stable_hash(safety_key)) or {}
+                facts = observation.get("facts", []) if isinstance(observation, dict) else []
+                candidate["observed_facts"] = facts if isinstance(facts, list) and all(isinstance(x, str) for x in facts) else []
+                scores = [(len(query & set(self.tokens(row["text"]))), row) for row in entries]
+                best = max(scores, key=lambda item: item[0], default=(0, None))
+                score = 4*sum(value for value, _ in scores) + 2*len(query & set(self.tokens(" ".join(candidate["observed_facts"]))))
+                lexical = candidate.get("score", 0)
+                lexical = lexical if type(lexical) in (int, float) and math.isfinite(lexical) else 0
+                score += len(query & set(self.tokens(candidate["description"]))) + math.log1p(max(0, lexical))
+                candidate["proposal_score"] = score/(1+score)
+                if best[0]:
+                    row = best[1]
+                    candidate["anchor"] = (row["overlap_start"]+row["overlap_end"])/2
+            identity = source_shot_key(candidate)
+            previous = unique.get(identity)
+            rank = lambda item: (not item.get("pending_review", True), item.get("confidence", item.get("proposal_score", 0)), item["source_end"]-item["source_start"])
+            if previous is None or rank(candidate) > rank(previous):
+                unique[identity] = candidate
+        return sorted(unique.values(), key=lambda item: (not item.get("pending_review", True), item.get("confidence", item.get("proposal_score", 0))), reverse=True)
+
+    def restore_candidates(self, directory, segments, assets, gateway, verify_visual):
+        """Recover paid positive results; database replies are revalidated for the current manuscript."""
+        result = {identifier: [] for identifier in segments}
+        for path in (Path(directory)/"candidates").glob("*.json"):
+            try:
+                saved = read_json(path)
+                if not isinstance(saved, dict):
+                    continue
+                for candidate in saved.get("value", []):
+                    unit = candidate.get("visual_unit_id")
+                    if unit in segments:
+                        rows = self.prepare(segments[unit], [candidate], assets, gateway, verify_visual)
+                        result[unit].extend(row for row in rows if row.get("pending_review") is False)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        return result
+
+    def shortlist(self, groups, gateway, directory, stop=None, *, search_round=0):
+        """Batch text-only choices; all choices remain provisional until explicit review."""
+        pairs = []
+        for segment, candidates, needed in groups:
+            capacity = 0
+            for candidate in candidates:
+                if candidate.pop("_force_review", False):
+                    candidate.update(proposal_version=PROPOSAL_VERSION, _screened=True)
+                    continue
+                if candidate.get("pending_review") and not candidate.get("_screened") and candidate["_review_key"] not in self.unconfirmed:
+                    pairs.append((segment, candidate))
+                    capacity += min(needed, candidate["source_end"]-candidate["source_start"])
+                    if capacity >= max(2, needed*2) or sum(s.id == segment.id for s, _ in pairs) >= 8:
+                        break
+        def submit(batch):
             if not batch:
+                return
+            check_cancel(stop)
+            units = {s.id: s for s, _ in batch}
+            clips = {c["_safety_key"]: c for _, c in batch}
+            ua = {name: f"U{i}" for i, name in enumerate(units, 1)}
+            ca = {key: f"C{i}" for i, key in enumerate(clips, 1)}
+            allowed = {ua[name]: [ca[c["_safety_key"]] for s, c in batch if s.id == name] for name in units}
+            identity = stable_hash((PROPOSAL_VERSION, gateway.signature("text_fast"),
+                [(s.id, self.unit_payload(s), c["_review_key"], c["subtitle_entries"], c.get("observed_facts")) for s, c in batch]))
+            path = Path(directory)/"planning"/f"preselect-{identity[:24]}.json"
+            try:
+                saved = read_json(path, default={})
+            except (OSError, ValueError):
+                saved = {}
+            chosen = saved.get("chosen") if isinstance(saved, dict) and saved.get("key") == identity and not saved.get("incomplete") else None
+            if not isinstance(chosen, list) or any(not isinstance(row, list) or len(row) != 2 or not all(isinstance(x, str) for x in row) for row in chosen):
+                chosen = None
+            if chosen is None:
+                reply = None
+                if len(clips) <= 3:
+                    chosen = [[s.id, c["_review_key"]] for s, c in batch]
+                else:
+                    payload = {"units": [{"id": ua[name], **self.unit_payload(s), "candidates": allowed[ua[name]]} for name, s in units.items()],
+                        "clips": [{"id": ca[key], "background": c["description"], "observed": c.get("observed_facts", []), "observation_partial": True,
+                                   "subtitles": [row["text"] for row in c["subtitle_entries"]]} for key, c in clips.items()]}
+                    def validate(value):
+                        rows = value.get("selections")
+                        if not isinstance(rows, list) or any(not isinstance(r, dict) or not isinstance(r.get("unit_id"), str) for r in rows) or \
+                                len(rows) != len(allowed) or {r["unit_id"] for r in rows} != set(allowed):
+                            raise ModelFormatError("selections须逐一返回所有unit_id且各一次："+str(allowed))
+                        invalid = []
+                        for row in rows:
+                            ids = row.get("clip_ids")
+                            if not isinstance(ids, list) or any(not isinstance(x, str) or x not in allowed[row["unit_id"]] for x in ids) or len(ids) != len(set(ids)):
+                                invalid.append(row["unit_id"])
+                        return {"selections": [{**row, "clip_ids": []} if row["unit_id"] in invalid else row for row in rows],
+                                "invalid_units": invalid, "raw_response": value}
+                    prompt = ("为文案预选值得进一步核对的少数镜头，只返回编号；预选不等于事实确认。"
+                        "背景与字幕不证明实际画面必然出现某人或事件；observed只是部分线索，未列不等于不存在。具体人物/事件要对应，抽象论述可用有具体同向联系的情境。"
+                        "遵守required_facts和avoid，否认关系不能支持建立关系。按相关性排序，证据不足可空，不按时长硬凑。"
+                        "返回{selections:[{unit_id,clip_ids:[]}]}，每个单元一次，不写解释。\n"+json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+                    limit = int(gateway.settings["text_fast"].get("max_prompt_chars", 16000))
+                    if len(prompt) > limit or len(prompt)*2+1024 >= int(gateway.settings["text_fast"].get("context_tokens", 64000)):
+                        if len(batch) > 1:
+                            submit(batch[:len(batch)//2]); submit(batch[len(batch)//2:])
+                        else:
+                            segment, candidate = batch[0]
+                            candidate["_screened"] = True
+                            self._remember(segment, candidate, {"_validation_issues": [{"field": "input", "category": "input_budget",
+                                "message": "文字预选单镜头输入超过模型预算，保留为未确认，调整上下文设置后可继续。"}]})
+                        return
+                    gateway.context.update(stage="候选文字预选", segment="、".join(units))
+                    value = gateway.json(prompt, model_kind="text_fast", max_output=1200, required={"selections": list}, result_validator=validate,
+                        request_metadata={"usage_stage": "text_preselect", "search_round": search_round,
+                                          "pairs": [{"unit_id": s.id, "review_key": c["_review_key"]} for s, c in batch]})
+                    reply = value["raw_response"]
+                    selected = {(r["unit_id"], x) for r in value["selections"] for x in r["clip_ids"]}
+                    for segment, candidate in batch:
+                        if ua[segment.id] in value.get("invalid_units", []):
+                            self._remember(segment, candidate, {"_validation_issues": [{"field": "preselection", "category": "invalid_selection",
+                                "message": "文字预选返回的候选编号类型、归属或唯一性无效，本次未确认。"}]})
+                    chosen = [[s.id, c["_review_key"]] for s, c in batch if (ua[s.id], ca[c["_safety_key"]]) in selected]
+                write_json(path, {"key": identity, "chosen": chosen, "response": reply,
+                                  "incomplete": any(c["_review_key"] in self.unconfirmed for _, c in batch)})
+            for segment, candidate in batch:
+                candidate["_screened"] = True
+                if [segment.id, candidate["_review_key"]] in chosen:
+                    candidate["proposal_version"] = PROPOSAL_VERSION
+        batch, unique, unit_ids = [], set(), set()
+        for pair in pairs:
+            source = pair[1]["_safety_key"]
+            if batch and (len(unique | {source}) > 20 or len(unit_ids | {pair[0].id}) > 4):
+                submit(batch)
+                batch, unique, unit_ids = [], set(), set()
+            batch.append(pair); unique.add(source); unit_ids.add(pair[0].id)
+        submit(batch)
+
+    def review_pairs(self, pairs, gateway, directory, stop=None, *, search_round=0, _safety_only=False):
+        """Only proposed pairs reach this final review; images/catalogues are shared by range."""
+        accepted = []
+        for offset in range(0, len(pairs), 6):
+            batch = pairs[offset:offset+6]
+            check_cancel(stop)
+            units = {s.id: s for s, _ in batch}
+            clips = {c["_safety_key"]: c for _, c in batch}
+            ua = {name: f"U{i}" for i, name in enumerate(units, 1)}
+            ca = {key: f"C{i}" for i, key in enumerate(clips, 1)}
+            aliases = {f"P{i}": pair for i, pair in enumerate(batch, 1)}
+            references = {f"{ca[key]}:L{i}": row["id"] for key, c in clips.items() for i, row in enumerate(c["subtitle_entries"], 1)}
+            with_images = _safety_only or batch[0][1]["_verify_visual"]
+            # With confirmation disabled, the existing independent visual safety check still runs on cache misses.
+            safety_only = not with_images and any(c.get("_safety") is None for c in clips.values())
+            if safety_only:
+                safety_batch = [(s, c) for s, c in batch if c.get("_safety") is None]
+                self.review_pairs(safety_batch, gateway, directory, stop, search_round=search_round, _safety_only=True)
+                batch = [(s, c) for s, c in batch if c.get("_safety") and c["_safety"]["usable"] and c["_review_key"] not in self.unconfirmed]
+                if batch:
+                    accepted.extend(self.review_pairs(batch, gateway, directory, stop, search_round=search_round))
                 continue
-            rows = review_batch(batch, relevance=True, with_images=verify_visual)
-            for candidate in batch:
-                remember_review(candidate, rows[candidate["_review_id"]], relevance=True, with_images=verify_visual)
-        approved, rejected = [], []
-        for candidate in selection:
-            judgment = candidate.pop("_judgment")
-            candidate.pop("_safety", None)
-            statistics["checked"] += 1
-            issues = judgment["_validation_issues"]
-            if issues:
-                statistics["unconfirmed"] += 1
-                category = "字幕引用未确认" if any(issue["field"] == "subtitle_ids" for issue in issues) else "候选格式未确认"
-                statistics["reasons"][category] = statistics["reasons"].get(category, 0) + 1
-                record = {"scene_id": candidate["scene_id"], "review_id": candidate["_review_id"],
-                          "candidate_file": cache_file.relative_to(directory).as_posix(),
-                          "source_start": candidate["source_start"], "source_end": candidate["source_end"],
-                          "relation": "unknown", "category": category, "validation_issues": issues,
-                          "reason": "; ".join(issue["message"] for issue in issues)}
-                rejected.append(record)
-                if len(statistics["examples"]) < 12:
-                    statistics["examples"].append(record)
+            images = []
+            if with_images:
+                for c in clips.values():
+                    folder = self.store.directory(c["library_id"])/"frames"/c["asset_id"]/c["_review_id"]
+                    c["frame_paths"] = extract_frames(c["video_path"], c["source_start"], c["source_end"], 3, folder)
+                    images.extend(c["frame_paths"])
+            payload = {"units": [{"id": ua[name], **self.unit_payload(s)} for name, s in units.items()],
+                "clips": [{"id": ca[key], "background": c["description"],
+                    "subtitles": [{"id": f"{ca[key]}:L{i}", "text": row["text"]} for i, row in enumerate(c["subtitle_entries"], 1)]}
+                    for key, c in clips.items()],
+                "pairs": [{"scene_id": alias, "unit": ua[s.id], "clip": ca[c["_safety_key"]]} for alias, (s, c) in aliases.items()]}
+            def validate(value):
+                rows = _review_rows(value, aliases)
+                normalized = []
+                for original in rows:
+                    segment, candidate = aliases[original["scene_id"]]
+                    row = {**original, "scene_id": candidate["_review_id"]}
+                    if isinstance(row.get("subtitle_ids"), list):
+                        row["subtitle_ids"] = [references.get(x, "unknown:"+x) if isinstance(x, str) else x for x in row["subtitle_ids"]]
+                    checked = _match_result({"clips": [row]}, {candidate["_review_id"]: candidate}, with_images, relevance=not _safety_only)["clips"][0]
+                    checked.update(_pair=original["scene_id"], _raw_response=original)
+                    normalized.append(checked)
+                return {"clips": normalized}
+            prompt = ("逐一检查pairs，仅返回每个P编号一次。clips按顺序各附3图，frame_index是该素材内0至2。"
+                "usable仅判断画面：剧情story为true，职员表/演职员名单credits、混合mixed、不明unknown为false；普通对白/歌词不因此禁用。"
+                "relation为direct/supporting/unrelated/unknown，facts_match须满足本单元具体事实且方向无冲突。"
+                "evidence类须直接证据；abstract/state/transition可用有具体同向联系的辅助画面，不要求单镜头证明整套理论。"
+                "遵守人物/时期/事件/关系及avoid，提及人物不等于出现，否认不能支持建立关系；背景仅作线索，不把窗口外剧情当本镜头。"
+                "visual_evidence仅写可见动作/状态/环境，不写对白；subtitle_ids只选本素材的C编号字幕，不跨素材、不抄引文。"
+                "字幕可能仅部分重叠，不能声称整句在范围内说完。给具体短依据，拒绝理由简短，每种依据最多3条。"
+                "返回{clips:[{scene_id,usable,content_kind,reason,confidence,frame_index,relation,facts_match,visual_evidence:[],conflicts:[],subtitle_ids:[]}]}。\n")
+            if not with_images:
+                prompt = prompt.replace("clips按顺序各附3图，frame_index是该素材内0至2。", "本次无新图，已独立检查画面可用性；据范围字幕和已有描述核对内容，不明细节标unknown。")
+            if _safety_only:
+                prompt = ("仅检查实际画面可用性，每个P编号一次。每个C按顺序附3张图，frame_index为该C内0至2。"
+                    "story剧情为usable=true；职员表/演职员名单credits、混合mixed、不明unknown为false。普通对白、歌词不因此禁用。"
+                    "返回{clips:[{scene_id,usable,content_kind,reason,confidence,frame_index}]}，不判断文案关系。\n")
+                payload = {"clips": [{"id": ca[key]} for key in clips],
+                           "pairs": [{"scene_id": a, "clip": ca[c["_safety_key"]]} for a, (_, c) in aliases.items()]}
+            text = prompt+json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            identity = stable_hash((PROPOSAL_VERSION, [(s.id, c["_review_key"]) for s, c in batch], with_images))
+            path = Path(directory)/"candidates"/f"review-{identity[:24]}.json"
+            limit = int(gateway.settings["vision" if with_images else "text"].get("max_prompt_chars", 16000))
+            too_large = len(text) > limit or len(text)*2+len(images)*1600+1024 >= int(gateway.settings["vision" if with_images else "text"].get("context_tokens", 64000))
+            if too_large:
+                if len(batch) > 1:
+                    accepted.extend(self.review_pairs(batch[:len(batch)//2], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only))
+                    accepted.extend(self.review_pairs(batch[len(batch)//2:], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only))
+                else:
+                    segment, candidate = batch[0]
+                    self._remember(segment, candidate, {"_validation_issues": [{"field": "input", "category": "input_budget", "message": "单镜头输入超过本模型预算，请调整模型上下文设置。"}]})
                 continue
-            candidate.update(**{name: judgment[name] for name in ("relation", "facts_match", "evidence", "conflicts", "subtitle_quotes",
-                                                                 "subtitle_ids", "visual_evidence", "evidence_protocol")},
-                usable=judgment["usable"], content_kind=judgment["content_kind"], visual_policy=VISUAL_POLICY_VERSION,
-                match_policy=MATCH_POLICY_VERSION, visual_unit_id=segment.id, visual_checked=verify_visual,
-                confidence=confidence(judgment.get("confidence")), reason=judgment["reason"],
-                weak_match=judgment["relation"] != "direct" or not verify_visual)
-            if not candidate["usable"] or not self.range_allowed(candidate) or not match_allowed(candidate, segment.requirement):
-                reason = "; ".join(judgment["conflicts"]) or judgment["reason"]
-                category = "画面不可用" if not candidate["usable"] else judgment["relation"] if judgment["facts_match"] else "事实未对应"
-                statistics["reasons"][category] = statistics["reasons"].get(category, 0) + 1
-                record = {"scene_id": candidate["scene_id"], "source_start": candidate["source_start"], "source_end": candidate["source_end"],
-                          "relation": judgment["relation"], "reason": reason}
-                rejected.append(record)
-                if len(statistics["examples"]) < 12:
-                    statistics["examples"].append(record)
-                continue
-            anchor_frame = frame_index(judgment.get("frame_index", 1)) if verify_visual else 1
-            candidate["anchor"] = candidate["source_start"] + (candidate["source_end"]-candidate["source_start"]) * (anchor_frame+.5)/3
-            approved.append(candidate)
-            statistics["approved"] += 1
-        approved.sort(key=lambda item: (item["relation"] == "direct", item["confidence"]), reverse=True)
-        write_json(cache_file, {"key": key, "version": MATCH_POLICY_VERSION, "visual_unit_id": segment.id,
-                               "evidence_protocol": SUBTITLE_EVIDENCE_VERSION, "value": approved, "rejected": rejected, "reviews": reviews})
-        return approved
+            gateway.context.update(stage="检查句意与实际镜头", segment="、".join(units))
+            requests, previous_after = [], gateway.after_request
+            def after(details):
+                requests.append({k: details[k] for k in ("request_file", "usage", "http_status") if k in details})
+                if previous_after:
+                    previous_after(details)
+            gateway.after_request = after
+            try:
+                result = gateway.json(text, images=images or None, model_kind="vision" if with_images else "text", max_output=2400,
+                    required={"clips": list}, result_validator=validate,
+                    request_metadata={"usage_stage": "visual_safety" if _safety_only else "visual_review", "search_round": search_round,
+                        "candidate_file": path.relative_to(directory).as_posix(), "canonical_pairs": {
+                            alias: {"unit_id": s.id, "review_id": c["_review_id"]} for alias, (s, c) in aliases.items()},
+                        "subtitle_aliases": references, "candidates": self._request_sources(list(clips.values()), with_images=with_images)})
+            finally:
+                gateway.after_request = previous_after
+            approved, diagnostics = [], []
+            for row in result["clips"]:
+                segment, candidate = aliases[row["_pair"]]
+                candidate.pop("proposal_version", None)
+                if with_images and row["_usability_valid"]:
+                    safety = {k: row[k] for k in ("scene_id", "usable", "content_kind", "reason")}
+                    self.store.cache_put(candidate["library_id"], candidate["_safety_key"], safety)
+                    candidate["_safety"] = safety
+                    if not safety["usable"]:
+                        self._reject(candidate, safety, gateway)
+                    elif isinstance(row.get("visual_evidence"), list) and all(isinstance(x, str) for x in row["visual_evidence"]):
+                        self.store.cache_put(candidate["library_id"], "visual-observation:"+stable_hash(candidate["_safety_key"]),
+                                             {"partial": True, "facts": row["visual_evidence"]})
+                if _safety_only:
+                    if row["_validation_issues"]:
+                        self._remember(segment, candidate, row)
+                elif not row["_validation_issues"]:
+                    self.store.cache_put(candidate["library_id"], candidate["_review_key"], {k: v for k, v in row.items() if not k.startswith("_")})
+                if not _safety_only and self._remember(segment, candidate, row):
+                    accepted.append(candidate); approved.append(candidate)
+                diagnostics.append({"unit_id": segment.id, "review_id": candidate["_review_id"],
+                    "source_start": candidate["source_start"], "source_end": candidate["source_end"],
+                    "response": row["_raw_response"], "validation_issues": row["_validation_issues"]})
+            try:
+                previous = read_json(path, default={})
+            except (OSError, ValueError):
+                previous = {}
+            history = previous.get("history", []) if isinstance(previous, dict) else []
+            if not isinstance(history, list):
+                history = []
+            if isinstance(previous, dict) and previous.get("reviews"):
+                history.append({k: previous[k] for k in ("reviews", "requests", "subtitle_aliases") if k in previous})
+            write_json(path, {"key": identity, "version": MATCH_POLICY_VERSION, "value": approved, "reviews": diagnostics,
+                              "requests": requests, "subtitle_aliases": references, "history": history})
+        return accepted
+
+    def select(self, segment, overview, gateway, directory, used=(), verify_visual=True, stop=None, *, candidates, scene_boundaries, assets):
+        prepared = self.prepare(segment, candidates, assets, gateway, verify_visual, scene_boundaries=scene_boundaries)
+        prepared = [c for c in prepared if unused_source(c, used)]
+        return [c for c in prepared if not c.get("pending_review")] + self.review_pairs(
+            [(segment, c) for c in prepared if c.get("pending_review") and unused_source(c, used)], gateway, directory, stop)

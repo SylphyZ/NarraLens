@@ -9,7 +9,7 @@ import wave
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from app.services.library.gateway import ModelGateway
+from app.services.library.gateway import ModelGateway, ModelUsage
 from app.services.library.retriever import MaterialRetriever
 from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
 from app.services.library import runner
@@ -364,6 +364,10 @@ def _task_options(text, options, *, draft=False, reuse_audio=False):
     if not isinstance(options, dict):
         raise ValueError("项目设置应为对象。")
     result = motion_options(bgm_options(normalized_audio_options(options)))
+    value = result.get("visual_no_gain_rounds", 2)
+    if type(value) is not int or value < 1:
+        raise ValueError("连续无改善轮数需为正整数。")
+    result["visual_no_gain_rounds"] = value
     for name in ("subtitles", "verify_visual", "mask_source_subtitles", "subtitle_allow_short"):
         if name in result and type(result[name]) is not bool:
             raise ValueError(name + " 应为开关。")
@@ -608,7 +612,7 @@ def _preserve_visual_result(directory):
                              (final.stat().st_size, final.stat().st_mtime_ns) if final.is_file() else None))
     archive = directory / "history" / ("visual-" + signature[:20])
     archive.mkdir(parents=True, exist_ok=True)
-    for name in ("timeline.json", "visual_plan.json", "visual_matches.json", "settings.json", "state.json", "motion/plan.json", "motion/manifest.json", "bgm_plan.json"):
+    for name in ("timeline.json", "visual_plan.json", "visual_matches.json", "visual_proposal.json", "visual_search_state.json", "settings.json", "state.json", "motion/plan.json", "motion/manifest.json", "bgm_plan.json"):
         source = directory / name
         if source.is_file():
             target = archive / name
@@ -627,17 +631,200 @@ def _preserve_visual_result(directory):
     write_json(archive / "retained-files.json", {"original_task": str(directory), "video": str(retained) if retained.is_file() else None})
 
 
+def _find_visual_shots(segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update):
+    """Propose globally, inspect only proposed pairs, and retain a resumable local search cursor."""
+    from app.models.timeline import NarrationSegment
+    from app.services.library.frame_extractor import scene_boundaries
+    from app.services.timeline_planner import (
+        MATCH_POLICY_VERSION, PROPOSAL_VERSION, VisualCapacityError, source_shot_key,
+        visual_unit_intervals, plan_visual_timeline, propose_visual_timeline,
+    )
+    units = visual_plan["units"]
+    visual_segments = {u["id"]: NarrationSegment(u["id"], u["text_start"], u["text_end"], text[u["text_start"]:u["text_end"]],
+                      u["requirement"], audio_start=u["start"], audio_end=u["end"]) for u in units}
+    asset_map = {a["id"]: a for a in assets}
+    verify = bool(options.get("verify_visual", True))
+    target = float(options.get("shot_seconds", 7))
+    no_gain_limit = int(options.get("visual_no_gain_rounds", 2))
+    key = stable_hash((PROPOSAL_VERSION, visual_plan["key"], retriever.version, verify, target,
+                      gateway.signature("text_fast"), gateway.signature("text"), gateway.signature("vision")))
+    path = directory/"visual_search_state.json"
+    try:
+        saved = read_json(path, default={})
+    except (OSError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict) or saved.get("key") != key or \
+            not isinstance(saved.get("pools", {}), dict) or not isinstance(saved.get("examined", {}), dict):
+        saved = {}
+    examined = {u["id"]: set(saved.get("examined", {}).get(u["id"], [])) for u in units}
+    exhausted = set(saved.get("exhausted", []))
+    no_gain = {u["id"]: 0 for u in units}  # Explicit continue grants another bounded expansion from the saved cursor.
+    pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify)
+    boundaries, fingerprint_boundaries = {}, {}
+    search_round = int(saved.get("search_round", 0))
+
+    def merge(identifier, values):
+        unique = {}
+        for c in pools[identifier]+values:
+            if c.get("_rejected") or not retriever.range_allowed(c):
+                continue
+            physical = source_shot_key(c)
+            rank = lambda row: (not row.get("pending_review", True), row.get("confidence", row.get("proposal_score", 0)), row["source_end"]-row["source_start"])
+            if physical not in unique or rank(c) > rank(unique[physical]):
+                unique[physical] = c
+        pools[identifier] = sorted(unique.values(), key=lambda c: (not c.get("pending_review", True),
+                                     c.get("confidence", c.get("proposal_score", 0))), reverse=True)
+
+    for u in units:
+        identifier = u["id"]
+        previous = saved.get("pools", {}).get(identifier, [])
+        merge(identifier, retriever.prepare(visual_segments[identifier], previous, assets, gateway, verify))
+
+    def ensure_boundaries(identifiers):
+        for identifier in dict.fromkeys(identifiers):
+            if identifier in boundaries:
+                continue
+            asset = asset_map[identifier]
+            fingerprint = asset["fingerprint"]
+            if fingerprint not in fingerprint_boundaries:
+                cache = retriever.store.directory(asset["library_id"])/"frames"/identifier/"shot-boundaries.json"
+                fingerprint_boundaries[fingerprint] = scene_boundaries(asset, cache, stop, diagnostic_directory=directory)
+            boundaries[identifier] = fingerprint_boundaries[fingerprint]
+
+    def fill_local(unit):
+        identifier = unit["id"]
+        if identifier in exhausted:
+            return
+        batch = retriever.retrieve(unit["requirement"], limit=4, excluded=examined[identifier])
+        if not batch:
+            exhausted.add(identifier)
+            return
+        examined[identifier].update(c["scene_id"] for c in batch)
+        ensure_boundaries(c["asset_id"] for c in batch)
+        merge(identifier, retriever.prepare(visual_segments[identifier], batch, assets, gateway, verify, scene_boundaries=boundaries))
+
+    def capacity(identifier):
+        return sum(min(target, c["source_end"]-c["source_start"]) for c in pools[identifier]
+                   if c.get("pending_review") is False and retriever.range_allowed(c))
+
+    def save(status, gaps, proposal):
+        write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": pools,
+            "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
+            "no_gain": no_gain, "search_round": search_round})
+        write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
+            "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
+        write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
+            "state": status, "timing_method": visual_plan["timing_method"], "search_policy": PROPOSAL_VERSION,
+            "excluded_windows": len(retriever.rejected_scenes), "excluded_ranges": len(retriever.rejected_ranges),
+            "units": {u["id"]: {"examined_windows": len(examined[u["id"]]),
+                "candidate_count": sum(c.get("pending_review") is False for c in pools[u["id"]]),
+                "pending_candidates": sum(c.get("pending_review") is True for c in pools[u["id"]]),
+                "exhausted": u["id"] in exhausted, "no_gain_rounds": no_gain[u["id"]],
+                **retriever.statistics.get(u["id"], {})} for u in units}, "gaps": gaps})
+
+    structural = [{"visual_unit_id": u["id"], "segment_id": u["segment_id"], "start": a, "end": b,
+                   "category": "short_interval", "missing_seconds": round(b-a, 3), "reason": "动画与句意边界留下不足1秒原片区间。"}
+                  for u in units for a, b in visual_unit_intervals(u, reservations)
+                  if b-a < min(1.0, visual_segments[u["id"]].audio_end-visual_segments[u["id"]].audio_start)-.001]
+    if structural:
+        proposal, _ = propose_visual_timeline(segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
+        save("incomplete", structural, proposal)
+        examples = "、".join(row["visual_unit_id"] for row in structural[:8])
+        raise JobPaused(f"发现{len(structural)}处不足1秒的原片区间（{examples}），已在候选模型复核前暂停。"
+                        "请扩大相邻手动动画范围或合并相邻句意范围后从3. 寻找画面继续；原配音、字幕、合格候选与旧成片保留。")
+
+    # Prepare all units locally before reserving scarce sources; this makes no provider calls.
+    for index, unit in enumerate(units):
+        check_cancel(stop)
+        if visual_unit_intervals(unit, reservations) and not pools[unit["id"]] and not examined[unit["id"]]:
+            fill_local(unit)
+        update("寻找画面", 47, f"复用已付费结果并本地整理候选 {index+1}/{len(units)}")
+    awaiting = {}
+    needed_seconds = sum(b-a for u in units for a, b in visual_unit_intervals(u, reservations))
+    while True:
+        check_cancel(stop)
+        for identifier in pools:
+            merge(identifier, [])
+        try:
+            shots = plan_visual_timeline(segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
+            ensure_boundaries(shot.asset_id for shot in shots if shot.visual_unit_id)
+            save("complete", [], shots)
+            return shots, boundaries, pools
+        except VisualCapacityError as exc:
+            gaps = exc.gaps
+        proposal_pools = {identifier: [c for c in rows if c.get("pending_review") is False or no_gain[identifier] < no_gain_limit]
+                          for identifier, rows in pools.items()}
+        proposal, _ = propose_visual_timeline(segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
+        confirmed, _ = propose_visual_timeline(segments, {k: [c for c in rows if c.get("pending_review") is False] for k, rows in pools.items()},
+                                             target_shot_seconds=target, visual_units=units, reservations=reservations)
+        covered = sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id)
+        progress = 47+22*min(1, covered/max(.001, needed_seconds))
+        pair_keys, pairs = set(), []
+        for shot in proposal:
+            identifier = shot.visual_unit_id
+            if not identifier or no_gain[identifier] >= no_gain_limit:
+                continue
+            candidate = next((c for c in pools[identifier] if c["asset_id"] == shot.asset_id and c["scene_id"] == shot.scene_id
+                and c["source_start"] <= shot.source_start+.000001 and c["source_end"] >= shot.source_end-.000001), None)
+            if candidate and candidate.get("pending_review") and candidate["_review_key"] not in retriever.unconfirmed:
+                pair = (identifier, candidate["_review_key"])
+                if pair not in pair_keys:
+                    pair_keys.add(pair); pairs.append((visual_segments[identifier], candidate))
+        save("searching", gaps, proposal)
+        if pairs:
+            batch = pairs[:6]
+            update("寻找画面", progress, f"确认拟用镜头{len(batch)}个；当前{len(gaps)}处缺口，已确认可分配画面{covered:.1f}秒")
+            retriever.review_pairs(batch, gateway, directory, stop, search_round=search_round)
+            for segment, _ in batch:
+                merge(segment.id, [])
+            continue
+        for identifier, previous in awaiting.items():
+            no_gain[identifier] = 0 if capacity(identifier) > previous+.001 else no_gain[identifier]+1
+        awaiting = {}
+        material = {r["visual_unit_id"] for r in gaps if r.get("category") != "short_interval"}
+        groups = []
+        for unit in units:
+            identifier = unit["id"]
+            if identifier not in material or no_gain[identifier] >= no_gain_limit:
+                continue
+            segment = visual_segments[identifier]
+            waiting = lambda: [c for c in pools[identifier] if c.get("pending_review") and not c.get("_screened")
+                              and c["_review_key"] not in retriever.unconfirmed]
+            before = capacity(identifier)
+            if not waiting():
+                fill_local(unit)
+            if not waiting() and identifier in exhausted and saved:
+                deferred = [c for c in pools[identifier] if c.get("pending_review") and not c.get("proposal_version")
+                            and c["_review_key"] not in retriever.unconfirmed][:3]
+                for candidate in deferred:
+                    candidate.update(_force_review=True, _screened=False)
+            if not waiting() and identifier in exhausted:
+                continue
+            awaiting[identifier] = before
+            groups.append((segment, waiting(), sum(b-a for a, b in visual_unit_intervals(unit, reservations))))
+        if not groups:
+            save("incomplete", gaps, proposal)
+            unconfirmed = sum(row.get("unconfirmed", 0) for row in retriever.statistics.values())
+            held = sum(value >= no_gain_limit for value in no_gain.values())
+            short = sum(row.get("category") == "short_interval" for row in gaps)
+            raise JobPaused(f"画面仍有{len(gaps)}处缺口，共缺{sum(r['missing_seconds'] for r in gaps):.2f}秒；"
+                f"{held}个单元连续{no_gain_limit}轮无新增合格时长，{short}处为短残段，{unconfirmed}个候选格式未确认。"
+                "本次停止自动扩大以控制Token；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
+                "从3. 寻找画面继续可复用缓存并沿保存的检索进度追加候选。")
+        update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；只对拟用镜头送图，当前已确认{covered:.1f}秒")
+        retriever.shortlist(groups, gateway, directory, stop, search_round=search_round)
+        search_round += 1
+        save("searching", gaps, proposal)
+
+
 def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *, start_stage="auto"):
-    from app.models.timeline import NarrationSegment, timeline_dict
+    from app.models.timeline import timeline_dict
     from app.services.narration_audio import (
         create_narration_subtitles, finalize_long_narration, synthesize_long_narration, synthesize_narration,
     )
     from app.services.narration_planner import fit_single_line_units, subtitle_text_ranges
-    from app.services.library.frame_extractor import scene_boundaries
     from app.services.timeline_planner import (
-        plan_visual_timeline, validate_timeline, coalesce_motion_shots,
-        natural_candidates, source_shot_key, make_visual_policy, visual_unit_intervals, VisualCapacityError,
-        MATCH_POLICY_VERSION,
+        validate_timeline, coalesce_motion_shots, make_visual_policy,
     )
     from app.services.timeline_renderer import render_timeline
 
@@ -652,6 +839,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
     checkpoint = _resume_checkpoint(directory, settings, text, level) if level else {}
     required = ["text"] if level <= 3 or (level == 4 and options["bgm_mode"] == "auto" and options["bgm_volume"] > 0) else []
     if level == 0 or (level == 2 and mode == LONG_MODE):
+        required.append("text_fast")
+    if level <= 3 and "text_fast" not in required:
         required.append("text_fast")
     # The relevance switch does not disable the independent credits/usability check.
     if level <= 3:
@@ -693,6 +882,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
         voice_profile = restore_voice(settings["voice"], voice_profile, profile_id=settings.get("models", {}).get("_bindings", {}).get("tts"))
     cache_source = task_directory(settings["parent_task_id"]) / "audio" if level <= 1 and settings.get("parent_task_id") else None
     model_calls = 0
+    usage = ModelUsage(directory)
+    state["token_usage"] = usage.snapshot()
 
     def update(phase, progress, message):
         state.update(state="running", phase=phase, progress=round(progress, 1), message=message, model_calls=model_calls)
@@ -708,6 +899,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
         entry = {"time": time.time(), "task_id": task_id, "phase": state.get("phase", ""), **record}
         with (directory / "model-diagnostics.jsonl").open("a", encoding="utf-8") as log:
             log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        usage.record(entry)
+        state.update(token_usage=usage.snapshot(), model_calls=model_calls)
         state["last_model_request"] = entry
         write_json(directory / "state.json", state)
 
@@ -817,98 +1010,13 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
             visual_plan = plan_visual_units(segments, text, overview, gateway, directory, stop,
                 progress=lambda p, message: update("规划句意画面", visual_start + p*2, message), reservations=reservations)
             assets = store.assets(selected_libraries) + motion_assets
-            asset_map = {asset["id"]: asset for asset in assets}
-            boundaries, fingerprint_boundaries = {}, {}
-            units = visual_plan["units"]
-            candidates_by_unit = {unit["id"]: [] for unit in units}
-            examined = {unit["id"]: set() for unit in units}
-            exhausted, gaps = set(), []
-
-            def write_matches(status, missing=()):
-                write_json(directory / "visual_matches.json", {"version": MATCH_POLICY_VERSION,
-                    "plan_key": visual_plan["key"], "state": status, "timing_method": visual_plan["timing_method"],
-                    "excluded_windows": len(retriever.rejected_scenes), "excluded_ranges": len(retriever.rejected_ranges),
-                    "units": {unit["id"]: {"examined_windows": len(examined[unit["id"]]),
-                        "candidate_count": len(candidates_by_unit[unit["id"]]), "exhausted": unit["id"] in exhausted,
-                        **retriever.statistics.get(unit["id"], {})} for unit in units}, "gaps": list(missing)})
-
-            def fill_unit(unit):
-                check_cancel(stop)
-                identifier = unit["id"]
-                if identifier in exhausted or not visual_unit_intervals(unit, reservations):
-                    return False
-                batch = retriever.retrieve(unit["requirement"], excluded=examined[identifier])
-                if not batch:
-                    exhausted.add(identifier)
-                    return False
-                examined[identifier].update(item["scene_id"] for item in batch)
-                for asset_id in dict.fromkeys(item["asset_id"] for item in batch):
-                    asset = asset_map[asset_id]
-                    if asset_id not in boundaries:
-                        if asset["fingerprint"] not in fingerprint_boundaries:
-                            cache_file = store.directory(asset["library_id"]) / "frames" / asset_id / "shot-boundaries.json"
-                            fingerprint_boundaries[asset["fingerprint"]] = scene_boundaries(asset, cache_file, stop,
-                                progress=lambda value: update("寻找画面", state["progress"],
-                                    f"{identifier} 检测第{asset['episode']}集切镜边界 {value:.0%}"), diagnostic_directory=directory)
-                        boundaries[asset_id] = fingerprint_boundaries[asset["fingerprint"]]
-                available_ids = {item["scene_id"] for item in natural_candidates(batch, boundaries, assets) if retriever.range_allowed(item)}
-                batch = [item for item in batch if item["scene_id"] in available_ids]
-                if batch:
-                    visual_segment = NarrationSegment(identifier, unit["text_start"], unit["text_end"],
-                        text[unit["text_start"]:unit["text_end"]], unit["requirement"], audio_start=unit["start"], audio_end=unit["end"])
-                    fresh = retriever.select(visual_segment, overview, gateway, directory,
-                        verify_visual=bool(options.get("verify_visual", True)), stop=stop,
-                        candidates=batch, scene_boundaries=boundaries, assets=assets)
-                    unique = {}
-                    for item in candidates_by_unit[identifier] + fresh:
-                        identity = source_shot_key(item)
-                        previous = unique.get(identity)
-                        if previous is None or (item["relation"] == "direct", item["confidence"], item["source_end"]-item["source_start"]) > \
-                                (previous["relation"] == "direct", previous["confidence"], previous["source_end"]-previous["source_start"]):
-                            unique[identity] = item
-                    candidates_by_unit[identifier] = list(unique.values())
-                return True
-
-            write_matches("collecting")
-            for index, unit in enumerate(units):
-                update("寻找画面", visual_start + 2 + (index+1)/len(units)*(66-visual_start-2),
-                       f"按句意寻找画面 {index+1}/{len(units)}，先收集全片候选，不使用未选中的过渡画面")
-                fill_unit(unit)
-                write_matches("collecting")
-            while True:
-                check_cancel(stop)
-                for identifier in candidates_by_unit:
-                    candidates_by_unit[identifier] = [item for item in candidates_by_unit[identifier] if retriever.range_allowed(item)]
-                try:
-                    shots = plan_visual_timeline(segments, candidates_by_unit, target_shot_seconds=float(options.get("shot_seconds", 7)),
-                        visual_units=units, reservations=reservations)
-                    break
-                except VisualCapacityError as shortage:
-                    gaps = shortage.gaps
-                    write_matches("searching", gaps)
-                    short_ids = {row["visual_unit_id"] for row in gaps if row.get("category") != "short_interval"}
-                    update("寻找画面", 67, f"仍有{len(gaps)}处句意缺口，缺少{shortage.missing_seconds:.2f}秒，继续寻找未用且内容匹配的画面")
-                    extended = False
-                    for unit in units:
-                        if unit["id"] in short_ids:
-                            extended = fill_unit(unit) or extended
-                            write_matches("searching", gaps)
-                    if not extended:
-                        write_matches("incomplete", gaps)
-                        identifiers = "、".join(row["visual_unit_id"] for row in gaps[:8])
-                        unconfirmed = sum(retriever.statistics.get(identifier, {}).get("unconfirmed", 0)
-                                          for identifier in {row["visual_unit_id"] for row in gaps})
-                        detail = (f"其中有{unconfirmed}个候选因引用或条目格式错误未确认，请查看画面匹配记录；"
-                                  "这些候选尚不能判定为内容不足，可从第3阶段重新评选。") if unconfirmed else ""
-                        raise JobPaused(f"画面匹配有{len(gaps)}处素材缺口（{identifiers}），共缺少{shortage.missing_seconds:.2f}秒。"
-                            + detail +
-                            "请查看画面匹配详情，补充素材或为合适的抽象范围增加解释动画后，从3. 寻找画面继续。"
-                            "原配音、字幕、有效候选与旧成片已保留。") from None
+            shots, boundaries, candidates_by_unit = _find_visual_shots(
+                segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update)
             used = []
             for shot in shots:
                 if not shot.visual_unit_id:
                     continue
-                selected = next(item for item in candidates_by_unit[shot.visual_unit_id] if item["asset_id"] == shot.asset_id
+                selected = next(item for item in candidates_by_unit[shot.visual_unit_id] if item.get("pending_review") is False and item["asset_id"] == shot.asset_id
                     and item["scene_id"] == shot.scene_id and item["source_start"] <= shot.source_start+.000001
                     and item["source_end"] >= shot.source_end-.000001)
                 used.append({key: selected[key] for key in ("asset_id", "scene_id", "fingerprint", "fps", "natural_start", "natural_end",
@@ -926,7 +1034,7 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                 if "manual_config_key" in motion_plan:
                     timeline["motion"].update(manual_config_key=motion_plan["manual_config_key"], placement=motion_plan["placement"])
             write_json(directory / "timeline.json", timeline)
-            write_matches("complete")
+
         else:
             shots, timeline = checkpoint["shots"], checkpoint["timeline"]
             assets = store.assets(selected_libraries) + load_motion_assets(directory, shots, verify=True,

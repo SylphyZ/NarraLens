@@ -10,6 +10,7 @@ from app.models.timeline import VisualShot
 
 VISUAL_POLICY_VERSION = "unique-source-credits-v1"
 MATCH_POLICY_VERSION = "semantic-visual-units-v1"
+PROPOSAL_VERSION = "token-shortlist-v1"
 
 
 class VisualCapacityError(ValueError):
@@ -24,7 +25,7 @@ def match_allowed(candidate, requirement):
     relation = candidate.get("relation")
     evidence, conflicts = candidate.get("evidence"), candidate.get("conflicts")
     score = candidate.get("confidence")
-    return (candidate.get("match_policy") == MATCH_POLICY_VERSION and
+    return (candidate.get("pending_review") is not True and candidate.get("match_policy") == MATCH_POLICY_VERSION and
             candidate.get("facts_match") is True and isinstance(conflicts, list) and not conflicts and
             isinstance(evidence, list) and bool(evidence) and all(isinstance(x, str) and x.strip() for x in evidence) and
             type(candidate.get("visual_checked")) is bool and type(score) in (int, float) and math.isfinite(score) and 0 < score <= 1 and
@@ -106,7 +107,7 @@ def visual_unit_intervals(unit, reservations):
     return intervals
 
 
-def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.0, scene_boundaries=None, *, visual_units=(), reservations=(), used=()):
+def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_seconds, *, visual_units, reservations, used, preview=False):
     """Allocate scarce factual footage first; only a complete attempt is committed."""
     shots, gaps = list(reservations), []
     allocated = list(used)
@@ -117,10 +118,15 @@ def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.
     owners = {s.id: s for s in segments}
     for segment in segments:
         _visual_intervals(segment, reservations)
-    pools = {unit["id"]: [item for item in candidates_by_segment.get(unit["id"], [])
-             if item.get("visual_policy") == VISUAL_POLICY_VERSION and item.get("usable") is True
-             and item.get("content_kind") == "story" and item.get("visual_unit_id") == unit["id"]
-             and match_allowed(item, unit["requirement"])] for unit in visual_units}
+    def eligible(item, unit):
+        if item.get("visual_unit_id") != unit["id"]:
+            return False
+        approved = (item.get("visual_policy") == VISUAL_POLICY_VERSION and item.get("usable") is True
+                    and item.get("content_kind") == "story" and match_allowed(item, unit["requirement"]))
+        return approved or (preview and item.get("proposal_version") == PROPOSAL_VERSION
+                            and item.get("pending_review") is True and item.get("usable") is not False)
+
+    pools = {unit["id"]: [item for item in candidates_by_segment.get(unit["id"], []) if eligible(item, unit)] for unit in visual_units}
 
     def priority(unit):
         needed = sum(right-left for left, right in visual_unit_intervals(unit, reservations))
@@ -139,10 +145,19 @@ def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.
             while position < end - .001:
                 remaining = end - position
                 minimum = min(1.0, segment.audio_end - segment.audio_start)
+                if remaining < minimum-.001 and trial and abs(trial[-1].timeline_end-position) < .001:
+                    previous, source = trial[-1], trial_used[-1]
+                    length = previous.timeline_end-previous.timeline_start+remaining
+                    if length <= source["source_end"]-source["source_start"]+.000001:
+                        left = max(source["source_start"], min(previous.source_start, source["source_end"]-length))
+                        trial[-1] = replace(previous, source_start=left, source_end=left+length, timeline_end=end)
+                        position = end
+                        continue
                 pool = sorted((item for item in candidates if unused_source(item, trial_used)),
-                              key=lambda item: (item["relation"] == "direct", item["confidence"]), reverse=True)
+                              key=lambda item: (not item.get("pending_review", False), item.get("relation") == "direct",
+                                                item.get("confidence", item.get("proposal_score", 0))), reverse=True)
                 chosen = None
-                for candidate in pool:
+                for candidate in pool if remaining >= minimum-.001 else []:
                     available = candidate["source_end"] - candidate["source_start"]
                     other_capacity = sum(item["source_end"]-item["source_start"] for item in pool
                                          if source_shot_key(item) != source_shot_key(candidate))
@@ -161,10 +176,10 @@ def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.
                         break
                 if chosen is None:
                     failure = {"visual_unit_id": unit["id"], "segment_id": unit["segment_id"], "start": position,
-                               "category": "short_interval" if remaining < minimum-.001 else "material",
+                               "category": "short_interval" if end-start < minimum-.001 else "material",
                                "end": unit["end"], "missing_seconds": round(remaining +
                                sum(b-a for a, b in intervals[interval_index+1:]), 3),
-                               "reason": "原片残段不足1秒，请合并相邻句意范围或扩大相邻动画范围。" if remaining < minimum-.001 else
+                               "reason": "原片残段不足1秒，请合并相邻句意范围或扩大相邻动画范围。" if end-start < minimum-.001 else
                                          "缺少通过当前句意检查、事实对应且未使用的自然镜头。"}
                     break
                 candidate, length = chosen
@@ -181,12 +196,24 @@ def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.
                 break
         if failure:
             gaps.append(failure)
-        else:
+        if not failure or preview:
             shots.extend(trial)
             allocated = trial_used
+    return sorted(shots, key=lambda row: row.timeline_start), gaps
+
+
+def propose_visual_timeline(segments, candidates_by_unit, target_shot_seconds=7.0, *, visual_units, reservations=()):
+    """A partial, unapproved proposal may choose what to inspect, never what to render."""
+    return _allocate_visual_timeline(segments, candidates_by_unit, target_shot_seconds,
+                                    visual_units=visual_units, reservations=reservations, used=(), preview=True)
+
+
+def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.0, scene_boundaries=None, *, visual_units=(), reservations=(), used=()):
+    shots, gaps = _allocate_visual_timeline(segments, candidates_by_segment, target_shot_seconds,
+        visual_units=visual_units, reservations=reservations, used=used)
     if gaps:
         raise VisualCapacityError(gaps[0]["visual_unit_id"], sum(row["missing_seconds"] for row in gaps), gaps=gaps)
-    return sorted(shots, key=lambda row: row.timeline_start)
+    return shots
 
 
 def coalesce_motion_shots(shots):

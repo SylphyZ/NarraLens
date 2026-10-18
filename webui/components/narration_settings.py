@@ -134,6 +134,27 @@ def _render_task_status(task_id, tr):
         st.success(message)
     else:
         st.info(message)
+    usage = state.get("token_usage", {})
+    if isinstance(usage, dict) and usage.get("version") == 1:
+        current = usage.get("current", {})
+        cumulative = usage.get("cumulative", {})
+        total = lambda rows, field: sum(row.get(field, 0) for row in rows.values())
+        st.caption(tr("本次已报告Token：") + f"{total(current, 'total_tokens'):,}" + tr(" · 项目累计：") +
+                   f"{total(cumulative, 'total_tokens'):,}" + tr(" · 本次用量不完整请求：") + str(total(current, "unknown")))
+        with remembered_expander(tr("Token用量"), key="narration_token_usage_"+task_id) as panel:
+            if panel.open:
+                labels = {"text_preselect": "文字预选", "visual_review": "内容确认", "visual_safety": "画面可用性", "other": "其他阶段"}
+                records = [{tr("范围"): tr(scope), tr("阶段"): tr(labels.get(kind, kind)), tr("请求"): row.get("requests", 0),
+                    tr("已报告输入"): row.get("prompt_tokens", 0), tr("已报告输出"): row.get("completion_tokens", 0),
+                    tr("总Token"): row.get("total_tokens", 0), tr("未知／不完整"): row.get("unknown", 0),
+                    tr("已报告推理Token"): row.get("reasoning_tokens", 0), tr("已报告缓存输入"): row.get("cached_tokens", 0),
+                    tr("缓存信息缺失请求"): row.get("cached_unknown", 0),
+                    tr("图片提交"): row.get("images", 0), tr("重试／后备Token"): row.get("retry_tokens", 0),
+                    tr("后续补查Token"): row.get("followup_tokens", 0)}
+                    for scope, rows in (("本次继续", current), ("项目累计", cumulative)) for kind, row in rows.items()]
+                st.dataframe(records, hide_index=True, width="stretch")
+                st.caption(tr("只累计接口已报告用量；未知不能按0计费。重试和补查是总量的子集，不重复相加。历史图片统计可能不完整。"))
+                st.caption(tr("统计本项目网关中的文案／视觉请求；配音及素材库独立分析的用量另计。推理属于输出明细，缓存输入属于输入明细。"))
     if runner.running("narration:" + task_id):
         if st.button(tr("停止当前任务"), key="cancel_narration_" + task_id):
             runner.cancel("narration:" + task_id)
@@ -564,7 +585,7 @@ def _seed_project_widgets(prefix, saved=None):
     memory = st.session_state.setdefault("narration_widget_memory", {})
     st.session_state["_narration_settings_prefix"] = prefix
     seed_model_choices(prefix, models=(saved or {}).get("models"), voice=(saved or {}).get("voice"), options=(saved or {}).get("options"))
-    fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "subtitle_min_seconds",
+    fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "visual_no_gain_rounds", "subtitle_min_seconds",
               "subtitle_allow_short", "tts_block_chars", "tts_chunking", "tts_break_after", "tts_break_text_hash",
               "alignment_enabled", "alignment_python", "alignment_model", "alignment_language",
               "bgm_min_seconds", "bgm_crossfade", "bgm_ducking", "bgm_volume",
@@ -692,6 +713,7 @@ def _output_values(prefix):
             "font_size": int(value("font_size_custom_v2", st.session_state.get("narration_font_size_mobile_v1", 72))),
             "mask_source_subtitles": bool(value("mask", False)), "shot_seconds": int(value("shot_seconds", 7)),
             "verify_visual": bool(value("verify_visual", True)), "subtitle_single_line": True,
+            "visual_no_gain_rounds": int(value("visual_no_gain_rounds", 2)),
             "subtitle_width_ratio": int(value("subtitle_width", 70)) / 100,
             "subtitle_min_seconds": float(value("subtitle_min_seconds", 1.0)), "subtitle_allow_short": bool(value("subtitle_allow_short", False))}
 
@@ -742,6 +764,9 @@ def _render_output_options(tr, prefix):
         st.checkbox(tr("遮盖原画面字幕"), value=options["mask_source_subtitles"], key=prefix + "_mask")
         st.slider(tr("目标镜头长度（秒）"), 3, 12, options["shot_seconds"], key=prefix + "_shot_seconds")
         st.checkbox(tr("确认候选画面"), value=options["verify_visual"], key=prefix + "_verify_visual")
+        st.number_input(tr("单元连续无改善暂停轮数"), min_value=1, value=options["visual_no_gain_rounds"], step=1,
+                        key=prefix+"_visual_no_gain_rounds")
+        st.caption(tr("本地收敛和文字预选后只确认拟用镜头；单元连续无新增合格时长时暂停扩大，继续可复用缓存追加检索。这不是API总次数上限。"))
         st.caption(tr("始终按当前句意检查内容；关闭时使用已有描述与范围字幕判断，仍独立排除片尾名单。画面单元不改变TTS分段。"))
         st.caption(tr("文案与视觉模型调用不设任务总次数上限。"))
         st.caption(tr("字幕分段由文案生成设置中的高效率模型完成，结果会校验和缓存。"))

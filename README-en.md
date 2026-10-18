@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.2**
+**Manuscript-driven video production · v2.7.3**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.2 provides seven workspaces:
+Version 2.7.3 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -133,13 +133,17 @@ Version 2.7.1 accepts valid zero-duration alignment entries and uses positive-du
 
 Version 2.7.2 uses range-scoped subtitle IDs and restores the original quotes in code. Identifiable row errors reject that candidate while retaining valid peers; unconfirmed formats and content shortages are recorded separately. Resume from **3. Find footage** to apply the new protocol, reusing narration, captions, alignment, and independent usability checks. Previous videos and timelines are retained; library reanalysis is unnecessary.
 
+Version 2.7.3 uses token-conscious footage scheduling from stage 3: restore approved candidates, prepare candidates locally, optionally run text-only model preselection, propose the full timeline, then inspect proposed footage as needed. Per-unit expansion pauses after successive rounds without new approved duration; continuing reuses caches and advances the search cursor. The workspace displays reported tokens for the current run and project history. Narration, captions, alignment, and previous output are retained; provisional plans cannot be rendered.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.2 binds subtitle evidence to candidate-specific IDs and rejects cross-candidate citations and local field errors without retrying valid peers. Abstract claims are separated from concrete constraints bound to the manuscript. Range diagnostics, valid caches, and zero-duration timing compatibility are retained. Implementation and static review are complete; live model requests and footage quality have not been validated.
+Version 2.7.3 adds optional text preselection, provisional allocation and on-demand footage confirmation, shared request catalogues with canonical ID restoration, and reuse of approved 2.7.2 results. Search checkpoints, no-gain pauses and reported token totals include retries and fallback requests. Final factual, source deduplication, credits and timeline checks remain required. Implementation and static review are complete; token savings, live model protocol adherence and video quality have not been validated.
+
+Version 2.7.2 binds subtitle evidence to candidate-specific IDs and rejects local errors while retaining valid peers. Abstract claims and concrete constraints are separated, with zero-duration alignment compatibility retained.
 
 Version 2.7.1 fixes visual planning rejecting otherwise valid alignment data containing zero-duration entries. The manuscript, audio, captions, and source caches are retained; only positive-duration points serve as speech anchors. Invalid ranges, malformed times, and missing voiced anchors remain errors. Existing valid 2.7 visual plans remain compatible.
 

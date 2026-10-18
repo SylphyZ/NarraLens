@@ -11,7 +11,7 @@ from pathlib import Path
 import requests
 from loguru import logger
 
-from app.services.library.store import stable_hash
+from app.services.library.store import stable_hash, read_json, write_json
 from app.services.library.validation import ModelFormatError, validate_result
 from app.services.llm.generation_options import build_generation_options, generation_settings, output_budget, thinking_mode
 from app.utils.openai_base_url_security import validate_openai_compatible_base_url
@@ -130,6 +130,73 @@ def model_settings(app, proxy, bindings=None):
         "proxy": dict(proxy),
         "context_tokens": int(app.get("material_context_tokens", 64000)),
     }
+
+
+class ModelUsage:
+    """Incremental reported usage; reasoning/cache details are subsets, never extra charges."""
+
+    def __init__(self, directory):
+        self.path = Path(directory) / "token_usage.json"
+        try:
+            saved = read_json(self.path, default={})
+        except (OSError, ValueError):
+            saved = {}
+        valid = (isinstance(saved, dict) and saved.get("version") == 1 and isinstance(saved.get("cumulative"), dict)
+                 and isinstance(saved.get("requests"), list) and all(isinstance(x, str) for x in saved["requests"])
+                 and all(isinstance(row, dict) and all(type(n) is int and n >= 0 for n in row.values())
+                         for row in saved["cumulative"].values()))
+        self.seen = set(saved.get("requests", [])) if valid else set()
+        self.total = saved.get("cumulative", {}) if valid else {}
+        self.current = {}
+        log = Path(directory) / "model-diagnostics.jsonl"
+        if log.is_file():
+            with log.open(encoding="utf-8-sig") as source:
+                for line in source:
+                    try:
+                        self.record(json.loads(line), historical=True, save=False)
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+        self.save()
+
+    def record(self, entry, *, historical=False, save=True):
+        identifier = entry.get("request_file") or stable_hash(tuple(entry.get(k) for k in ("time", "model", "attempt", "stage", "segment")))
+        if identifier in self.seen:
+            return
+        self.seen.add(identifier)
+        stage = entry.get("usage_stage")
+        if not stage:
+            stage = "visual_review" if entry.get("stage") == "检查句意与实际镜头" else "other"
+        usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+        for scope in [self.total] + ([] if historical else [self.current]):
+            row = scope.setdefault(stage, {"requests": 0, "unknown": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                                          "total_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
+                                          "cached_unknown": 0, "images": 0, "retry_tokens": 0, "followup_tokens": 0})
+            for field in ("requests", "unknown", "prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens",
+                          "cached_tokens", "cached_unknown", "images", "retry_tokens", "followup_tokens"):
+                row.setdefault(field, 0)
+            row["requests"] += 1
+            if any(type(usage.get(name)) is not int or usage[name] < 0 for name in ("prompt_tokens", "completion_tokens", "total_tokens")):
+                row["unknown"] += 1
+            for name in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_tokens"):
+                if type(usage.get(name)) is int and usage[name] >= 0:
+                    row[name] += usage[name]
+            if type(usage.get("cached_tokens")) is not int:
+                row["cached_unknown"] += 1
+            row["images"] += entry.get("image_count", 0) if type(entry.get("image_count")) is int else 0
+            tokens = usage.get("total_tokens", 0)
+            if type(tokens) is int and tokens >= 0:
+                if entry.get("attempt", 1) > 1 or entry.get("fallback_from_model"):
+                    row["retry_tokens"] += tokens
+                if entry.get("search_round", 0) > 0:
+                    row["followup_tokens"] += tokens
+        if save:
+            self.save()
+
+    def snapshot(self):
+        return {"version": 1, "current": self.current, "cumulative": self.total}
+
+    def save(self):
+        write_json(self.path, {**self.snapshot(), "requests": sorted(self.seen)})
 
 
 class ModelGateway:
@@ -291,6 +358,8 @@ class ModelGateway:
             finish_reason = ""
             details = {"configured_thinking": configured_thinking, "effective_thinking": effective_thinking,
                        "output_limit": body[limit_field], "output_ceiling": output_ceiling, "input_estimate": input_tokens}
+            details.update(image_count=len(images or []), usage_stage=(request_metadata or {}).get("usage_stage", "other"),
+                           search_round=(request_metadata or {}).get("search_round", 0))
             if format_repair:
                 details.update(format_repair=True, repair_allowed_paths=(repair_context or {}).get("allowed_paths", []))
             retry_delay = 0
@@ -351,6 +420,8 @@ class ModelGateway:
                         token_details = {}
                     details["usage"] = {name: usage.get(name) for name in ("prompt_tokens", "completion_tokens", "total_tokens")}
                     details["usage"]["reasoning_tokens"] = token_details.get("reasoning_tokens")
+                    prompt_details = usage.get("prompt_tokens_details") or {}
+                    details["usage"]["cached_tokens"] = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
                     if audios:
                         prompt_details = usage.get("prompt_tokens_details") or {}
                         details["usage"]["audio_tokens"] = prompt_details.get("audio_tokens") if isinstance(prompt_details, dict) else None
