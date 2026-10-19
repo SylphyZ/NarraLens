@@ -410,6 +410,42 @@ def plan_visual_units(segments, text, overview, gateway, directory, stop=None, p
     return plan
 
 
+def _requirement_rows(value, expected):
+    """Bind only unique numeric IDs; merge JSON-identical peers without altering the reply."""
+    def numbers(identifier):
+        match = re.fullmatch(r"P([0-9]+)-V([0-9]+)", identifier) if isinstance(identifier, str) else None
+        return tuple(part.lstrip("0") or "0" for part in match.groups()) if match else None
+    groups, originals = {identifier: [] for identifier in expected}, {identifier: [] for identifier in expected}
+    aliases, seen, unexpected, changes = {}, {identifier: set() for identifier in expected}, [], []
+    for identifier in expected:
+        key = numbers(identifier)
+        if key is not None:
+            aliases.setdefault(key, []).append(identifier)
+    rows = value.get("units") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        return groups, originals, [value] if value is not None else [], changes
+    for index, row in enumerate(rows, 1):
+        actual = row.get("unit_id") if isinstance(row, dict) else None
+        owner = actual if isinstance(actual, str) and actual in groups else None
+        if owner is None:
+            choices = aliases.get(numbers(actual), [])
+            owner = choices[0] if len(choices) == 1 else None
+        if owner is None:
+            unexpected.append(row)
+            continue
+        canonical = {**row, "unit_id": owner}
+        originals[owner].append(row)
+        if actual != owner:
+            changes.append({"rule": "unit-id-zero-padding-v1", "unit_id": owner, "row": index, "from": actual, "to": owner})
+        identity = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if identity in seen[owner]:
+            changes.append({"rule": "identical-unit-row-v1", "unit_id": owner, "row": index})
+        else:
+            groups[owner].append(canonical)
+            seen[owner].add(identity)
+    return groups, originals, unexpected, changes
+
+
 def revise_visual_requirements(plan, previous_plan, text, gateway, directory, stop=None, progress=None):
     """Bind model-selected original parts once; retain valid peers and correct only failures."""
     from app.services.library.gateway import ModelAPIError
@@ -503,6 +539,13 @@ def revise_visual_requirements(plan, previous_plan, text, gateway, directory, st
         unit["requirement"] = after
         entries.append({"unit_id": unit["id"], "before": before, "after": after, "decision": decision, "changed": before != after})
 
+    def save_decision(record, decision, audit_file, provenance=None):
+        unit = record["unit"]
+        write_json(directory/"planning"/f"requirement-{record['key'][:24]}.json", {
+            "key": record["key"], "unit_id": unit["id"], "before": unit["requirement"], "value": decision,
+            "schema": "bound-requirements-v1", "audit_file": audit_file, **(provenance or {})})
+        apply(unit, decision)
+
     for unit in plan["units"]:
         check_cancel(stop)
         original = text[unit["text_start"]:unit["text_end"]]
@@ -560,6 +603,52 @@ def revise_visual_requirements(plan, previous_plan, text, gateway, directory, st
     plan["requirements_pending"] = sorted({r["unit"]["id"] for r in pending} | {r["unit_id"] for r in deferred})
     plan["key"] = _visual_plan_key(plan)
     write_json(directory/"visual_plan.json", plan)  # Cancellation must still block stages 4/5 until revision completes.
+
+    # Only unresolved contracts may recover a paid reply; never replace a newer accepted contract.
+    recoverable = {row["key"]: row for row in pending if same_input and row["unit"]["id"] in previous_plan.get("requirements_pending", [])
+        and row["unit"]["id"] in previous
+        and previous.get(row["unit"]["id"], {}).get("requirement", {}).get("coverage_version") != COVERAGE_VERSION
+        and all(previous[row["unit"]["id"]].get(k) == row["unit"][k] for k in ("text_start", "text_end", "start", "end"))}
+    recovered = []
+    if recoverable:
+        for audit_path in sorted((directory/"planning").glob("requirement-audit-*.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True):
+            if not recoverable:
+                break
+            try:
+                saved = read_json(audit_path)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(saved, dict) or any(saved.get(k) != v for k, v in
+                    (("version", REQUIREMENT_REVIEW_VERSION), ("model_signature", signature), ("text_hash", plan["text_hash"]))):
+                continue
+            if not isinstance(saved.get("inputs"), list) or not isinstance(saved.get("attempts"), list):
+                continue
+            for record in list(recoverable.values()):
+                unit = record["unit"]
+                inputs = [row for row in saved["inputs"] if isinstance(row, dict) and row.get("unit_id") == unit["id"] and row.get("key") == record["key"]
+                    and row.get("parts_signature") == stable_hash(record["payload"]["parts"]) and row.get("parts") == record["payload"]["parts"]
+                    and all(row.get(k) == unit[k] for k in ("text_start", "text_end"))]
+                attempts = [(i, row) for i, row in enumerate(saved["attempts"], 1) if isinstance(row, dict) and
+                            isinstance(row.get("unit_ids"), list) and unit["id"] in row["unit_ids"]]
+                if len(inputs) != 1 or not attempts:
+                    continue
+                recoverable.pop(record["key"])  # A later conflicting reply must not fall back to an older favorable one.
+                number, attempt = attempts[-1]
+                if attempt.get("gateway_state") != "resolved":
+                    continue
+                matches, _, _, changes = _requirement_rows(attempt.get("parsed_response"), attempt["unit_ids"])
+                if len(matches[unit["id"]]) != 1:
+                    continue
+                try:
+                    decision = normalize(matches[unit["id"]][0], unit, record["offsets"])
+                except ModelFormatError:
+                    continue
+                source = {"file": audit_path.relative_to(directory).as_posix(), "attempt": number}
+                save_decision(record, decision, source["file"], {"recovered_from": source,
+                    "identity_normalization": [row for row in changes if row["unit_id"] == unit["id"]]})
+                pending.remove(record)
+                recovered.append({"unit_id": unit["id"], **source})
+                reused += 1
 
     def submit(batch, audit=None, correction=None):
         check_cancel(stop)
@@ -623,25 +712,27 @@ def revise_visual_requirements(plan, previous_plan, text, gateway, directory, st
         finally:
             gateway.request_recorder = recorder
         rows = value.get("units") if isinstance(value, dict) else None
-        if isinstance(rows, list):
-            attempt["unexpected_rows"] = [r for r in rows if not isinstance(r, dict) or r.get("unit_id") not in attempt["unit_ids"]]
+        grouped, originals, unexpected, changes = _requirement_rows(value, attempt["unit_ids"])
+        attempt.update(unexpected_rows=unexpected, identity_normalization=changes)
         failures = []
         for record in batch:
             unit = record["unit"]
-            matches = [r for r in rows if isinstance(r, dict) and r.get("unit_id") == unit["id"]] if isinstance(rows, list) else []
+            matches = grouped[unit["id"]]
             try:
-                if len(matches) != 1:
-                    raise ModelFormatError("units：当前unit_id须恰好出现一次，不能缺失或重复。" if isinstance(rows, list) else "units：须为当前单元对象的列表。")
+                if not matches:
+                    raise ModelFormatError(f"units：未收到{unit['id']}；须完整复制expected_unit_id。" if isinstance(rows, list) else "units：须为当前单元对象的列表。")
+                if len(matches) > 1:
+                    raise ModelFormatError(f"units：{unit['id']}有{len(matches)}条内容冲突的结果，请核对原文后只返回一条。")
                 decision = normalize(matches[0], unit, record["offsets"])
             except ModelFormatError as exc:
-                issue = {"unit_id": unit["id"], "reason": str(exc), "allowed_parts": [1, len(record["offsets"])-1], "previous": matches}
+                issue = {"unit_id": unit["id"], "expected_unit_id": unit["id"], "reason": str(exc),
+                    "returned_unit_ids": [row.get("unit_id") for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+                    "allowed_parts": [1, len(record["offsets"])-1], "previous": originals[unit["id"]] or unexpected}
                 attempt["issues"].append(issue)
                 failures.append((record, issue))
                 continue
-            path = directory/"planning"/f"requirement-{record['key'][:24]}.json"
-            write_json(path, {"key": record["key"], "unit_id": unit["id"], "before": unit["requirement"],
-                             "value": decision, "schema": "bound-requirements-v1", "audit_file": audit["file"]})
-            apply(unit, decision)
+            save_decision(record, decision, audit["file"],
+                {"identity_normalization": [row for row in changes if row["unit_id"] == unit["id"]]})
             attempt["accepted"].append({"unit_id": unit["id"], "cache_key": record["key"]})
             write_json(directory/audit["file"], audit)
         attempt["state"] = "invalid" if failures else "accepted"
@@ -662,7 +753,7 @@ def revise_visual_requirements(plan, previous_plan, text, gateway, directory, st
     write_json(directory/"visual_plan.json", plan)
     write_json(directory/"planning"/"requirement-review.json", {"version": REQUIREMENT_REVIEW_VERSION,
         "base_plan_key": base_key, "plan_key": plan["key"], "reviewed": len(entries), "reused": reused,
-        "changed": sum(r["changed"] for r in entries), "deferred": deferred})
+        "changed": sum(r["changed"] for r in entries), "deferred": deferred, "recovered": recovered})
     return plan
 
 
