@@ -1215,6 +1215,12 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                 reservations=reservations, motion_plan=motion_plan)
             visual_plan = revise_visual_requirements(visual_plan, previous_visual_plan, text, gateway, directory, stop,
                 progress=lambda message: update("修订缺口画面需求", visual_start + 2, message))
+            if visual_plan.get("requirements_pending"):
+                review = read_json(directory/"planning"/"requirement-review.json")
+                reasons = "；".join(r["unit_id"]+"："+r["reason"]+("（已尝试局部纠正一次）" if r.get("corrected") else "")
+                                   for r in review["deferred"][:8])
+                raise JobPaused(f"画面需求已整理{review['reviewed']}项（复用{review['reused']}项），仍待处理{len(visual_plan['requirements_pending'])}项："
+                                + reasons + "。已有配音、字幕、成功需求和旧成片保留；从3. 寻找画面继续仅补未完成项。")
             validate_visual_plan(visual_plan, segments, text, directory)
             assets = store.assets(selected_libraries) + motion_assets
             shots, boundaries, candidates_by_unit = _find_visual_shots(
