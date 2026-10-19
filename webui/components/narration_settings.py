@@ -585,7 +585,7 @@ def _seed_project_widgets(prefix, saved=None):
     memory = st.session_state.setdefault("narration_widget_memory", {})
     st.session_state["_narration_settings_prefix"] = prefix
     seed_model_choices(prefix, models=(saved or {}).get("models"), voice=(saved or {}).get("voice"), options=(saved or {}).get("options"))
-    fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "visual_no_gain_rounds", "subtitle_min_seconds",
+    fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "visual_review_concurrency", "visual_no_gain_rounds", "subtitle_min_seconds",
               "subtitle_allow_short", "tts_block_chars", "tts_chunking", "tts_break_after", "tts_break_text_hash",
               "alignment_enabled", "alignment_python", "alignment_model", "alignment_language",
               "bgm_min_seconds", "bgm_crossfade", "bgm_ducking", "bgm_volume",
@@ -713,6 +713,7 @@ def _output_values(prefix):
             "font_size": int(value("font_size_custom_v2", st.session_state.get("narration_font_size_mobile_v1", 72))),
             "mask_source_subtitles": bool(value("mask", False)), "shot_seconds": int(value("shot_seconds", 7)),
             "verify_visual": bool(value("verify_visual", True)), "subtitle_single_line": True,
+            "visual_review_concurrency": int(value("visual_review_concurrency", 4)),
             "visual_no_gain_rounds": int(value("visual_no_gain_rounds", 2)),
             "subtitle_width_ratio": int(value("subtitle_width", 70)) / 100,
             "subtitle_min_seconds": float(value("subtitle_min_seconds", 1.0)), "subtitle_allow_short": bool(value("subtitle_allow_short", False))}
@@ -764,6 +765,9 @@ def _render_output_options(tr, prefix):
         st.checkbox(tr("遮盖原画面字幕"), value=options["mask_source_subtitles"], key=prefix + "_mask")
         st.slider(tr("目标镜头长度（秒）"), 3, 12, options["shot_seconds"], key=prefix + "_shot_seconds")
         st.checkbox(tr("确认候选画面"), value=options["verify_visual"], key=prefix + "_verify_visual")
+        st.number_input(tr("画面审核并发数"), min_value=1, value=options["visual_review_concurrency"], step=1,
+                        key=prefix + "_visual_review_concurrency",
+                        help=tr("默认4，设为1使用同一流程串行审核。建议4–8；不同文案单元独立请求，每波后统一编排，不改变已付费缓存。"))
         st.number_input(tr("单元连续无改善暂停轮数"), min_value=1, value=options["visual_no_gain_rounds"], step=1,
                         key=prefix+"_visual_no_gain_rounds")
         st.caption(tr("本地收敛和文字预选后只确认拟用镜头；单元连续无新增合格时长时暂停扩大，继续可复用缓存追加检索。这不是API总次数上限。"))

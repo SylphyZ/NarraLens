@@ -4,6 +4,8 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
+from contextlib import nullcontext
+from copy import copy, deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -736,11 +738,14 @@ class MaterialRetriever:
                 count("duplicate_ranges")
         return sorted(unique.values(), key=lambda item: (not item.get("pending_review", True), item.get("confidence", item.get("proposal_score", 0))), reverse=True)
 
-    def _restore_reply(self, saved, metadata, segments, assets, gateway, verify_visual, request_file):
+    def _restore_reply(self, saved, metadata, segments, assets, gateway, verify_visual, request_file, *, directory=None):
         """Recover incomplete replies only after reconstructing their exact original input key."""
         pairs = metadata.get("canonical_pairs")
-        if not self.queue_signature or not any(isinstance(r, dict) and r.get("validation_issues") for r in saved.get("reviews", [])) or \
-                metadata.get("usage_stage") != "visual_review" or not isinstance(pairs, dict) or not pairs or \
+        receipt = (directory is not None and saved.get("receipt_version") == "frozen-review-receipt-v1" and
+                   saved.get("application_complete") is False and not saved.get("error") and
+                   isinstance(saved.get("parsed_response"), dict) and metadata.get("review_protocol") == REVIEW_PROTOCOL)
+        if not self.queue_signature or (not receipt and not any(isinstance(r, dict) and r.get("validation_issues") for r in saved.get("reviews", []))) or \
+                metadata.get("usage_stage") not in ({"visual_review", "visual_safety"} if receipt else {"visual_review"}) or not isinstance(pairs, dict) or not pairs or \
                 any(not isinstance(alias, str) or not re.fullmatch(r"P[1-9]\d*", alias) for alias in pairs):
             return
         aliases = {}
@@ -756,15 +761,39 @@ class MaterialRetriever:
             asset = next((a for a in assets if a["id"] == source.get("asset_id")), None)
             if not asset or asset["fingerprint"] != source.get("fingerprint"):
                 return
-            candidates = self.prepare(segment, [{**source, "fps": asset["fps"]}], assets, gateway, verify_visual, _identity_only=True)
+            candidates = self.prepare(segment, [{**source, "fps": asset["fps"]}], assets, gateway, verify_visual, _identity_only=not receipt)
             if len(candidates) != 1 or candidates[0]["_review_id"] != pair.get("review_id"):
                 return
             aliases[alias] = (segment, candidates[0])
-        identity = stable_hash((PROPOSAL_VERSION, [(s.id, c["_review_key"]) for s, c in aliases.values()], verify_visual))
+        safety_only = receipt and metadata.get("usage_stage") == "visual_safety"
+        with_images = verify_visual or safety_only
+        identity = stable_hash((PROPOSAL_VERSION, [(s.id, c["_review_key"]) for s, c in aliases.values()], with_images))
         if metadata.get("local_repair"):
             identity = stable_hash((identity, "row-repair-v1"))
         references = saved.get("subtitle_aliases")
         if saved.get("key") != identity or not isinstance(references, dict):
+            return
+        if receipt:
+            relative = f"candidates/review-{identity[:24]}.json"
+            if metadata.get("candidate_file") != relative or len({s.id for s, _ in aliases.values()}) != 1:
+                return
+            if not with_images and any(not (c.get("_safety") or {}).get("usable") for _, c in aliases.values()):
+                return  # Text-only receipts still require the existing independent source check.
+            result = _match_pairs(saved["parsed_response"], aliases, references, with_images,
+                                  relevance=not safety_only, require_owner=not safety_only)
+            skipped = {c["_review_key"] for _, c in aliases.values() if self.store.cache_get(c["library_id"],
+                       c["_safety_key"] if safety_only else c["_review_key"]) is not None}
+            job = {"key": identity, "file": relative, "unit_id": next(iter(aliases.values()))[0].id,
+                   "aliases": aliases, "frozen": deepcopy(aliases), "references": references, "with_images": with_images,
+                   "safety_only": safety_only, "repair": bool(metadata.get("local_repair")),
+                   "search_round": metadata.get("search_round", 0), "skip_keys": skipped}
+            self.commit_review(job, {"result": result, "requests": saved.get("requests", []),
+                "parsed_response": saved["parsed_response"], "error": ""}, gateway, directory)
+            for row in result["clips"]:
+                segment, candidate = aliases[row["_pair"]]
+                if candidate["_review_key"] not in skipped and row["_validation_issues"]:
+                    self._remember(segment, candidate, row, cached=True, request_file=request_file)
+            saved["application_complete"] = True
             return
         rows = []
         for alias, (segment, candidate) in aliases.items():
@@ -838,7 +867,7 @@ class MaterialRetriever:
                                 self.legacy_quarantine[quarantine_key] = {"request_file":relative.as_posix(),"candidate_file":path.name,"unit_id":review["unit_id"],
                                     "review_id":review.get("review_id"),"source_start":review.get("source_start"),"source_end":review.get("source_end"),"old_response":response,
                                     "reason":"旧实际审片混合多个单元，当前缺口需单单元核对；原回复保留，未转为批准。"}
-                    self._restore_reply(saved, metadata, segments, assets, gateway, verify_visual, relative.as_posix())
+                    self._restore_reply(saved, metadata, segments, assets, gateway, verify_visual, relative.as_posix(), directory=directory)
                     pairs = list(metadata.get("canonical_pairs", {}).values())
                     if not pairs and metadata.get("visual_unit_id") == saved.get("visual_unit_id") in segments:
                         pairs = [{"unit_id": metadata["visual_unit_id"], "review_id": c.get("review_id")}
@@ -1031,45 +1060,31 @@ class MaterialRetriever:
                 "local_alternatives": sum(c.get("_preselection", {}).get("state") == "local-alternative" for c in selected)}
         return result
 
-    def review_pairs(self, pairs, gateway, directory, stop=None, *, search_round=0, _safety_only=False, _repair=None):
-        """Only proposed pairs reach this final review; images/catalogues are shared by range."""
-        from app.services.library.gateway import ModelAPIError, ModelInputBudgetError
-        accepted = []
-        groups = defaultdict(list)
+    def prepare_reviews(self, pairs, gateway, directory, *, search_round=0, _safety_only=False, _repair=None):
+        """Freeze jobs on the task thread; do not request a model or modify candidates."""
+        groups, jobs = defaultdict(list), []
         for segment, candidate in pairs:
-            groups[segment.id].append((segment,candidate))
-        batches = [group[offset:offset+6] for group in groups.values() for offset in range(0,len(group),6)]
+            groups[segment.id].append((segment, candidate))
+        batches = [group[offset:offset+6] for group in groups.values() for offset in range(0, len(group), 6)]
         for batch in batches:
-            check_cancel(stop)
+            with_images = _safety_only or batch[0][1]["_verify_visual"]
+            if not with_images and any(c.get("_safety") is None for _, c in batch):
+                jobs.extend(self.prepare_reviews([(s, c) for s, c in batch if c.get("_safety") is None], gateway,
+                    directory, search_round=search_round, _safety_only=True, _repair=_repair))
+                batch = [(s, c) for s, c in batch if c.get("_safety") and c["_safety"]["usable"] and c["_review_key"] not in self.unconfirmed]
+                if not batch:
+                    continue
             units = {s.id: s for s, _ in batch}
             clips = {c["_safety_key"]: c for _, c in batch}
             ua = {name: f"U{i}" for i, name in enumerate(units, 1)}
             ca = {key: f"C{i}" for i, key in enumerate(clips, 1)}
             aliases = {f"P{i}": pair for i, pair in enumerate(batch, 1)}
             references = {f"{ca[key]}:L{i}": row["id"] for key, c in clips.items() for i, row in enumerate(c["subtitle_entries"], 1)}
-            with_images = _safety_only or batch[0][1]["_verify_visual"]
-            # With confirmation disabled, the existing independent visual safety check still runs on cache misses.
-            safety_only = not with_images and any(c.get("_safety") is None for c in clips.values())
-            if safety_only:
-                safety_batch = [(s, c) for s, c in batch if c.get("_safety") is None]
-                self.review_pairs(safety_batch, gateway, directory, stop, search_round=search_round, _safety_only=True, _repair=_repair)
-                batch = [(s, c) for s, c in batch if c.get("_safety") and c["_safety"]["usable"] and c["_review_key"] not in self.unconfirmed]
-                if batch:
-                    accepted.extend(self.review_pairs(batch, gateway, directory, stop, search_round=search_round, _repair=_repair))
-                continue
-            images = []
-            if with_images:
-                for c in clips.values():
-                    folder = self.store.directory(c["library_id"])/"frames"/c["asset_id"]/c["_review_id"]
-                    c["frame_paths"] = extract_frames(c["video_path"], c["source_start"], c["source_end"], 3, folder)
-                    images.extend(c["frame_paths"])
             payload = {"units": [{"id": ua[name], **self.unit_payload(s)} for name, s in units.items()],
                 "clips": [{"id": ca[key], "background": c["description"],
                     "subtitles": [{"id": f"{ca[key]}:L{i}", "text": row["text"]} for i, row in enumerate(c["subtitle_entries"], 1)]}
                     for key, c in clips.items()],
                 "pairs": [{"scene_id": alias, "unit": ua[s.id], "clip": ca[c["_safety_key"]]} for alias, (s, c) in aliases.items()]}
-            def validate(value):
-                return _match_pairs(value, aliases, references, with_images, relevance=not _safety_only, require_owner=not _safety_only)
             prompt = ("本次只有一个文案单元U1，逐一检查其pairs，每个P编号一次，回复unit_id固定U1。clips按顺序各附3图，frame_index是该素材内0至2。"
                 "usable仅判断画面：剧情story为true，职员表/演职员名单credits、混合mixed、不明unknown为false；普通对白/歌词不因此禁用。"
                 "relation为direct/supporting/unrelated/unknown，facts_match只用true或false；具体事实仅部分满足时用false，禁止partial。"
@@ -1117,91 +1132,149 @@ class MaterialRetriever:
                     feedback.append({"scene_id": alias, "previous": previous, "issues": old["issues"]})
                 payload["repair"] = feedback
                 prompt += "这是一次失败条目的局部纠错。原回复只作待修数据，按当前P/C目录修正字段；证据不足应明确不匹配，不为了通过而改成true。\n"
-            text = prompt+json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            prompt = prompt+json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             identity = stable_hash((PROPOSAL_VERSION, [(s.id, c["_review_key"]) for s, c in batch], with_images))
             if _repair:
                 identity = stable_hash((identity, "row-repair-v1"))
-            path = Path(directory)/"candidates"/f"review-{identity[:24]}.json"
-            limit = int(gateway.settings["vision" if with_images else "text"].get("max_prompt_chars", 16000))
-            too_large = len(text) > limit or len(text)*2+len(images)*1600+1024 >= int(gateway.settings["vision" if with_images else "text"].get("context_tokens", 64000))
-            if too_large:
-                if len(batch) > 1:
-                    accepted.extend(self.review_pairs(batch[:len(batch)//2], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only, _repair=_repair))
-                    accepted.extend(self.review_pairs(batch[len(batch)//2:], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only, _repair=_repair))
-                else:
-                    segment, candidate = batch[0]
-                    self._remember(segment, candidate, {"_validation_issues": [{"field": "input", "category": "input_budget", "message": "单镜头输入超过本模型预算，请调整模型上下文设置。"}]})
+            profile = gateway.settings["vision" if with_images else "text"]
+            too_large = len(prompt) > int(profile.get("max_prompt_chars", 16000)) or \
+                len(prompt)*2+(3*len(clips)*1600 if with_images else 0)+1024 >= int(profile.get("context_tokens", 64000))
+            if too_large and len(batch) > 1:
+                middle = len(batch)//2
+                jobs.extend(self.prepare_reviews(batch[:middle], gateway, directory, search_round=search_round, _safety_only=_safety_only, _repair=_repair))
+                jobs.extend(self.prepare_reviews(batch[middle:], gateway, directory, search_round=search_round, _safety_only=_safety_only, _repair=_repair))
                 continue
-            gateway.context.update(stage="检查句意与实际镜头", segment="、".join(units))
-            requests, previous_after = [], gateway.after_request
+            frozen = deepcopy(aliases)
+            frames = {c["_safety_key"]: str(self.store.directory(c["library_id"])/"frames"/c["asset_id"]/c["_review_id"]) for _, c in frozen.values()}
+            jobs.append({"key": identity, "file": f"candidates/review-{identity[:24]}.json", "unit_id": batch[0][0].id,
+                "aliases": aliases, "frozen": frozen, "references": references, "frames": frames, "prompt": prompt,
+                "with_images": with_images, "safety_only": _safety_only, "repair": bool(_repair), "search_round": search_round,
+                "input_error": "单镜头输入超过本模型预算，请调整模型上下文设置。" if too_large else ""})
+        return jobs
+
+    def request_review(self, job, gateway, stop=None, *, media_slots=None):
+        """Use an isolated client and frozen data; shared caches/state are committed elsewhere."""
+        from app.services.library.gateway import ModelAPIError
+        aliases, references, with_images = job["frozen"], job["references"], job["with_images"]
+        clips = {c["_safety_key"]: c for _, c in aliases.values()}
+        outcome = {"requests": [], "error": job["input_error"], "result": None, "parsed_response": None}
+        if not outcome["error"]:
+            check_cancel(stop)
+            images = []
+            if with_images:
+                with media_slots if media_slots is not None else nullcontext():
+                    for candidate in clips.values():
+                        check_cancel(stop)
+                        candidate["frame_paths"] = extract_frames(candidate["video_path"], candidate["source_start"],
+                            candidate["source_end"], 3, Path(job["frames"][candidate["_safety_key"]]))
+                        images.extend(candidate["frame_paths"])
+            def validate(value):
+                outcome["parsed_response"] = value
+                return _match_pairs(value, aliases, references, with_images, relevance=not job["safety_only"], require_owner=not job["safety_only"])
+            previous_after = gateway.after_request
             def after(details):
-                requests.append({k: details[k] for k in ("request_file", "usage", "http_status") if k in details})
+                outcome["requests"].append({k: details[k] for k in ("request_file", "usage", "http_status") if k in details})
                 if previous_after:
                     previous_after(details)
+            gateway.context.update(stage="检查句意与实际镜头", segment=job["unit_id"])
             gateway.after_request = after
             try:
-                result = gateway.json(text, images=images or None, model_kind="vision" if with_images else "text", max_output=max(2400, len(batch)*1100),
-                    required={"clips": list}, result_validator=validate, attempts=1 if _repair else 3,
-                    request_metadata={"usage_stage": "visual_safety" if _safety_only else "visual_review", "search_round": search_round,
-                        "candidate_file": path.relative_to(directory).as_posix(), "canonical_pairs": {
-                            alias: {"unit_id": s.id, "review_id": c["_review_id"]} for alias, (s, c) in aliases.items()},
-                        "subtitle_aliases": references, "local_repair": bool(_repair), "review_protocol": REVIEW_PROTOCOL,
+                outcome["result"] = gateway.json(job["prompt"], images=images or None, model_kind="vision" if with_images else "text",
+                    max_output=max(2400, len(aliases)*1100), required={"clips": list}, result_validator=validate,
+                    attempts=1 if job["repair"] else 3,
+                    request_metadata={"usage_stage": "visual_safety" if job["safety_only"] else "visual_review", "search_round": job["search_round"],
+                        "candidate_file": job["file"], "canonical_pairs": {alias: {"unit_id": s.id, "review_id": c["_review_id"]} for alias, (s, c) in aliases.items()},
+                        "subtitle_aliases": references, "local_repair": job["repair"], "review_protocol": REVIEW_PROTOCOL,
                         "candidates": self._request_sources(list(clips.values()), with_images=with_images)})
+            except (ModelFormatError, ModelAPIError) as exc:
+                outcome["error"] = gateway._redact_request(str(exc))[:1000]
             finally:
                 gateway.after_request = previous_after
-            approved, diagnostics, deferred = [], [], []
-            for row in result["clips"]:
-                segment, candidate = aliases[row["_pair"]]
-                candidate.pop("proposal_version", None)
-                row["review_scope"] = REVIEW_SCOPE_VERSION
-                row["review_protocol"] = REVIEW_PROTOCOL
-                if with_images and row["_usability_valid"]:
-                    safety = {k: row[k] for k in ("scene_id", "usable", "content_kind", "reason")}
-                    safety["scope"] = REVIEW_SCOPE_VERSION
-                    if safety["content_kind"] != "unknown" or _safety_only:
-                        self.store.cache_put(candidate["library_id"], candidate["_safety_key"], safety)
-                    candidate["_safety"] = safety
-                    if not safety["usable"]:
-                        self._reject(candidate, safety, gateway)
-                    elif isinstance(row.get("visual_evidence"), list) and all(isinstance(x, str) for x in row["visual_evidence"]):
-                        self.store.cache_put(candidate["library_id"], "visual-observation:"+stable_hash(candidate["_safety_key"]),
-                                             {"partial": True, "facts": row["visual_evidence"]})
-                if row["_validation_issues"] and not _repair and not any(
-                        issue["category"] == "unknown_visual" for issue in row["_validation_issues"]):
-                    deferred.append((segment, candidate, row))
-                else:
-                    if not _safety_only and not row["_validation_issues"]:
-                        self.store.cache_put(candidate["library_id"], candidate["_review_key"], {k: v for k, v in row.items() if not k.startswith("_")})
-                    if (not _safety_only or row["_validation_issues"]) and self._remember(segment, candidate, row,
-                            request_file=requests[-1].get("request_file") if requests else None) and not _safety_only:
-                        accepted.append(candidate); approved.append(candidate)
-                diagnostics.append({"unit_id": segment.id, "review_id": candidate["_review_id"],
-                    "source_start": candidate["source_start"], "source_end": candidate["source_end"],
-                    "response": row["_raw_response"], "response_stage": "normalized_model_reply",
-                    "validation_issues": row["_validation_issues"], "normalization": row.get("normalization")})
-            try:
-                previous = read_json(path, default={})
-            except (OSError, ValueError):
-                previous = {}
-            history = previous.get("history", []) if isinstance(previous, dict) else []
-            if not isinstance(history, list):
-                history = []
-            if isinstance(previous, dict) and previous.get("reviews"):
-                history.append({k: previous[k] for k in ("reviews", "requests", "subtitle_aliases") if k in previous})
-            audit = {"key": identity, "version": MATCH_POLICY_VERSION, "value": [{k:v for k,v in c.items() if k!="_requirement"} for c in approved], "reviews": diagnostics,
-                     "requests": requests, "subtitle_aliases": references, "history": history, "local_repair": bool(_repair),
-                     "discarded_replies": result.get("discarded_replies", [])}
-            write_json(path, audit)
-            if deferred:
-                repair = {c["_review_key"]: {"previous": row, "issues": row["_validation_issues"]} for _, c, row in deferred}
-                try:
-                    accepted.extend(self.review_pairs([(s, c) for s, c, _ in deferred], gateway, directory, stop,
-                        search_round=search_round, _safety_only=_safety_only, _repair=repair))
-                except (ModelFormatError, ModelAPIError, ModelInputBudgetError) as exc:
-                    for segment, candidate, row in deferred:
-                        self._remember(segment, candidate, row, request_file=requests[-1].get("request_file") if requests else None)
-                    audit["repair_error"] = gateway._redact_request(str(exc))[:1000]
-                    write_json(path, audit)
+        if outcome["result"] is None:
+            outcome["result"] = _match_pairs({"clips": []}, aliases, references, with_images)
+            for row in outcome["result"]["clips"]:
+                row["_validation_issues"] = [{"field": "input" if job["input_error"] else "request", "category": "input_budget" if job["input_error"] else "request_failed", "message": outcome["error"]}]
+        return outcome
+
+    def commit_review(self, job, outcome, gateway, directory):
+        """Persist every returned row and apply shared conclusions on the task thread."""
+        aliases, references, result = job["aliases"], job["references"], outcome["result"]
+        path = Path(directory)/job["file"]
+        try:
+            previous = read_json(path, default={})
+        except (OSError, ValueError):
+            previous = {}
+        history = previous.get("history", []) if isinstance(previous, dict) else []
+        history = list(history) if isinstance(history, list) else []
+        if isinstance(previous, dict) and previous.get("reviews"):
+            history.append({k: previous[k] for k in ("reviews", "requests", "subtitle_aliases", "parsed_response", "error") if k in previous})
+        diagnostics = [{"unit_id": aliases[row["_pair"]][0].id, "review_id": aliases[row["_pair"]][1]["_review_id"],
+            "source_start": aliases[row["_pair"]][1]["source_start"], "source_end": aliases[row["_pair"]][1]["source_end"],
+            "response": row["_raw_response"], "response_stage": "normalized_model_reply", "validation_issues": row["_validation_issues"],
+            "normalization": row.get("normalization")} for row in result["clips"]]
+        audit = {"key": job["key"], "version": MATCH_POLICY_VERSION, "value": [], "reviews": diagnostics,
+            "requests": outcome["requests"], "subtitle_aliases": references, "history": history, "local_repair": job["repair"],
+            "parsed_response": outcome["parsed_response"], "error": outcome["error"], "discarded_replies": result.get("discarded_replies", []),
+            "receipt_version": "frozen-review-receipt-v1", "application_complete": False}
+        write_json(path, audit)  # A received reply must survive failure during cache application.
+        approved, deferred = [], []
+        request_file = outcome["requests"][-1].get("request_file") if outcome["requests"] else None
+        for row in result["clips"]:
+            segment, candidate = aliases[row["_pair"]]
+            if candidate["_review_key"] in job.get("skip_keys", ()):
+                continue  # Recovery never overwrites a conclusion already present under the exact current key.
+            owner, frozen = job["frozen"][row["_pair"]]
+            if owner.id != segment.id or owner.requirement != segment.requirement or any(candidate.get(k) != frozen.get(k) for k in
+                    ("_review_key", "fingerprint", "source_start", "source_end", "natural_start", "natural_end")):
+                raise ValueError("审核期间原文需求或来源身份发生变化，回包已保存，请从3. 寻找画面继续核对。")
+            if "frame_paths" in frozen:
+                candidate["frame_paths"] = frozen["frame_paths"]
+            candidate.pop("proposal_version", None)
+            row.update(review_scope=REVIEW_SCOPE_VERSION, review_protocol=REVIEW_PROTOCOL)
+            if job["with_images"] and row["_usability_valid"]:
+                safety = {k: row[k] for k in ("scene_id", "usable", "content_kind", "reason")}
+                safety["scope"] = REVIEW_SCOPE_VERSION
+                if safety["content_kind"] != "unknown" or job["safety_only"]:
+                    self.store.cache_put(candidate["library_id"], candidate["_safety_key"], safety)
+                candidate["_safety"] = safety
+                if not safety["usable"]:
+                    self._reject(candidate, safety, gateway)
+                elif isinstance(row.get("visual_evidence"), list) and all(isinstance(x, str) for x in row["visual_evidence"]):
+                    self.store.cache_put(candidate["library_id"], "visual-observation:"+stable_hash(candidate["_safety_key"]), {"partial": True, "facts": row["visual_evidence"]})
+            if row["_validation_issues"] and not job["repair"] and not outcome["error"] and not any(i["category"] == "unknown_visual" for i in row["_validation_issues"]):
+                deferred.append((segment, candidate, row))
+            else:
+                if not job["safety_only"] and not row["_validation_issues"]:
+                    self.store.cache_put(candidate["library_id"], candidate["_review_key"], {k: v for k, v in row.items() if not k.startswith("_")})
+                if (not job["safety_only"] or row["_validation_issues"]) and self._remember(segment, candidate, row, request_file=request_file) and not job["safety_only"]:
+                    approved.append(candidate)
+        audit["value"] = [{k: v for k, v in c.items() if k != "_requirement"} for c in approved]
+        audit["application_complete"] = True
+        write_json(path, audit)
+        followups = []
+        if deferred:
+            repair = {c["_review_key"]: {"previous": row, "issues": row["_validation_issues"]} for _, c, row in deferred}
+            followups.extend(self.prepare_reviews([(s, c) for s, c, _ in deferred], gateway, directory,
+                search_round=job["search_round"], _safety_only=job["safety_only"], _repair=repair))
+        if job["safety_only"]:
+            ready = [(s, c) for s, c in aliases.values() if (c.get("_safety") or {}).get("usable") and
+                     c["_review_key"] not in self.unconfirmed and not any(c is bad for _, bad, _ in deferred)]
+            followups.extend(self.prepare_reviews(ready, gateway, directory, search_round=job["search_round"]))
+        return approved, followups
+
+    def review_pairs(self, pairs, gateway, directory, stop=None, *, search_round=0, _safety_only=False, _repair=None):
+        """Synchronous caller of the same frozen jobs, validator and shared commit path."""
+        jobs = self.prepare_reviews(pairs, gateway, directory, search_round=search_round, _safety_only=_safety_only, _repair=_repair)
+        accepted = []
+        while jobs:
+            check_cancel(stop)
+            job = jobs.pop(0)
+            client = copy(gateway)
+            client.context = dict(gateway.context)
+            value = self.request_review(job, client, stop)
+            approved, followups = self.commit_review(job, value, gateway, directory)
+            accepted.extend(approved)
+            jobs[0:0] = followups
         return accepted
 
     def select(self, segment, overview, gateway, directory, used=(), verify_visual=True, stop=None, *, candidates, scene_boundaries, assets):

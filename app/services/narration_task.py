@@ -7,13 +7,17 @@ import time
 import re
 import wave
 from pathlib import Path
+from copy import copy, deepcopy
+from queue import Empty, SimpleQueue
 from uuid import UUID, uuid4
 
 from loguru import logger
 
 from app.services.library.gateway import ModelGateway, ModelUsage
 from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION, CANDIDATE_QUEUE_VERSION, REVIEW_PROTOCOL
-from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
+from app.services.library.runner import (
+    DEFAULT_CALL_BUDGET, AnalysisCoordinator, JobCancelled, api_concurrency, check_cancel, library_operation, run_analysis_jobs,
+)
 from app.services.library import runner
 from app.services.library.store import LibraryStore, library_ids, stable_hash, write_json, read_json
 from app.services.library.indexer import audit_subtitles
@@ -375,6 +379,7 @@ def _task_options(text, options, *, draft=False, reuse_audio=False):
     if type(value) is not int or value < 1:
         raise ValueError("连续无改善轮数需为正整数。")
     result["visual_no_gain_rounds"] = value
+    result["visual_review_concurrency"] = api_concurrency(result.get("visual_review_concurrency", 4))
     for name in ("subtitles", "verify_visual", "mask_source_subtitles", "subtitle_allow_short"):
         if name in result and type(result[name]) is not bool:
             raise ValueError(name + " 应为开关。")
@@ -638,6 +643,123 @@ def _preserve_visual_result(directory):
     write_json(archive / "retained-files.json", {"original_task": str(directory), "video": str(retained) if retained.is_file() else None})
 
 
+class _ReviewCoordinator(AnalysisCoordinator):
+    """Workers own HTTP contexts; the task thread owns evidence, usage and candidates."""
+
+    def __init__(self, retriever, gateway, directory, stop, concurrency, maximum_jobs, metrics):
+        super().__init__(min(concurrency, max(1, maximum_jobs)), stop, gateway.before_request)
+        self.configured = concurrency
+        self.retriever, self.gateway, self.directory = retriever, gateway, directory
+        self.settings = deepcopy(gateway.settings)
+        self.events = SimpleQueue()
+        self.metrics, self.inflight = metrics, []
+        self.followups, self.progress = [], None
+        self.last_reply = None
+
+    def client(self, job):
+        client = copy(self.gateway)
+        client.settings = self.settings
+        client.context = {**self.gateway.context, "review_wave": self.metrics["waves"], "review_job": job["key"]}
+        def before():
+            self.before_request()  # Admission and the original call counter are protected by the existing lock.
+            client.context["request_started_at"] = time.time()
+        def diagnostic(record):
+            now = time.time()
+            record = {**record, "time": now, "elapsed_seconds": max(0, now-record.get("request_started_at", now))}
+            self.events.put(("diagnostic", record))
+        client.before_request, client.diagnostic, client.after_request = before, diagnostic, self.after_request
+        return client
+
+    def after_request(self, details):
+        super().after_request(details)
+        if self.gateway.after_request:
+            self.events.put(("after", dict(details)))
+
+    def execute(self, job):
+        try:
+            value = self.retriever.request_review(job, self.client(job), self.stop, media_slots=self.media_slots)
+        except Exception as exc:
+            self.events.put(("failed", job, self.gateway._redact_request(str(exc))[:500]))
+            raise
+        self.events.put(("result", job, value))
+
+    def report(self, force=False):
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except Empty:
+                break
+            kind = event[0]
+            if kind == "diagnostic":
+                record = event[1]
+                self.metrics["api_requests"] += 1
+                self.metrics["api_seconds"] += record["elapsed_seconds"]
+                self.last_reply = record.get("time", time.time())
+                if self.gateway.diagnostic:
+                    self.gateway.diagnostic(record)
+            elif kind == "after":
+                self.gateway.after_request(event[1])
+            else:
+                job = event[1]
+                descriptor = next(row for row in self.inflight if row["key"] == job["key"])
+                if kind == "failed":
+                    descriptor.update(state="interrupted", error=event[2])
+                else:
+                    approved, followups = self.retriever.commit_review(job, event[2], self.gateway, self.directory)
+                    self.followups.extend(followups)
+                    descriptor.update(state="returned", approved=len(approved), error=event[2]["error"])
+                    self.metrics["completed_jobs"] += 1
+                    self.metrics["approved_pairs"] += len(approved)
+        now = time.monotonic()
+        if self.progress and (force or now-self.reported >= 1):
+            self.reported = now
+            with self.lock:
+                active, limit = self.active, self.limit
+            recent = time.strftime("%H:%M:%S", time.localtime(self.last_reply)) if self.last_reply else "尚无"
+            done = sum(row["state"] != "queued" for row in self.inflight)
+            status = "停止派发，保存已返回结果" if self.abort.is_set() or (self.stop is not None and self.stop.is_set()) else "审核"
+            self.progress(f"{status}并发{active}/{limit}（设置{self.configured}）；第{self.metrics['waves']}波 "
+                          f"{done}/{len(self.inflight)}；单元{'、'.join(dict.fromkeys(r['unit_id'] for r in self.inflight))}；最近回包{recent}")
+
+    def run(self, jobs, checkpoint, progress):
+        self.progress = progress
+        self.metrics["waves"] += 1
+        started = time.monotonic()
+        pending = list(jobs)
+        submitted = set()
+        try:
+            while pending:
+                self.check()
+                fresh = [job for job in pending if job["key"] not in submitted]
+                self.metrics["duplicate_jobs_skipped"] += len(pending)-len(fresh)
+                pending = fresh
+                if not pending:
+                    break
+                selected, remaining, units = [], [], set()
+                for job in pending:
+                    if job["unit_id"] in units or len(selected) >= self.maximum:
+                        remaining.append(job)
+                    else:
+                        selected.append(job)
+                        units.add(job["unit_id"])
+                submitted.update(job["key"] for job in selected)
+                self.inflight = [{"key": j["key"], "unit_id": j["unit_id"], "file": j["file"], "state": "queued",
+                    "review_keys": [c["_review_key"] for _, c in j["aliases"].values()],
+                    "safety_only": j["safety_only"], "repair": j["repair"]} for j in selected]
+                self.followups = []
+                self.metrics["submitted_jobs"] += len(selected)
+                self.metrics["review_candidates"] += sum(len(j["aliases"]) for j in selected)
+                checkpoint()  # Persist frozen identities before starting any worker.
+                try:
+                    run_analysis_jobs(self, selected, self.execute)
+                finally:
+                    self.report(force=True)  # Drain paid replies even while cancellation is being reported.
+                pending = self.followups+remaining
+        finally:
+            self.metrics["wave_seconds"] += time.monotonic()-started
+            self.progress = None
+
+
 def _find_visual_shots(segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update, *, previous_plan=None):
     """Propose globally, inspect only proposed pairs, and retain a resumable local search cursor."""
     from app.models.timeline import NarrationSegment
@@ -714,6 +836,21 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify, stop=stop)
     boundaries, fingerprint_boundaries = {}, {}
     search_round = int(saved.get("search_round", 0))
+    metrics = {name: 0 for name in ("waves", "submitted_jobs", "completed_jobs", "review_candidates", "approved_pairs",
+        "api_requests", "api_seconds", "wave_seconds", "planning_calls", "planning_seconds", "snapshot_calls", "snapshot_seconds", "source_conflicts", "duplicate_jobs_skipped")}
+    previous_metrics = saved.get("review_metrics", {})
+    if isinstance(previous_metrics, dict):
+        metrics.update({k: v for k, v in previous_metrics.items() if k in metrics and type(v) in (int, float) and 0 <= v < float("inf")})
+    concurrency = api_concurrency(options.get("visual_review_concurrency", 4))
+    reviews = _ReviewCoordinator(retriever, gateway, directory, stop, concurrency, len(units), metrics)
+
+    def timed_plan(callback, *args, **kwargs):
+        started = time.monotonic()
+        metrics["planning_calls"] += 1
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            metrics["planning_seconds"] += time.monotonic()-started
 
     def merge(identifier, values):
         unique = {}
@@ -813,6 +950,8 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         return "exhausted"
 
     def save(status, gaps, proposal):
+        started = time.monotonic()
+        metrics["snapshot_calls"] += 1
         write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": {uid:[{k:v for k,v in c.items() if k!="_requirement"} for c in rows] for uid,rows in pools.items()},
             "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
             "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from,
@@ -820,12 +959,14 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             "migration": migration or saved.get("migration"), "evaluation_version": RETRIEVAL_REPAIR_VERSION,
             "evaluation_waves": waves, "paused_units": paused_units, "queue_version": CANDIDATE_QUEUE_VERSION,
             "candidate_progress": retriever.candidate_progress, "pause_dependencies": pause_dependencies,
-            "uncertain_waves": uncertain_waves, "local_search": local_search, "review_protocol":REVIEW_PROTOCOL})
+            "uncertain_waves": uncertain_waves, "local_search": local_search, "review_protocol":REVIEW_PROTOCOL,
+            "review_metrics": metrics, "review_inflight": reviews.inflight})
         write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
             "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
         write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
             "state": status, "timing_method": visual_plan["timing_method"], "search_policy": PROPOSAL_VERSION,
             "excluded_windows": len(retriever.rejected_scenes), "excluded_ranges": len(retriever.rejected_ranges),
+            "review_metrics": metrics, "review_inflight": reviews.inflight,
             "units": {u["id"]: {"examined_windows": len(examined[u["id"]]),
                 "candidate_count": sum(c.get("pending_review") is False for c in pools[u["id"]]),
                 "pending_candidates": sum(c.get("pending_review") is True for c in pools[u["id"]]),
@@ -838,6 +979,9 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                 "unconfirmed": sum(c["_review_key"] in retriever.unconfirmed for c in pools[u["id"]]),
                 "deferred_candidates": sum(c.get("state") == "deferred" and c.get("unit_id") == u["id"]
                     for c in retriever.candidate_progress.values())} for u in units}, "gaps": gaps})
+        elapsed = time.monotonic()-started
+        metrics["snapshot_seconds"] += elapsed
+        logger.debug("画面搜索快照{}，本次{:.3f}秒，累计{:.3f}秒", metrics["snapshot_calls"], elapsed, metrics["snapshot_seconds"])
 
     structural = [{"visual_unit_id": u["id"], "segment_id": u["segment_id"], "start": a, "end": b,
                    "category": "short_interval", "missing_seconds": round(b-a, 3), "reason": "动画与句意边界留下不足1秒原片区间。"}
@@ -855,7 +999,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             if not reasons:
                 reasons = ["父段或单元边界与动画原文绑定不一致，无法安全自动归并。"]
             gap["reason"] = "；".join(dict.fromkeys(reasons))
-        proposal, _ = propose_visual_timeline(segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
+        proposal, _ = timed_plan(propose_visual_timeline, segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         save("incomplete", structural, proposal)
         examples = "、".join(row["visual_unit_id"] for row in structural[:8])
         reasons = "；".join(dict.fromkeys(row["reason"] for row in structural))
@@ -878,13 +1022,13 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         for identifier in pools:
             merge(identifier, [])
         try:
-            shots = plan_visual_timeline(segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
+            shots = timed_plan(plan_visual_timeline, segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
             ensure_boundaries(shot.asset_id for shot in shots if shot.visual_unit_id)
             save("complete", [], shots)
             return shots, boundaries, pools
         except VisualCapacityError as exc:
             gaps = exc.gaps
-        confirmed, _ = propose_visual_timeline(segments, {k: [c for c in rows if c.get("pending_review") is False] for k, rows in pools.items()},
+        confirmed, _ = timed_plan(propose_visual_timeline, segments, {k: [c for c in rows if c.get("pending_review") is False] for k, rows in pools.items()},
                                              target_shot_seconds=target, visual_units=units, reservations=reservations)
         occupied = [(shot.visual_unit_id, candidate_for_shot(shot)) for shot in confirmed if shot.visual_unit_id]
         occupied = [(owner, candidate) for owner, candidate in occupied if candidate is not None]
@@ -904,7 +1048,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                            c["_review_key"] not in retriever.unconfirmed and identifier not in paused_units and
                            retriever.candidate_progress.get(c["_review_key"], {}).get("state") != "deferred")]
                           for identifier, rows in pools.items()}
-        proposal, _ = propose_visual_timeline(segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
+        proposal, _ = timed_plan(propose_visual_timeline, segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         covered = sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id)
         allocated = {u["id"]: sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id == u["id"]) for u in units}
         allocated_facts = {u["id"]:len({identifier for shot in confirmed if shot.visual_unit_id == u["id"] for identifier in shot.fact_ids}) for u in units}
@@ -919,14 +1063,40 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                 pair = (identifier, candidate["_review_key"])
                 if pair not in pair_keys:
                     pair_keys.add(pair); pairs.append((visual_segments[identifier], candidate))
-        save("searching", gaps, proposal)
         if pairs:
-            batch = [pair for pair in pairs if pair[0].id == pairs[0][0].id][:6]
-            update("寻找画面", progress, f"确认拟用镜头{len(batch)}个；当前{len(gaps)}处缺口，已确认可分配画面{covered:.1f}秒")
-            retriever.review_pairs(batch, gateway, directory, stop, search_round=search_round)
-            for segment, _ in batch:
-                merge(segment.id, [])
-            continue
+            selected, reserved, selected_units = [], [], set()
+            desired = {u["id"]: max(0, sum(b-a for a, b in visual_unit_intervals(u, reservations))-allocated[u["id"]]) for u in units}
+            capacity, counts = {}, {}
+            for segment, candidate in pairs:
+                identifier = segment.id
+                if identifier not in selected_units and len(selected_units) >= reviews.maximum:
+                    continue
+                if counts.get(identifier, 0) >= 6 or (counts.get(identifier, 0) and capacity[identifier] >= desired[identifier]-.001):
+                    continue
+                if not unused_source(candidate, [c for owner, c in reserved if owner != identifier]):
+                    metrics["source_conflicts"] += 1
+                    continue
+                selected.append((segment, candidate))
+                selected_units.add(identifier)
+                reserved.append((identifier, candidate))
+                counts[identifier] = counts.get(identifier, 0)+1
+                capacity[identifier] = capacity.get(identifier, 0)+min(target, candidate["source_end"]-candidate["source_start"])
+            jobs, owners = [], set()
+            for job in retriever.prepare_reviews(selected, gateway, directory, search_round=search_round):
+                if job["unit_id"] not in owners:
+                    jobs.append(job)
+                    owners.add(job["unit_id"])
+            if jobs:
+                update("寻找画面", progress, f"按缺口审核{len(jobs)}个单元；并发设置{concurrency}，当前{len(gaps)}处缺口，已确认{covered:.1f}秒")
+                try:
+                    reviews.run(jobs, lambda: save("searching", gaps, proposal),
+                        lambda message: update("寻找画面", progress, message))
+                finally:
+                    for identifier in selected_units:
+                        merge(identifier, [])
+                    save("searching", gaps, proposal)
+                continue
+        save("searching", gaps, proposal)
         material = {r["visual_unit_id"] for r in gaps if r.get("category") != "short_interval"}
         for identifier, wave in waves.items():
             processed[identifier].update(wave["keys"])

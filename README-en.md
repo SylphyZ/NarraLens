@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.9**
+**Manuscript-driven video production · v2.7.10**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.9 provides seven workspaces:
+Version 2.7.10 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -147,13 +147,17 @@ Version 2.7.8 separates ASS language hints from dialogue, lyrics and translator 
 
 Version 2.7.9 uses original-text part IDs for gap requirement revision. The model selects ranges and code restores quotes, offsets and fact IDs, without repeated quotation copying or legacy fact-index remapping. Valid peers are saved immediately. Invalid units receive one local correction with field-specific feedback; unresolved work pauses with saved progress. Parsed replies, request references and application validation remain in one batch audit. Compatible successful requirements can be reused. Resume from **3. Find footage**; new revisions and corrections consume tokens. No model calls or generation were run for this release; semantic quality and full output still require live acceptance.
 
+Version 2.7.10 schedules footage reviews across independent manuscript units with bounded concurrency, defaulting to 4 and adjustable in advanced output settings. Set 1 for the same serial path. Each request still handles one unit and a small set of proposed candidates. Inputs are frozen; the task thread persists replies, updates usage and commits shared state before batch allocation. Remaining duration bounds candidate submissions, with temporary source reservations and all factual, credits, source uniqueness and minimum-shot gates retained. New reply receipts support recovery after interrupted cache application; compatible caches remain reusable. Restart and resume from **3. Find footage**. Live concurrency, speed/token comparisons and full output have not been tested; no fixed speedup is promised.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.9 simplifies requirement revision and validation, reuses compatible successful results, saves complete parsed replies and corrects only invalid units once. Recoverable work pauses with progress retained. Implementation and static review are recorded separately from live model and full-generation acceptance, which have not been run.
+Version 2.7.10 adds configurable footage review concurrency, defaulting to 4 with the same serial path at 1. Frozen inputs, shared validation and task-thread commits support batch allocation and paid-result recovery. Static review is recorded separately from live concurrency, token and full-generation acceptance, which remain pending.
+
+Version 2.7.9 simplified requirement revision and validation, reuses compatible successful results, saves complete parsed replies and corrects only invalid units once. Recoverable work pauses with progress retained. Implementation and static review are recorded separately from live model and full-generation acceptance, which have not been run.
 
 Version 2.7.8 repaired lost Chinese ASS dialogue, adds reversible local index recovery, isolates actual reviews by manuscript unit and supports grounded multi-shot fact coverage. Existing narration, subtitle timing, compatible caches and old output are retained. Implementation and static review are complete; full generation and token effects have not been validated.
 
