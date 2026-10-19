@@ -189,10 +189,14 @@ class LibraryStore:
         result = []
         for identifier in library_ids(library_id):
             with self.database(identifier) as db:
-                rows = db.execute("""SELECT a.*, s.source_path AS subtitle_path, s.processed_path, s.content_hash,
+                rows = db.execute("""SELECT a.*, s.source_path AS subtitle_path, s.original_path, s.processed_path, s.content_hash,
                     s.settings AS subtitle_settings FROM assets a
                     LEFT JOIN subtitle_sources s ON s.id=a.active_subtitle ORDER BY a.episode,a.path""").fetchall()
-            result.extend({**dict(row), "library_id": identifier} for row in rows)
+            for row in rows:
+                item = {**dict(row), "library_id": identifier}
+                settings = json.loads(item.get("subtitle_settings") or "{}")
+                item["subtitle_identity"] = item["active_subtitle"] if settings.get("_processing") else item.get("content_hash")
+                result.append(item)
         return result
 
     def upsert_asset(self, library_id, media, episode):
@@ -217,6 +221,79 @@ class LibraryStore:
             db.execute("UPDATE assets SET active_subtitle=?,status=CASE WHEN active_subtitle=? THEN status ELSE 'pending' END WHERE id=?",
                        (identifier, identifier, asset_id))
         return previous != identifier
+
+    def restore_subtitle(self, library_id, asset, subtitle, scenes, manifest):
+        """Commit one asset and its exact-window mapping together; keep old files and a rollback record."""
+        key = "subtitle-migration:" + manifest["id"]
+        with self.database(library_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = db.execute("SELECT active_subtitle FROM assets WHERE id=?", (asset["id"],)).fetchone()
+            if not active or active[0] != asset["active_subtitle"]:
+                raise ValueError("字幕登记已变化，请重新校验后恢复。")
+            old_scenes = [dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end", (asset["id"],))]
+            if stable_hash(old_scenes) != manifest["old_scenes_hash"]:
+                raise ValueError("场景已变化，请停止关联任务并重新校验。")
+            old_shots = [dict(row) for row in db.execute("SELECT sh.* FROM shots sh JOIN scenes s ON sh.scene_id=s.id WHERE s.asset_id=?", (asset["id"],))]
+            old_directory = db.execute("SELECT value FROM analysis_cache WHERE key=?", ("episode-summary:"+asset["id"],)).fetchone()
+            db.execute("INSERT OR IGNORE INTO subtitle_sources VALUES(?,?,?,?,?,?,?)", (
+                subtitle["id"], asset["id"], subtitle["source_path"], subtitle["original_path"],
+                subtitle["processed_path"], subtitle["content_hash"], json.dumps(subtitle["settings"], ensure_ascii=False)))
+            mapping = {}
+            for row in scenes:
+                mapping[row["old_id"]] = row["id"]
+                db.execute("INSERT INTO scenes VALUES(?,?,?,?,?,?,?,?,?)", (
+                    row["id"], asset["id"], row["start"], row["end"], row["transcript"],
+                    json.dumps(row["analysis"], ensure_ascii=False), row["version"], row["visual"], row["frame_paths"]))
+                db.execute("UPDATE shots SET scene_id=?,version=? WHERE scene_id=?", (row["id"], row["version"], row["old_id"]))
+                db.execute("DELETE FROM scenes WHERE id=?", (row["old_id"],))
+            db.execute("DELETE FROM analysis_cache WHERE key=?", ("episode-summary:"+asset["id"],))
+            db.execute("UPDATE assets SET active_subtitle=?,status=? WHERE id=?", (subtitle["id"], "partial" if scenes else "pending", asset["id"]))
+            committed = {**manifest, "state": "committed", "scene_map": mapping, "old_scenes": old_scenes,
+                         "old_shots": old_shots, "old_episode_directory": old_directory[0] if old_directory else None,
+                         "old_status": asset["status"], "new_subtitle": subtitle}
+            committed["new_scenes_hash"] = stable_hash([dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end",(asset["id"],))])
+            committed["new_shots_hash"] = stable_hash([dict(row) for row in db.execute("SELECT sh.* FROM shots sh JOIN scenes s ON sh.scene_id=s.id WHERE s.asset_id=? ORDER BY sh.id",(asset["id"],))])
+            db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)", (key, json.dumps(committed, ensure_ascii=False)))
+        return committed
+
+    def rollback_subtitle(self, library_id, migration_id):
+        with self.database(library_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            key = "subtitle-migration:"+migration_id
+            saved = db.execute("SELECT value FROM analysis_cache WHERE key=?",(key,)).fetchone()
+            manifest = json.loads(saved[0]) if saved else {}
+            if manifest.get("state") != "committed":
+                raise ValueError("此字幕恢复记录不存在或已回退。")
+            asset_id = manifest["asset_id"]
+            active = db.execute("SELECT active_subtitle FROM assets WHERE id=?",(asset_id,)).fetchone()
+            scenes = [dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end",(asset_id,))]
+            shots = [dict(row) for row in db.execute("SELECT sh.* FROM shots sh JOIN scenes s ON sh.scene_id=s.id WHERE s.asset_id=? ORDER BY sh.id",(asset_id,))]
+            if not active or active[0] != manifest["new_subtitle"]["id"] or stable_hash(scenes) != manifest.get("new_scenes_hash") or stable_hash(shots) != manifest.get("new_shots_hash"):
+                raise ValueError("恢复后资料已有新修改，拒绝覆盖后续工作；请按备份与manifest定点处理。")
+            for row in scenes:
+                db.execute("DELETE FROM shots WHERE scene_id=?",(row["id"],))
+            db.execute("DELETE FROM scenes WHERE asset_id=?",(asset_id,))
+            for row in manifest["old_scenes"]:
+                db.execute("INSERT INTO scenes VALUES(?,?,?,?,?,?,?,?,?)",tuple(row[k] for k in ("id","asset_id","start","end","transcript","analysis","version","visual","frame_paths")))
+            for row in manifest["old_shots"]:
+                db.execute("INSERT INTO shots VALUES(?,?,?,?,?,?)",tuple(row[k] for k in ("id","scene_id","start","end","description","version")))
+            db.execute("UPDATE assets SET active_subtitle=?,status=? WHERE id=?",(manifest["old_subtitle"],manifest["old_status"],asset_id))
+            directory_key = "episode-summary:"+asset_id
+            if manifest.get("old_episode_directory") is None:
+                db.execute("DELETE FROM analysis_cache WHERE key=?",(directory_key,))
+            else:
+                db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)",(directory_key,manifest["old_episode_directory"]))
+            manifest.update(state="rolled_back",rolled_back=time.time())
+            db.execute("UPDATE analysis_cache SET value=? WHERE key=?",(json.dumps(manifest,ensure_ascii=False),key))
+        return manifest
+
+    def subtitle_migrations(self, library_id):
+        result = []
+        for identifier in library_ids(library_id):
+            with self.database(identifier) as db:
+                rows = db.execute("SELECT value FROM analysis_cache WHERE key LIKE 'subtitle-migration:%'").fetchall()
+            result.extend({**json.loads(row[0]), "library_id": identifier} for row in rows)
+        return result
 
     def rebind(self, library_id, asset_id, media):
         from app.services.library.runner import library_operation
@@ -268,7 +345,7 @@ class LibraryStore:
         with self.database(library_id) as db:
             db.execute("""INSERT INTO scenes(id,asset_id,start,end,transcript,analysis,version,visual,frame_paths)
                 VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                transcript=excluded.transcript,analysis=excluded.analysis,visual=excluded.visual,frame_paths=excluded.frame_paths""",
+                transcript=excluded.transcript,analysis=excluded.analysis,version=excluded.version,visual=excluded.visual,frame_paths=excluded.frame_paths""",
                 (scene["id"], asset_id, scene["start"], scene["end"], scene["transcript"],
                  json.dumps(scene["analysis"], ensure_ascii=False), scene["version"],
                  json.dumps(visual or {}, ensure_ascii=False), json.dumps(frames or [])))

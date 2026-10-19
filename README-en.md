@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.7**
+**Manuscript-driven video production · v2.7.8**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.7 provides seven workspaces:
+Version 2.7.8 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -143,13 +143,17 @@ Version 2.7.6 filters invalid preselection IDs individually and retains valid ch
 
 Version 2.7.7 saves temporary source conflicts and inconclusive reviews per candidate, then tries other ranges. Local retrieval continues past empty window batches. Resume advances the saved candidate queue and window cursor while reusing paid results. Unknown reply IDs are rejected individually and valid peers are retained. Strictly identified negative results may be validated locally without another correction request. User-configured valid no-gain stopping and final factual, pending-review, unique-source and credits gates remain required. Resume from **3. Find footage**; new reviews still consume tokens.
 
+Version 2.7.8 separates ASS language hints from dialogue, lyrics and translator annotations, preserving Chinese dialogue in neutral styles. Video Library adds subtitle checks, local dialogue/index recovery and per-asset rollback, retaining old files and visual analysis. Restored subtitle semantics are marked pending. Known dialogue loss blocks paid footage search. Each actual review handles one manuscript unit with multiple candidates. Grounded atomic facts may be covered by several shots, but only evidence inside the footage actually used counts. Unique-source, credits and minimum-duration checks remain required. Check/recover subtitle data before resuming from **3. Find footage**. Model review and full output still require live acceptance.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.7 repairs premature unit pauses, empty local batch handling and repeated selection of blocked candidates on resume. Saved candidate progress tracks allocation changes and inconclusive reviews. Valid reply peers and narrowly normalized negative results retain their audit records. Implementation and static review are complete; live gap improvement, token consumption and full video output have not been validated.
+Version 2.7.8 repairs lost Chinese ASS dialogue, adds reversible local index recovery, isolates actual reviews by manuscript unit and supports grounded multi-shot fact coverage. Existing narration, subtitle timing, compatible caches and old output are retained. Implementation and static review are complete; full generation and token effects have not been validated.
+
+Version 2.7.7 repaired premature unit pauses, empty local batch handling and repeated selection of blocked candidates on resume. Saved candidate progress tracks allocation changes and inconclusive reviews. Valid reply peers and narrowly normalized negative results retain their audit records. Implementation and static review are complete; live gap improvement, token consumption and full video output have not been validated.
 
 Version 2.7.6 repaired invalid preselection IDs, strictly compatible approval reuse and valid no-gain accounting while retaining existing audio, subtitles and footage ranges.
 

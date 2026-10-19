@@ -17,7 +17,7 @@ from app.services.timeline_planner import MATCH_POLICY_VERSION
 
 VISUAL_REQUIREMENT_VERSION = "grounded-facts-v1"
 BOUNDARY_ALIGNMENT_VERSION = "motion-boundary-gap-v1"
-REQUIREMENT_REVIEW_VERSION = "gap-facts-review-v1"
+REQUIREMENT_REVIEW_VERSION = "atomic-facts-review-v2"
 
 
 def split_document(text, limit=420):
@@ -411,8 +411,9 @@ def plan_visual_units(segments, text, overview, gateway, directory, stop=None, p
 
 
 def revise_visual_requirements(plan, previous_plan, text, gateway, directory, stop=None, progress=None):
-    """Review only saved gap contracts; retain raw grouping, text bindings and concrete facts."""
+    """Upgrade gap contracts, retaining paid grouping, exact text/time bounds and unchanged units."""
     from app.services.library.gateway import ModelAPIError, ModelInputBudgetError
+    from app.services.timeline_planner import COVERAGE_VERSION
 
     directory = Path(directory)
     try:
@@ -420,122 +421,172 @@ def revise_visual_requirements(plan, previous_plan, text, gateway, directory, st
     except (OSError, ValueError):
         report = {}
     previous = {u["id"]: u for u in previous_plan["units"]} if previous_plan else {}
-    compatible = previous_plan and all(previous_plan.get(k) == plan.get(k) for k in
-        ("text_hash", "audio_key", "model_signature", "requirement_contract"))
-    gaps = {row.get("visual_unit_id") for row in report.get("gaps", []) if isinstance(row, dict)} if \
-        compatible and isinstance(report, dict) and report.get("plan_key") == previous_plan["key"] else set()
+    same_input = previous_plan and all(previous_plan.get(k) == plan.get(k) for k in ("text_hash", "audio_key", "model_signature"))
+    gaps = {r.get("visual_unit_id") for r in report.get("gaps", []) if isinstance(r, dict)} if same_input and isinstance(report, dict) else set()
     entries, deferred, pending = [], [], []
     signature = gateway.signature("text")
 
     def validate(row, unit):
-        facts = unit["requirement"]["fact_sources"]
-        if not isinstance(row, dict) or row.get("unit_id") != unit["id"] or \
-                row.get("kind") not in {"evidence", "state", "abstract", "transition"} or \
-                not isinstance(row.get("reason"), str) or not row["reason"].strip():
-            raise ModelFormatError("需求修订须保留unit_id，含合法kind和非空reason。")
-        rows = row.get("facts")
-        if not isinstance(rows, list) or len(rows) != len(facts) or any(not isinstance(r, dict) or
-                type(r.get("index")) is not int or r.get("role") not in {"concrete", "commentary"} or
-                not isinstance(r.get("reason"), str) or not r["reason"].strip() for r in rows) or \
-                sorted(r["index"] for r in rows) != list(range(1, len(facts)+1)):
-            raise ModelFormatError("facts须逐一返回全部原事实index，各一次，role为concrete或commentary，附reason。")
-        return {"unit_id": unit["id"], "kind": row["kind"], "reason": row["reason"],
-                "facts": sorted(rows, key=lambda r: r["index"])}
+        before, original = unit["requirement"], text[unit["text_start"]:unit["text_end"]]
+        if not isinstance(row, dict) or row.get("unit_id") != unit["id"] or row.get("kind") not in {"evidence", "state", "abstract", "transition"} or not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            raise ModelFormatError("需求修订须保留unit_id，含合法kind及理由。")
+        def strings(value, maximum=8):
+            if not isinstance(value, list) or len(value) > maximum or any(not isinstance(s, str) or not s.strip() for s in value):
+                raise ModelFormatError("需求列表须为有限的非空字符串列表，可为空。")
+            return list(dict.fromkeys(s.strip() for s in value))
+        def binding(item):
+            quote, occurrence = item.get("quote"), item.get("occurrence", 1)
+            if not isinstance(quote, str) or not quote.strip() or type(occurrence) is not int or occurrence < 1:
+                raise ModelFormatError("事实和限制须逐字quote；同句多次出现时用occurrence指定第几次。")
+            matches = [m.start() for m in re.finditer(re.escape(quote), original)]
+            if occurrence > len(matches):
+                raise ModelFormatError("quote必须逐字属于当前单元，不能引用上下文或改写。")
+            a = unit["text_start"] + matches[occurrence-1]
+            return {"quote": quote, "text_start": a, "text_end": a+len(quote)}
+        sources = before.get("fact_sources", [])
+        roles = row.get("source_roles")
+        if not isinstance(roles, list) or len(roles) != len(sources) or any(not isinstance(r, dict) or type(r.get("index")) is not int or r.get("role") not in {"fact", "constraint", "commentary"} or not isinstance(r.get("reason"), str) or not r["reason"].strip() for r in roles) or sorted(r["index"] for r in roles) != list(range(1,len(sources)+1)):
+            raise ModelFormatError("source_roles须逐一交代全部原事实index，role为fact/constraint/commentary并附原因。")
+        facts, constraints = [], []
+        raw = row.get("facts")
+        if not isinstance(raw, list) or len(raw) > 16:
+            raise ModelFormatError("facts须为最多16个原子事件/关系，复合列举须拆开，不能用角色出现替代事件。")
+        for index, item in enumerate(raw, 1):
+            if not isinstance(item, dict) or item.get("kind") not in {"event", "relationship"} or not isinstance(item.get("description"), str) or not item["description"].strip() or len(item["description"]) > 100:
+                raise ModelFormatError("原子事实须含event/relationship、简短description及原文quote。人物/时期归入限制。")
+            bound = binding(item)
+            indices = item.get("source_indices", [])
+            if not isinstance(indices, list) or any(type(i) is not int or not 1 <= i <= len(sources) for i in indices) or len(indices) != len(set(indices)):
+                raise ModelFormatError("source_indices只能对应给定原事实编号。")
+            local = []
+            for limit in item.get("constraints", []):
+                if not isinstance(limit, dict) or not isinstance(limit.get("description"), str) or not limit["description"].strip():
+                    raise ModelFormatError("事实限制须含原文quote与description。")
+                local.append({**binding(limit), "description": limit["description"].strip()})
+            if len(local) > 8:
+                raise ModelFormatError("每事实最多8个限制。")
+            facts.append({"id": f"F{index:02d}", "kind": item["kind"], **bound, "description": item["description"].strip(), "constraints": local, "source_indices": indices})
+        facts.sort(key=lambda f:(f["text_start"],f["text_end"]))
+        for index, fact in enumerate(facts,1):
+            fact["id"] = f"F{index:02d}"
+        for item in row.get("constraints", []):
+            if not isinstance(item, dict) or not isinstance(item.get("description"), str) or not item["description"].strip():
+                raise ModelFormatError("全局限制须含原文quote及description，只作用于本单元全部镜头。")
+            constraints.append({**binding(item), "description": item["description"].strip()})
+        if len(constraints) > 8 or len({(f["text_start"],f["text_end"],f["description"]) for f in facts}) != len(facts):
+            raise ModelFormatError("限制最多8项，原子事实不得重复。")
+        for role in roles:
+            if role["role"] == "fact" and not any(role["index"] in f["source_indices"] for f in facts):
+                raise ModelFormatError("具体原事实不能遗漏，须由facts.source_indices对应，多个事件须分别覆盖。")
+            if role["role"] == "constraint":
+                quote = sources[role["index"]-1]["quote"]
+                if not any(c["quote"] in quote or quote in c["quote"] for c in constraints+[c for f in facts for c in f["constraints"]]):
+                    raise ModelFormatError("原身份/时期限制须明确绑定到事实或全局，不能只在解释中保留。")
+        motifs = strings(row.get("motifs"), 4)
+        if row["kind"] == "evidence" and not facts:
+            raise ModelFormatError("evidence必须有可观察的具体事件/关系；纯论述应分类为abstract/state/transition并说明配图行为。")
+        if row["kind"] != "evidence" and not motifs:
+            raise ModelFormatError("辅助画面须给出与论点具体相关、可观察的配图行为，不能只写主题词。")
+        return {"unit_id": unit["id"], "kind": row["kind"], "reason": row["reason"], "facts": facts, "constraints": constraints, "motifs": motifs, "source_roles": roles}
 
     def apply(unit, decision):
         before = unit["requirement"]
-        hard = [before["fact_sources"][r["index"]-1] for r in decision["facts"] if r["role"] == "concrete"]
-        commentary = [before["fact_sources"][r["index"]-1]["quote"] for r in decision["facts"] if r["role"] == "commentary"]
-        # A real fact cannot be weakened by relabeling its original evidence/state contract.
-        after = {**before, "kind": before["kind"] if hard else decision["kind"], "fact_sources": hard,
-                 "required_facts": list(dict.fromkeys(r["quote"] for r in hard)),
-                 "themes": list(dict.fromkeys([*before.get("themes", []), *commentary]))[:8]}
+        after = {**before, "kind": decision["kind"], "coverage_version": COVERAGE_VERSION,
+                 "facts": decision["facts"], "constraints": decision["constraints"], "motifs": decision["motifs"],
+                 "required_facts": [f["description"] for f in decision["facts"]],
+                 "events": [f["description"] for f in decision["facts"]],
+                 "avoid": [c["description"] for c in decision["constraints"]]}
         unit["requirement"] = after
-        entries.append({"unit_id": unit["id"], "before": before, "after": after, "decision": decision,
-                        "changed": before != after})
+        entries.append({"unit_id": unit["id"], "before": before, "after": after, "decision": decision, "changed": before != after})
 
     for unit in plan["units"]:
-        before = unit["requirement"]
-        if not before.get("fact_sources"):
-            continue
-        key = stable_hash((REQUIREMENT_REVIEW_VERSION, signature, unit["id"], unit["text_start"], unit["text_end"],
-                           text[unit["text_start"]:unit["text_end"]], before))
+        check_cancel(stop)
+        old = previous.get(unit["id"])
+        same_bounds = same_input and old and all(old.get(k) == unit[k] for k in ("text_start", "text_end", "start", "end"))
+        # Keep completed units and their paid legacy contract as a whole; never invent atom-level evidence.
+        key = stable_hash((REQUIREMENT_REVIEW_VERSION, signature, unit["id"], unit["text_start"], unit["text_end"], text[unit["text_start"]:unit["text_end"]], unit["requirement"]))
         path = directory/"planning"/f"requirement-{key[:24]}.json"
         try:
             cached = read_json(path, default={})
-            decision = validate(cached["value"], unit) if isinstance(cached, dict) and cached.get("key") == key else None
+            decision = validate(cached.get("value"), unit) if isinstance(cached, dict) and cached.get("key") == key else None
         except (OSError, ValueError, KeyError, TypeError):
             decision = None
         if decision:
             apply(unit, decision)
-        elif unit["id"] in gaps and unit["id"] in previous and all(unit[k] == previous[unit["id"]][k] for k in ("text_start", "text_end", "start", "end")):
+        elif same_bounds and unit["id"] not in gaps and unit["id"] not in previous_plan.get("requirements_pending", []):
+            unit["requirement"] = old["requirement"]
+        else:
             pending.append((unit, key, path))
 
     def submit(batch):
-        if not batch:
-            return
         check_cancel(stop)
-        units = {u["id"]: u for u, _, _ in batch}
-        payload = [{"unit_id": u["id"], "text": text[u["text_start"]:u["text_end"]], "kind": u["requirement"]["kind"],
-            "claim": u["requirement"]["claim"], "characters": u["requirement"]["characters"],
-            "events": u["requirement"]["events"], "avoid": u["requirement"]["avoid"],
-            "facts": [{"index": i, **fact} for i, fact in enumerate(u["requirement"]["fact_sources"], 1)]} for u, _, _ in batch]
-        prompt = ("审查缺口单元中原文事实的角色，不改写文案，不生成时间戳，不根据素材是否好找放宽要求。"
-            "逐一分类facts：concrete为原文明示、可由画面/范围字幕核对的人物、时期、事件或关系；commentary为主题、观众评价、价值判断、意义解释。"
-            "引句来自原文不等于它是具体事实。具体剧情即使尚无素材、涉及小说后期或同一单元有多个事件，也必须保留concrete。"
-            "人物/事件/时期/关系/avoid继续保留，不用笼统情绪代替具体事件，不把复合事件全部移成commentary。"
-            "纯论述可用abstract及有具体同向联系的辅助画面；一个事件的心理解释与实际事件需分清。"
-            "每个unit_id及事实index各一次，只返回{units:[{unit_id,kind,reason,facts:[{index,role:concrete或commentary,reason}]}]}。不补写事实或引文。\n"+
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        if len(prompt) > int(gateway.settings["text"].get("max_prompt_chars", 16000)) or \
-                len(prompt)*2+1200 >= int(gateway.settings["text"].get("context_tokens", 64000)):
+        units = {u["id"]: u for u,_,_ in batch}
+        payload = [{"unit_id": u["id"], "text": text[u["text_start"]:u["text_end"]], "requirement": u["requirement"], "source_facts": [{"index": i, **f} for i,f in enumerate(u["requirement"].get("fact_sources",[]),1)]} for u,_,_ in batch]
+        prompt = ("整理已有文案的画面合同，保留原文与时间边界，不根据素材可得性降低要求。每个单元独立，不混入其他单元人物。"
+            "claim是论点，不要求一帧证明理论。kind=evidence用于原文明示的具体事件/关系；身份/时期本身是约束，不自动导致evidence。"
+            "对全部source_facts分类source_roles:[{index,role:fact/constraint/commentary,reason}]。价值评价/意义解释是commentary，具体剧情不能移走。"
+            "将并列事件拆成独立facts:[{kind:event或relationship,quote:本单元逐字原文,occurrence:1,description:单个具体事件含主语,source_indices:[原事实index],constraints:[{quote,description}]}]。"
+            "例如结婚/买房/妹妹到来/孩子出生分别编号，保罗出现不能替代保罗死亡。前世门内/现世门外各自绑定时期和人物，不能全局禁止门内。"
+            "constraints是对本单元全部镜头成立的限制:[{quote,description}]，仅从当前原文绑定，不补外部剧情。facts内constraints仅作用该事实。"
+            "abstract/state/transition给motifs:[最多4个与论点同向的具体可见行为]，不能用无关普通镜头凑时长；facts可为空。"
+            "梳理events/avoid的作用范围，不再让抽象评价或跨事实全部人物成为每镜头必须证明的事件。没有原文依据不得加爱夏等角色。"
+            "不改变claim，不生成字幕/时间戳。返回{units:[{unit_id,kind,reason,source_roles:[],facts:[],constraints:[],motifs:[]}]}，全部列表必填。\n" + json.dumps(payload,ensure_ascii=False,separators=(",",":")))
+        if len(prompt) > int(gateway.settings["text"].get("max_prompt_chars",16000)) or len(prompt)*2+3600 >= int(gateway.settings["text"].get("context_tokens",64000)):
             if len(batch) > 1:
-                submit(batch[:len(batch)//2]); submit(batch[len(batch)//2:])
+                middle = len(batch)//2
+                submit(batch[:middle])
+                submit(batch[middle:])
             else:
-                deferred.append({"unit_id": batch[0][0]["id"], "reason": "需求修订输入超过模型预算，原需求保留。"})
+                deferred.append({"unit_id": batch[0][0]["id"], "reason": "单元合同超过输入预算，保留原合同等待处理。"})
             return
         def validate_batch(value):
             rows = value.get("units")
-            if not isinstance(rows, list) or any(not isinstance(r, dict) or not isinstance(r.get("unit_id"), str) for r in rows) or \
-                    len({r["unit_id"] for r in rows}) != len(rows) or any(r["unit_id"] not in units for r in rows):
-                raise ModelFormatError("需求修订units须使用给定unit_id，各最多一次。")
+            if not isinstance(rows,list):
+                raise ModelFormatError("units须为列表。")
             valid, invalid = [], []
-            by_id = {r["unit_id"]: r for r in rows}
             for identifier, unit in units.items():
+                matches = [r for r in rows if isinstance(r,dict) and r.get("unit_id") == identifier]
                 try:
-                    valid.append(validate(by_id.get(identifier), unit))
-                except ModelFormatError as exc:
-                    invalid.append({"unit_id": identifier, "reason": str(exc)})
-            return {"units": valid, "invalid": invalid}
-        gateway.context.update(stage="修订缺口画面需求", segment="、".join(units))
+                    if len(matches) != 1:
+                        raise ModelFormatError("当前unit_id须恰好一次。")
+                    valid.append(validate(matches[0],unit))
+                except (ModelFormatError, TypeError, KeyError) as exc:
+                    invalid.append({"unit_id":identifier,"reason":str(exc)})
+            return {"units":valid,"invalid":invalid}
+        gateway.context.update(stage="整理画面事实与配图",segment="、".join(units))
         if progress:
-            progress(f"小批复核{len(batch)}个缺口合同，保留已付费句意分组")
+            progress(f"整理{len(batch)}个原文单元，保留既有句意分组与时间")
         try:
-            value = gateway.json(prompt, max_output=3200, required={"units": list}, result_validator=validate_batch,
-                request_metadata={"usage_stage": "requirement_review", "rule": REQUIREMENT_REVIEW_VERSION, "unit_ids": list(units)})
-        except (ModelAPIError, ModelFormatError, ModelInputBudgetError) as exc:
-            deferred.extend({"unit_id": identifier, "reason": gateway._redact_request(str(exc))[:500]} for identifier in units)
+            value = gateway.json(prompt,max_output=6000,required={"units":list},result_validator=validate_batch,request_metadata={"usage_stage":"requirement_review","rule":REQUIREMENT_REVIEW_VERSION,"unit_ids":list(units)})
+        except (ModelAPIError,ModelFormatError,ModelInputBudgetError) as exc:
+            deferred.extend({"unit_id":identifier,"reason":gateway._redact_request(str(exc))[:500]} for identifier in units)
             return
         deferred.extend(value["invalid"])
-        records = {u["id"]: (key, path) for u, key, path in batch}
+        records = {u["id"]:(key,path) for u,key,path in batch}
         for decision in value["units"]:
             unit = units[decision["unit_id"]]
-            key, path = records[unit["id"]]
-            write_json(path, {"key": key, "unit_id": unit["id"], "before": unit["requirement"], "value": decision})
-            apply(unit, decision)
+            key,path = records[unit["id"]]
+            # Store the model schema, with local offsets removed, so the same validator checks reuse.
+            raw = next(r for r in value.get("_raw_units",[]) if r.get("unit_id") == unit["id"]) if value.get("_raw_units") else None
+            if raw is None:
+                original = text[unit["text_start"]:unit["text_end"]]
+                def unbind(item):
+                    return {k:v for k,v in item.items() if k not in {"id","text_start","text_end"}} | {"occurrence": sum(m.start() <= item["text_start"]-unit["text_start"] for m in re.finditer(re.escape(item["quote"]),original))}
+                raw = {**decision, "facts":[{**unbind(f),"constraints":[unbind(c) for c in f["constraints"]]} for f in decision["facts"]], "constraints":[unbind(c) for c in decision["constraints"]]}
+            write_json(path,{"key":key,"unit_id":unit["id"],"before":unit["requirement"],"value":raw})
+            apply(unit,decision)
 
-    for offset in range(0, len(pending), 4):
+    for offset in range(0,len(pending),4):
         submit(pending[offset:offset+4])
     base_key = plan["key"]
     if entries:
-        plan["requirement_revisions"] = {"version": REQUIREMENT_REVIEW_VERSION, "base_plan_key": base_key,
-            "model_signature": signature, "entries": sorted(entries, key=lambda r: r["unit_id"])}
-        plan["key"] = _visual_plan_key(plan)
-        write_json(directory/"visual_plan.json", plan)
-    if entries or deferred:
-        write_json(directory/"planning"/"requirement-review.json", {"version": REQUIREMENT_REVIEW_VERSION,
-            "base_plan_key": base_key, "plan_key": plan["key"], "reviewed": len(entries),
-            "changed": sum(r["changed"] for r in entries), "deferred": deferred})
+        plan["requirement_revisions"] = {"version":REQUIREMENT_REVIEW_VERSION,"base_plan_key":base_key,"model_signature":signature,"entries":sorted(entries,key=lambda r:r["unit_id"])}
+    plan["requirements_pending"] = sorted({row["unit_id"] for row in deferred})
+    plan["key"] = _visual_plan_key(plan)
+    write_json(directory/"visual_plan.json",plan)
+    write_json(directory/"planning"/"requirement-review.json",{"version":REQUIREMENT_REVIEW_VERSION,"base_plan_key":base_key,"plan_key":plan["key"],"reviewed":len(entries),"changed":sum(r["changed"] for r in entries),"deferred":deferred})
+    if deferred:
+        raise ValueError("画面需求尚未整理完成，已有配音/字幕和成功合同保留：" + "；".join(r["unit_id"]+"："+r["reason"] for r in deferred[:8]) + "。从3. 寻找画面继续仅补未完成单元。")
     return plan
 
 

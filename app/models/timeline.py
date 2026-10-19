@@ -28,6 +28,8 @@ class VisualShot:
     reason: str = ""
     weak_match: bool = False
     visual_unit_id: str = ""
+    fact_ids: list[str] = field(default_factory=list)
+    review_key: str = ""
 
 
 def timeline_dict(segments, shots):

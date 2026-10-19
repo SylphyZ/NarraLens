@@ -14,7 +14,7 @@ from uuid import uuid4
 import pysrt
 from loguru import logger
 
-from app.services.ass_subtitle import select_chinese_ass
+from app.services.ass_subtitle import ASS_SELECTION_VERSION, ass_role, parse_ass_events, plain_ass_lines, select_chinese_ass
 from app.services.library.frame_extractor import extract_frames, inspect_video
 from app.services.library.runner import (
     AnalysisCoordinator, DEFAULT_API_CONCURRENCY, JobCancelled, api_concurrency, check_cancel,
@@ -70,24 +70,151 @@ def suggest_mappings(videos, subtitles):
     return suggestions
 
 
-def prepare_subtitle(path, settings):
+def prepare_subtitle(path, settings, *, with_report=False):
     source = Path(path).resolve(strict=True)
     data = source.read_bytes()
     decoded = decode_subtitle_bytes(data)
     text = decoded.text
     uncertainty = 0
+    report = {"version": "plain-subtitle-v1", "body_events": 0, "decisions": []}
     if source.suffix.lower() in {".ass", ".ssa"}:
         if settings.get("chinese_only", True):
             filtered = select_chinese_ass(text, settings.get("styles", []), settings.get("line_mode", "auto"))
             text = filtered.text
             uncertainty = filtered.uncertain_events
+            report = filtered.report
+            # Style selection and retrieval role are separate, including explicitly selected lyrics.
+            lyrics = {event.line_index for event in parse_ass_events(text) if ass_role(event.style) in {"lyrics","annotation"}}
+            plot_lines = [line for index, line in enumerate(text.splitlines()) if index not in lyrics]
+            report["lyrics_not_indexed"] = len(lyrics)
+            if any(ass_role(event.style) not in {"lyrics","annotation"} for event in filtered.selected):
+                text = "\n".join(plot_lines)
+            else:
+                report["lyrics_only"] = True
         text = convert_ass_to_srt(text)
     if not has_timecodes(text):
         raise ValueError(f"字幕没有有效时间戳：{source.name}")
     cues = pysrt.from_string(text)
     if not cues or not any(item.text.strip() and item.end.ordinal > item.start.ordinal for item in cues):
         raise ValueError(f"字幕没有有效台词：{source.name}")
-    return data, text, hashlib.sha256(data).hexdigest(), uncertainty
+    report.update(source_hash=hashlib.sha256(data).hexdigest(), processed_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                  settings={k: v for k, v in settings.items() if not k.startswith("_")}, indexed_cues=len(cues))
+    result = (data, text, report["source_hash"], uncertainty)
+    return (*result, report) if with_report else result
+
+
+def _write_subtitle(store, library_id, asset_id, source, prepared, settings):
+    data, text, content_hash, _, report = prepared
+    settings = {k: v for k, v in settings.items() if not k.startswith("_")}
+    settings["_processing"] = {"version": report["version"], "processed_hash": report["processed_hash"],
+                               "lyrics_only": report.get("lyrics_only", False)}
+    identifier = stable_hash((asset_id, content_hash, settings))
+    directory = store.directory(library_id)/"subtitles"/asset_id/stable_hash((content_hash, settings))[:20]
+    directory.mkdir(parents=True, exist_ok=True)
+    original = directory/("original" + Path(source).suffix.lower())
+    processed = directory/"processed.srt"
+    for path, payload in ((original, data), (processed, text.encode("utf-8"))):
+        if path.exists():
+            if path.read_bytes() != payload:
+                raise ValueError("派生字幕身份与文件内容不符，已保留现有文件，请校验资料。")
+        else:
+            temporary = path.with_name(path.name+"."+uuid4().hex+".tmp")
+            try:
+                temporary.write_bytes(payload)
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+    write_json(directory/"selection-report.json", report)
+    return {"id": identifier, "source_path": str(source), "original_path": str(original),
+            "processed_path": str(processed), "content_hash": content_hash, "settings": settings}
+
+
+def audit_subtitles(store, library_id, stop=None):
+    """Read originals and derivatives; detect lost body text without model requests."""
+    rows = []
+    for asset in store.assets(library_id):
+        check_cancel(stop)
+        if not asset.get("original_path") or Path(asset["original_path"]).suffix.lower() not in {".ass", ".ssa"}:
+            continue
+        settings = json.loads(asset.get("subtitle_settings") or "{}")
+        if not settings.get("chinese_only", True):
+            continue
+        row = {"asset_id": asset["id"], "episode": asset["episode"], "video": Path(asset["path"]).name, "state": "ok"}
+        try:
+            original = Path(asset["original_path"])
+            if hashlib.sha256(original.read_bytes()).hexdigest() != asset["content_hash"]:
+                raise ValueError("登记original与原哈希不符，不能自动恢复。")
+            external = Path(asset["subtitle_path"])
+            if external.is_file() and hashlib.sha256(external.read_bytes()).hexdigest() != asset["content_hash"]:
+                raise ValueError("外部ASS已改变，请使用重新登记流程，不混合两个版本。")
+            prepared = prepare_subtitle(original, settings, with_report=True)
+            report = prepared[4]
+            current = pysrt.open(asset["processed_path"], encoding="utf-8")
+            normalized = lambda value: re.sub(r"\s+", "", value)
+            actual = {(cue.start.ordinal, cue.end.ordinal, normalized(cue.text)) for cue in current}
+            body = [d for d in report["decisions"] if d["action"] == "kept" and d["role"] == "body"]
+            missing = [d for d in body if (d["start_ms"], d["end_ms"], normalized(d["text"].replace(r"\N", "\n"))) not in actual]
+            row.update(body_events=len(body), missing_body_events=len(missing), current_cues=len(current),
+                       restored_cues=report["indexed_cues"], uncertain_events=report.get("uncertain_events", 0),
+                       lyrics_only=report.get("lyrics_only", False))
+            # Manual selection is intentional; source changes/errors still block unsafe repair.
+            if missing and not settings.get("styles"):
+                row["state"] = "recovery_needed"
+            elif report.get("lyrics_only"):
+                row["state"] = "lyrics_only"
+        except (OSError, ValueError) as exc:
+            row.update(state="error", error=str(exc))
+        rows.append(row)
+    return rows
+
+
+def restore_subtitle_text(store, library_id, stop=None):
+    """Repair only confirmed affected assets locally, preserving visual results and original files."""
+    with library_operation(library_id):
+        report = audit_subtitles(store, library_id, stop)
+        if any(row["state"] == "error" for row in report):
+            raise ValueError("字幕校验有原件／路径错误，请先处理：" + "；".join(row.get("error", "") for row in report if row["state"] == "error"))
+        targets = {row["asset_id"] for row in report if row["state"] == "recovery_needed"}
+        repaired = []
+        for asset in store.assets(library_id):
+            check_cancel(stop)
+            if asset["id"] not in targets:
+                continue
+            prepared = prepare_subtitle(asset["original_path"], json.loads(asset["subtitle_settings"]), with_report=True)
+            subtitle = _write_subtitle(store, library_id, asset["id"], asset["subtitle_path"], prepared, json.loads(asset["subtitle_settings"]))
+            with store.database(library_id) as db:
+                old = [dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end", (asset["id"],))]
+            cues = pysrt.from_string(prepared[1])
+            restored = []
+            for scene in old:
+                previous = json.loads(scene["analysis"])
+                base = previous.get("_analysis_version", scene["version"])
+                version = stable_hash((base, subtitle["id"]))
+                transcript = _window_text(cues, scene["start"], scene["end"])
+                analysis = {"title": "正文已恢复·字幕语义待补", "summary": "", "characters": [], "events": [], "themes": [],
+                            "subtitle_semantics": "pending", "_analysis_version": base, "subtitle_identity": subtitle["id"]}
+                restored.append({**scene, "old_id": scene["id"], "id": stable_hash((asset["id"], asset["fingerprint"], subtitle["id"], scene["start"], scene["end"], version)),
+                                 "transcript": transcript, "analysis": analysis, "version": version})
+            manifest = {"id": stable_hash((asset["id"], asset["active_subtitle"], subtitle["id"])), "state": "prepared",
+                        "rule": ASS_SELECTION_VERSION, "created": time.time(), "asset_id": asset["id"], "fingerprint": asset["fingerprint"],
+                        "old_subtitle": asset["active_subtitle"], "old_scenes_hash": stable_hash(old),
+                        "scene_map": {row["old_id"]: row["id"] for row in restored}, "new_subtitle": subtitle}
+            path = store.directory(library_id)/"subtitle-migrations"/(manifest["id"]+".json")
+            write_json(path, manifest)
+            committed = store.restore_subtitle(library_id, asset, subtitle, restored, manifest)
+            write_json(path, committed)
+            repaired.append({"asset_id": asset["id"], "episode": asset["episode"], "windows": len(restored), "manifest": str(path)})
+            store.job(library_id, "subtitle", progress=100*len(repaired)/max(1,len(targets)), message=f"已恢复{len(repaired)}/{len(targets)}个素材正文；原片及视觉结果保留，字幕语义待补。")
+        store.job(library_id, "subtitle", state="complete", progress=100, message=f"本地恢复完成：{len(repaired)}个素材；未调用API。可继续寻找画面，或用原分析入口补字幕语义。")
+        return repaired
+
+
+def rollback_subtitle_text(store, library_id, migration_id):
+    """Rollback one untouched local repair, without replacing a whole library database."""
+    with library_operation(library_id):
+        manifest = store.rollback_subtitle(library_id, migration_id)
+        write_json(store.directory(library_id)/"subtitle-migrations"/(migration_id+".json"),manifest)
+        return manifest
 
 
 def import_materials(store, library_id, mappings, subtitle_settings, stop=None):
@@ -103,7 +230,7 @@ def _import_materials(store, library_id, mappings, subtitle_settings, stop=None)
         store.job(library_id, "import", progress=index * 100 / len(mappings), message=f"登记素材 {index + 1}/{len(mappings)}")
         try:
             media = inspect_video(mapping.video_path, stop)
-            subtitle = prepare_subtitle(mapping.subtitle_path, subtitle_settings) if mapping.subtitle_path else None
+            subtitle = prepare_subtitle(mapping.subtitle_path, subtitle_settings, with_report=True) if mapping.subtitle_path else None
             duplicate = next((item for item in store.assets(library_id) if item["fingerprint"] == media.fingerprint and item["path"] != media.path), None)
             if duplicate:
                 if subtitle and duplicate.get("content_hash") not in {None, subtitle[2]}:
@@ -112,14 +239,8 @@ def _import_materials(store, library_id, mappings, subtitle_settings, stop=None)
                 continue
             asset_id = store.upsert_asset(library_id, media, mapping.episode)
             if subtitle:
-                data, text, content_hash, _ = subtitle
-                directory = store.directory(library_id) / "subtitles" / asset_id / stable_hash((content_hash, subtitle_settings))[:20]
-                directory.mkdir(parents=True, exist_ok=True)
-                original = directory / ("original" + Path(mapping.subtitle_path).suffix.lower())
-                processed = directory / "processed.srt"
-                original.write_bytes(data)
-                processed.write_text(text, encoding="utf-8")
-                store.set_subtitle(library_id, asset_id, str(Path(mapping.subtitle_path).resolve()), original, processed, content_hash, subtitle_settings)
+                record = _write_subtitle(store, library_id, asset_id, str(Path(mapping.subtitle_path).resolve()), subtitle, subtitle_settings)
+                store.set_subtitle(library_id, asset_id, record["source_path"], record["original_path"], record["processed_path"], record["content_hash"], record["settings"])
             elif not mapping.subtitle_path:
                 with store.database(library_id) as db:
                     db.execute("UPDATE assets SET status=CASE WHEN active_subtitle IS NULL THEN status ELSE 'pending' END,active_subtitle=NULL WHERE id=?", (asset_id,))
@@ -131,13 +252,37 @@ def _import_materials(store, library_id, mappings, subtitle_settings, stop=None)
               message=("\n".join(failures) if failures else "素材登记完成，视频仍位于原路径。") + (f"\n跳过 {len(duplicates)} 个相同内容的视频副本。" if duplicates else ""))
 
 
+def _window_text(cues, start, end):
+    return "\n".join(f"{item.start} --> {item.end} {item.text.replace(chr(10), ' ')}" for item in cues
+                     if item.start.ordinal / 1000 < end and item.end.ordinal / 1000 > start)
+
+
+def plot_cues(asset):
+    """Read existing SRT and exclude positively identified lyrics, also for older registrations."""
+    cues = pysrt.open(asset["processed_path"],encoding="utf-8") if asset.get("processed_path") else []
+    processing = json.loads(asset.get("subtitle_settings") or "{}").get("_processing",{})
+    if processing.get("lyrics_only"):
+        return []
+    original = Path(asset["original_path"]) if asset.get("original_path") else None
+    if processing or not original or original.suffix.lower() not in {".ass",".ssa"}:
+        return cues
+    events = parse_ass_events(decode_subtitle_bytes(original.read_bytes()).text)
+    key = lambda start,end,text:(start,end,re.sub(r"\s+","",text))
+    identities = {"lyrics":set(),"body":set()}
+    for event in events:
+        a,b = event.start.split(":"),event.end.split(":")
+        ms = lambda value:round((int(value[0])*3600+int(value[1])*60+float(value[2]))*1000)
+        identities["lyrics" if ass_role(event.style) in {"lyrics","annotation"} else "body"].add(key(ms(a),ms(b),"".join(plain_ass_lines(event.text))))
+    lyrics = identities["lyrics"]-identities["body"]
+    return [cue for cue in cues if key(cue.start.ordinal,cue.end.ordinal,cue.text) not in lyrics]
+
+
 def _windows(asset, window_seconds):
-    cues = pysrt.open(asset["processed_path"], encoding="utf-8") if asset.get("processed_path") else []
+    cues = plot_cues(asset)
     windows = []
 
     def append(start, end):
-        text = "\n".join(f"{item.start} --> {item.end} {item.text.replace(chr(10), ' ')}" for item in cues
-                         if item.start.ordinal / 1000 < end and item.end.ordinal / 1000 > start)
+        text = _window_text(cues, start, end)
         if len(text) > 7000:
             if end - start < .5:
                 raise ValueError("字幕事件过于密集，请先整理重复字幕。")
@@ -429,8 +574,11 @@ def _commit_ready(coordinator, entries):
         if entry["plan"]["visual"] and (entry.get("visual") is None or not entry.get("frames")):
             continue
         analysis = entry["analysis"]
+        if entry["plan"].get("subtitle_identity"):
+            analysis = {**analysis, "_analysis_version": entry["plan"]["base_version"],
+                        "subtitle_identity": entry["plan"]["subtitle_identity"]}
         if not entry["transcript"]:
-            analysis = {**analysis, "summary": entry["visual"]["summary"]}
+            analysis = {**analysis, "summary": entry.get("visual",{}).get("summary","此窗口没有可检索剧情台词。")}
         scene = {"id": entry["id"], "start": entry["start"], "end": entry["end"],
                  "transcript": entry["transcript"], "analysis": analysis, "version": entry["plan"]["version"]}
         with coordinator.lock:
@@ -487,6 +635,10 @@ def _build_library(store, library_id, gateway, settings, stop=None):
     assets = store.assets(library_id)
     if not assets:
         raise ValueError("素材库为空，请先登记视频。")
+    issues = [row for row in audit_subtitles(store, library_id, stop) if row["state"] in {"recovery_needed", "error"}]
+    if issues:
+        raise ValueError("字幕正文校验未通过，请先在已登记素材下展开“字幕资料校验与恢复”，校验并恢复正文与本地索引。受影响集数：" +
+                         "、".join(str(row["episode"]) for row in issues))
     def setting(name, default, maximum):
         value = settings.get(name, default)
         try:
@@ -519,13 +671,17 @@ def _build_library(store, library_id, gateway, settings, stop=None):
             if media.fingerprint != asset["fingerprint"]:
                 changed = True
                 raise ValueError("原视频已变化，请重新登记此文件。")
-            if not visual and not asset.get("processed_path"):
+            if not visual and (not asset.get("processed_path") or json.loads(asset.get("subtitle_settings") or "{}").get("_processing",{}).get("lyrics_only")):
                 raise ValueError("此视频没有字幕，必须启用视觉分析。")
             windows = _windows(asset, window_seconds)
-            identifiers = [stable_hash((asset["id"], asset["fingerprint"], asset.get("content_hash"), start, end, version))
+            identity = asset.get("subtitle_identity") or asset.get("content_hash")
+            derived = json.loads(asset.get("subtitle_settings") or "{}").get("_processing")
+            asset_version = stable_hash((version, identity)) if derived else version
+            identifiers = [stable_hash((asset["id"], asset["fingerprint"], identity, start, end, asset_version))
                            for start, end, transcript in windows]
             retained = store.begin_analysis(library_id, asset["id"], identifiers)
-            plan = {"asset": asset, "visual": visual, "version": version, "retained": retained,
+            plan = {"asset": asset, "visual": visual, "version": asset_version, "base_version": version,
+                    "subtitle_identity": identity if derived else None, "retained": retained,
                     "scenes": {}, "entries": [], "directory": None}
             for index, ((start, end, transcript), identifier) in enumerate(zip(windows, identifiers), 1):
                 text_key = stable_hash(("scene-text-v2", gateway.signature("text"), library_name, transcript, asset["episode"], start, end))

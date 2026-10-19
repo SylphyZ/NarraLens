@@ -12,10 +12,11 @@ from uuid import UUID, uuid4
 from loguru import logger
 
 from app.services.library.gateway import ModelGateway, ModelUsage
-from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION, CANDIDATE_QUEUE_VERSION
+from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION, CANDIDATE_QUEUE_VERSION, REVIEW_PROTOCOL
 from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
 from app.services.library import runner
 from app.services.library.store import LibraryStore, library_ids, stable_hash, write_json, read_json
+from app.services.library.indexer import audit_subtitles
 from app.services.narration_planner import (
     BOUNDARY_ALIGNMENT_VERSION, plan_document, plan_subtitles, plan_visual_units, revise_visual_requirements, validate_visual_plan,
 )
@@ -142,6 +143,8 @@ def _resume_checkpoint(directory, settings, text, level):
         if policy.get("matching", {}).get("version") != MATCH_POLICY_VERSION:
             raise ValueError("此时间轴尚未执行2.7句意匹配，请从3. 寻找画面继续；配音与字幕可复用。")
         visual_plan = validate_visual_plan(saved("visual_plan.json", "句意画面计划"), segments, text, directory)
+        if visual_plan.get("requirements_pending"):
+            raise ValueError("画面事实需求尚未整理完成，请从3. 寻找画面继续；已有配音、字幕与旧成片保留。")
         if policy["matching"] != matching_policy(visual_plan):
             raise ValueError("句意画面计划与时间线不一致，请从3. 寻找画面继续。")
         expected_motion = motion_config_key(options)
@@ -658,7 +661,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     alignment = visual_plan.get("boundary_alignment", {})
     base_key = alignment.get("base_plan_key") if alignment.get("version") == BOUNDARY_ALIGNMENT_VERSION else None
     revisions = visual_plan.get("requirement_revisions", {})
-    retriever.configure_requirements(visual_segments, revisions, gateway)
+    retriever.configure_requirements(visual_segments, revisions, gateway, previous_plan=previous_plan)
     compatible_keys = {key}
     if not any(row.get("changed") for row in revisions.get("entries", [])):
         compatible_keys.update(stable_hash((PROPOSAL_VERSION, value, *search_identity)) for value in
@@ -672,23 +675,30 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             not isinstance(saved.get("pools", {}), dict) or not isinstance(saved.get("examined", {}), dict):
         saved = {}
     migration = None
+    repaired_indices = set()
     if saved and saved.get("key") not in compatible_keys:
         previous_units = {u["id"]: stable_hash(u) for u in previous_plan["units"]} if previous_plan else {}
-        if saved.get("search_signature") == search_signature and isinstance(saved.get("unit_signatures"), dict):
+        previous_source = next((version for version in retriever.previous_versions if saved.get("search_signature") ==
+            stable_hash((PROPOSAL_VERSION,version,*search_identity[1:]))),None)
+        if previous_source and isinstance(saved.get("unit_signatures"),dict):
+            known = saved["unit_signatures"]
+            repaired_indices = set(retriever.previous_versions[previous_source])
+        elif saved.get("search_signature") == search_signature and isinstance(saved.get("unit_signatures"), dict):
             known = saved["unit_signatures"]
         elif previous_plan and saved.get("key") == stable_hash((PROPOSAL_VERSION, previous_plan["key"], *search_identity)):
             known = previous_units
         else:
             known = None
         if known is None:
-            saved = {}
+            # Unproven cursors are reset; physical ranges still pass prepare's current source/content checks.
+            saved = {"pools":saved.get("pools",{}),"key":saved.get("key"),"search_round":saved.get("search_round",0),"examined":{}}
         else:
             retained = {uid for uid, signature in unit_signatures.items() if known.get(uid) == signature}
-            saved = {**saved, "examined": {uid: rows for uid, rows in saved["examined"].items() if uid in retained},
-                     "exhausted": [uid for uid in saved.get("exhausted", []) if uid in retained]}
+            saved = {**saved, "examined": {uid: [i for i in rows if i not in repaired_indices] for uid, rows in saved["examined"].items() if uid in retained},
+                     "exhausted": [uid for uid in saved.get("exhausted", []) if uid in retained and not repaired_indices]}
             # Old ranges can be proposed again, but prepare() revalidates every current requirement/key.
             migration = {"from_key": saved.get("key"), "retained_units": sorted(retained),
-                         "reset_units": sorted(set(unit_signatures)-retained)}
+                         "reset_units": sorted(set(unit_signatures)-retained),"repaired_source_indices":sorted(repaired_indices)}
     migrated_from = saved.get("key") if saved and saved.get("key") != key else saved.get("migrated_from_key")
     if migrated_from and migrated_from != saved.get("migrated_from_key"):
         logger.info("已核对搜索身份并复用候选范围；仅变更合同的单元重置游标：{}，{}", migrated_from, migration)
@@ -711,7 +721,8 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             if c.get("_rejected") or not retriever.range_allowed(c):
                 continue
             physical = source_shot_key(c)
-            rank = lambda row: (not row.get("pending_review", True), row.get("confidence", row.get("proposal_score", 0)), row["source_end"]-row["source_start"])
+            rank = lambda row: (not row.get("pending_review", True), len(row.get("coverage",{}).get("supports",[])),
+                                row.get("confidence", row.get("proposal_score", 0)), row["source_end"]-row["source_start"])
             if physical not in unique or rank(c) > rank(unique[physical]):
                 unique[physical] = c
         pools[identifier] = sorted(unique.values(), key=lambda c: (not c.get("pending_review", True),
@@ -802,14 +813,14 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         return "exhausted"
 
     def save(status, gaps, proposal):
-        write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": pools,
+        write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": {uid:[{k:v for k,v in c.items() if k!="_requirement"} for c in rows] for uid,rows in pools.items()},
             "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
             "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from,
             "search_signature": search_signature, "unit_signatures": unit_signatures,
             "migration": migration or saved.get("migration"), "evaluation_version": RETRIEVAL_REPAIR_VERSION,
             "evaluation_waves": waves, "paused_units": paused_units, "queue_version": CANDIDATE_QUEUE_VERSION,
             "candidate_progress": retriever.candidate_progress, "pause_dependencies": pause_dependencies,
-            "uncertain_waves": uncertain_waves, "local_search": local_search})
+            "uncertain_waves": uncertain_waves, "local_search": local_search, "review_protocol":REVIEW_PROTOCOL})
         write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
             "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
         write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
@@ -896,6 +907,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         proposal, _ = propose_visual_timeline(segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         covered = sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id)
         allocated = {u["id"]: sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id == u["id"]) for u in units}
+        allocated_facts = {u["id"]:len({identifier for shot in confirmed if shot.visual_unit_id == u["id"] for identifier in shot.fact_ids}) for u in units}
         progress = 47+22*min(1, covered/max(.001, needed_seconds))
         pair_keys, pairs = set(), []
         for shot in proposal:
@@ -909,7 +921,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                     pair_keys.add(pair); pairs.append((visual_segments[identifier], candidate))
         save("searching", gaps, proposal)
         if pairs:
-            batch = pairs[:6]
+            batch = [pair for pair in pairs if pair[0].id == pairs[0][0].id][:6]
             update("寻找画面", progress, f"确认拟用镜头{len(batch)}个；当前{len(gaps)}处缺口，已确认可分配画面{covered:.1f}秒")
             retriever.review_pairs(batch, gateway, directory, stop, search_round=search_round)
             for segment, _ in batch:
@@ -933,7 +945,8 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                     paused_units[identifier] = f"连续{no_gain_limit}批实际审核未确认，相关候选已保存待后续处理"
             elif not unresolved and len(retriever.evaluated[identifier]) > wave["evaluated_before"]:
                 uncertain_waves[identifier] = 0
-                no_gain[identifier] = 0 if allocated[identifier] > wave["allocated_before"]+.001 else no_gain[identifier]+1
+                improved = allocated[identifier] > wave["allocated_before"]+.001 or allocated_facts[identifier] > wave.get("facts_before",0)
+                no_gain[identifier] = 0 if improved else no_gain[identifier]+1
             elif not wave["keys"]:
                 paused_units[identifier] = "预选输入或协议未完成" if wave["protocol_issues"] else "本轮没有可审候选且无新有效结论"
         waves = {}
@@ -951,7 +964,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             if not candidates:
                 if len(retriever.evaluated[identifier]) > before:
                     waves[identifier] = {"keys": [], "evaluated_before": before,
-                        "allocated_before": allocated[identifier], "protocol_issues": 0}
+                        "allocated_before": allocated[identifier], "facts_before":allocated_facts[identifier], "protocol_issues": 0}
                 elif local_state == "yielded":
                     paused_units[identifier] = "本地续查已保存游标让出，查询尚未耗尽"
                 elif local_state == "stalled":
@@ -964,21 +977,23 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                         pause_dependencies[identifier] = occupancy
                 continue
             waves[identifier] = {"keys": [], "evaluated_before": before,
-                "allocated_before": allocated[identifier], "protocol_issues": 0}
+                "allocated_before": allocated[identifier], "facts_before":allocated_facts[identifier], "protocol_issues": 0}
             groups.append((visual_segments[identifier], candidates, sum(row["missing_seconds"] for row in gaps if row["visual_unit_id"] == identifier)))
         if not groups and not waves:
             save("incomplete", gaps, proposal)
             unconfirmed = sum(c["_review_key"] in retriever.unconfirmed for rows in pools.values() for c in rows)
             held = sum(no_gain[identifier] >= no_gain_limit for identifier in material)
             short = sum(row.get("category") == "short_interval" for row in gaps)
+            fact_gaps = [row for row in gaps if row.get("category") in {"fact_coverage","fact_order"}]
             protocol = sum(row.get("invalid_references", 0) > 0 for row in retriever.preselection.values())
             pending = sum(c.get("pending_review") is True for rows in pools.values() for c in rows)
             deferred = sum(row.get("state") == "deferred" for row in retriever.candidate_progress.values())
             reasons = "；".join(f"{reason}{list(paused_units.values()).count(reason)}个单元" for reason in dict.fromkeys(paused_units.values()))
             raise JobPaused(f"画面仍有{len(gaps)}处缺口，共缺{sum(r['missing_seconds'] for r in gaps):.2f}秒；"
-                f"{held}个单元完成有效评估后连续{no_gain_limit}轮无新增可分配时长，{short}处为短残段，"
+                f"{held}个单元完成有效评估后连续{no_gain_limit}轮无新增可分配时长或事实覆盖，{short}处为短残段，{len(fact_gaps)}处为事实覆盖/顺序不足，"
                 f"预选协议或编号问题涉及{protocol}个单元，实际镜头未确认{unconfirmed}个，候选队列待审{pending}个，分配延后{deferred}个。"
                 f"{reasons + '。' if reasons else ''}"
+                + ("事实缺项："+"；".join(row["visual_unit_id"]+"："+row["reason"] for row in fact_gaps[:6])+"。" if fact_gaps else "") +
                 "本次按有效评估及候选进度暂停；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
                 "从3. 寻找画面继续会复用已付费结果，沿候选队列及保存的本地检索游标向后推进。")
         if groups:
@@ -1101,6 +1116,15 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
             gateway.require(kind)
         store = LibraryStore()
         selected_libraries = library_ids(settings)
+        if level <= 3:
+            update("校验字幕资料", 0 if level == 0 else 40, "本地检查正文资料；异常资料修复前不发起模型找片")
+            subtitle_issues = [row for identifier in selected_libraries for row in audit_subtitles(store, identifier, stop)
+                               if row["state"] in {"recovery_needed", "error"}]
+            if subtitle_issues:
+                write_json(directory/"subtitle_quality.json", {"state": "blocked", "issues": subtitle_issues})
+                raise JobPaused("视频素材库字幕正文校验未通过：" + "；".join(
+                    f"第{r['episode']}集：" + (r.get("error") or f"缺少{r.get('missing_body_events', 0)}条正文") for r in subtitle_issues) +
+                    "。请到视频素材库→已登记素材→字幕资料校验与恢复，点“校验字幕”及“恢复正文与本地索引”，再从3. 寻找画面继续。配音、字幕、动画及旧成片保留。")
         retriever = MaterialRetriever(store, selected_libraries) if level <= 3 else None
         if level == 0:
             update("分析文案", 0, "保留原文，分析全文结构和画面需求")
@@ -1207,6 +1231,10 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                     "source_start", "source_end", "usable", "content_kind", "visual_policy", "match_policy", "visual_unit_id",
                     "relation", "facts_match", "evidence", "conflicts", "subtitle_quotes", "visual_checked", "confidence",
                     "subtitle_ids", "visual_evidence", "evidence_protocol")})
+                used[-1]["review_key"] = selected["_review_key"]
+                for key in ("coverage", "review_protocol", "compatible_from"):
+                    if key in selected:
+                        used[-1][key] = selected[key]
             update("编排镜头", 70, "校验句意对应、全片来源去重与实际范围画面检查记录")
             policy = make_visual_policy(assets, boundaries, used, retriever.forbidden, visual_plan=visual_plan)
             validate_timeline(segments, shots, assets, policy=policy)

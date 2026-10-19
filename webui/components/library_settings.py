@@ -12,7 +12,7 @@ from app.services.library import runner
 from app.services.library.frame_extractor import inspect_video
 from app.services.library.gateway import ModelGateway
 from webui.components.model_settings import seed_model_choices, render_model_choices, selected_models, selected_bindings, check_model_choices
-from app.services.library.indexer import VIDEO_EXTENSIONS, SUBTITLE_EXTENSIONS, scan_directory, suggest_mappings, import_materials, build_library
+from app.services.library.indexer import VIDEO_EXTENSIONS, SUBTITLE_EXTENSIONS, scan_directory, suggest_mappings, import_materials, build_library, audit_subtitles, restore_subtitle_text, rollback_subtitle_text
 from app.services.library.store import LibraryStore, _json_access, library_ids, read_json, write_json
 from app.services.subtitle_text import decode_subtitle_bytes
 from webui.utils.file_utils import folder_input
@@ -102,7 +102,7 @@ def _launch_library_job(store, library_id, kind, callback):
 def _job_status(library_id, tr):
     store = LibraryStore()
     key = "library:" + library_id
-    jobs = [job for job in (store.job(library_id, "import"), store.job(library_id, "build")) if job]
+    jobs = [job for job in (store.job(library_id, "import"), store.job(library_id, "build"), store.job(library_id, "subtitle")) if job]
     if not jobs:
         return
     job = max(jobs, key=lambda item: item["updated"])
@@ -261,6 +261,45 @@ def render_library_panel(tr):
             column_config={"remove": st.column_config.CheckboxColumn(tr("移除"), required=True), "episode": tr("集数"), "video": tr("视频"), "duration": tr("时长（秒）"),
                            "subtitle": tr("字幕"), "status": tr("分析状态"), "available": tr("源文件可用")})
         selected = [assets[index]["id"] for index, row in enumerate(registered.to_dict("records")) if row["remove"]]
+        with st.expander(tr("字幕资料校验与恢复")):
+            st.caption(tr("校验登记的ASS正文是否被误删。恢复仅在本地生成新版字幕与窗口文本，保留原ASS、旧派生文件、抽帧和视觉分析；字幕剧情语义会标为待补，不调用API。"))
+            report_key = "subtitle_audit_" + library_id
+            if st.button(tr("校验字幕"), disabled=busy, key=report_key + "_check"):
+                try:
+                    with runner.library_operation(library_id):
+                        st.session_state[report_key] = audit_subtitles(store, library_id)
+                except (OSError, ValueError) as exc:
+                    st.error(str(exc))
+            audit = st.session_state.get(report_key)
+            if audit is not None:
+                labels = {"ok":"正常","recovery_needed":"正文待恢复","lyrics_only":"只有歌词/注释，无剧情台词","error":"原件或路径异常"}
+                st.dataframe(pd.DataFrame([{tr("集数"):r["episode"],tr("视频"):r["video"],tr("校验"):tr(labels.get(r["state"],r["state"])),
+                    tr("正文条数"):r.get("body_events",0),tr("缺失正文"):r.get("missing_body_events",0),tr("当前字幕条数"):r.get("current_cues",0),
+                    tr("恢复后条数"):r.get("restored_cues",0),tr("说明"):r.get("error","")} for r in audit]), hide_index=True, width="stretch")
+                count = sum(row["state"] == "recovery_needed" for row in audit)
+                errors = any(row["state"] == "error" for row in audit)
+                if count:
+                    st.warning(tr("待恢复正文的素材数：") + str(count))
+                if st.button(tr("恢复正文与本地索引"), disabled=busy or not count or errors, key=report_key + "_restore"):
+                    try:
+                        _launch_library_job(store, library_id, "subtitle", lambda stop: restore_subtitle_text(store, library_id, stop))
+                        st.session_state.pop(report_key, None)
+                        st.rerun()
+                    except (OSError, ValueError) as exc:
+                        st.error(str(exc))
+                st.caption(tr("恢复后可直接从3. 寻找画面继续；如需补充剧情语义，使用下方原有建立／继续分析入口，纯画面缓存继续复用。"))
+            migrations = [m for m in store.subtitle_migrations(library_id) if m.get("state") == "committed" and m.get("asset_id") in {item["id"] for item in assets}]
+            if migrations:
+                st.caption(tr("需要回退时按单个素材恢复登记与窗口；若恢复后已有新分析，会停止回退以保留后续工作。新旧字幕文件均保留。"))
+                selected_migration = st.selectbox(tr("本地恢复记录"),[m["id"] for m in migrations],
+                    format_func=lambda value: next(tr("第")+str(item["episode"])+tr("集")+" · "+Path(item["path"]).name for m in migrations for item in assets if m["id"]==value and item["id"]==m["asset_id"]),key=report_key+"_migration")
+                if st.button(tr("回退该素材的本地恢复"),disabled=busy,key=report_key+"_rollback"):
+                    try:
+                        rollback_subtitle_text(store,library_id,selected_migration)
+                        st.session_state.pop(report_key,None)
+                        st.rerun()
+                    except (OSError,ValueError) as exc:
+                        st.error(str(exc))
         if selected:
             from app.services.narration_task import list_tasks
             related = [task for task in list_tasks() if library_id in library_ids(task)]

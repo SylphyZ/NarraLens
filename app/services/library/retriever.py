@@ -7,15 +7,14 @@ from collections import Counter, defaultdict
 from dataclasses import replace
 from pathlib import Path
 
-import pysrt
-
 from app.services.library.frame_extractor import extract_frames
+from app.services.library.indexer import plot_cues
 from app.services.library.runner import check_cancel
 from app.services.library.store import library_ids, stable_hash, write_json, read_json
 from app.services.subtitle_segmentation import _tokenizer
 from app.services.library.validation import confidence, frame_index, ModelFormatError
 from app.services.timeline_planner import (
-    VISUAL_POLICY_VERSION, MATCH_POLICY_VERSION, PROPOSAL_VERSION, match_allowed, natural_candidates, source_shot_key, unused_source,
+    VISUAL_POLICY_VERSION, MATCH_POLICY_VERSION, PROPOSAL_VERSION, COVERAGE_VERSION, match_allowed, natural_candidates, source_shot_key, unused_source,
 )
 
 
@@ -23,6 +22,7 @@ SUBTITLE_EVIDENCE_VERSION = "subtitle-evidence-ids-v1"
 REVIEW_SCOPE_VERSION = "source-usability-v1"
 RETRIEVAL_REPAIR_VERSION = "preselection-compatibility-v1"
 CANDIDATE_QUEUE_VERSION = "candidate-progress-v1"
+REVIEW_PROTOCOL = "single-unit-review-v2"
 
 
 def _credits_description(scene):
@@ -116,6 +116,48 @@ def _match_result(value, expected, with_images, *, relevance=True):
             visual = row.get("visual_evidence")
             evidence = list(visual) if isinstance(visual, list) and all(isinstance(x, str) and x.strip() for x in visual) else []
             evidence.extend("字幕：" + quote for quote in quotes)
+            candidate = expected[row["scene_id"]]
+            requirement = candidate.get("_requirement", {})
+            if requirement.get("coverage_version") == COVERAGE_VERSION:
+                allowed = {fact["id"] for fact in requirement.get("facts", [])}
+                supports, raw_supports = [], row.get("supports")
+                if type(row.get("constraints_match")) is not bool or type(row.get("motif_match")) is not bool:
+                    issue("constraints_match/motif_match", "invalid_type", "约束满足和配图符合须为布尔值。")
+                if not isinstance(raw_supports, list) or len(raw_supports) > len(allowed):
+                    issue("supports", "invalid_list", "supports须逐条引用当前F编号，最多每事实一次。")
+                    raw_supports = []
+                seen_facts = set()
+                for support in raw_supports:
+                    if not isinstance(support, dict) or not isinstance(support.get("fact_id"),str) or support["fact_id"] not in allowed or support["fact_id"] in seen_facts:
+                        issue("supports", "invalid_fact", "事实编号须属于当前单元且不得重复。")
+                        continue
+                    seen_facts.add(support["fact_id"])
+                    indices, citations = support.get("visual_indices"), support.get("subtitle_ids")
+                    if not isinstance(indices,list) or len(indices)>3 or any(type(i) is not int or not 0<=i<=2 for i in indices) or len(indices)!=len(set(indices)) or (indices and not with_images):
+                        issue("supports", "invalid_frame", "事实可见依据须为本候选0至2图片编号；无图时不得引用图片。")
+                        continue
+                    if not isinstance(citations,list) or len(citations)>3 or any(not isinstance(i,str) or i not in entries for i in citations) or len(citations)!=len(set(citations)):
+                        issue("supports", "invalid_citation", "事实引用须使用本候选实际范围内的字幕编号。")
+                        continue
+                    if (not indices and not citations) or not isinstance(support.get("reason"),str) or not support["reason"].strip():
+                        issue("supports", "missing_evidence", "事实须有当前可见帧或合法范围字幕的依据及理由。")
+                        continue
+                    points = [candidate["source_start"]+(candidate["source_end"]-candidate["source_start"])*(i+.5)/3 for i in indices]
+                    cited = [e for e in candidate["subtitle_entries"] if e["id"] in citations]
+                    left = min(points+[e["overlap_start"] for e in cited])
+                    right = max(points+[e["overlap_end"] for e in cited])
+                    supports.append({"fact_id":support["fact_id"],"start":left,"end":right,"visual_indices":indices,"subtitle_ids":citations,"reason":support["reason"]})
+                    evidence.append("事实"+support["fact_id"]+"："+support["reason"])
+                motif = None
+                if row.get("motif_match") is True:
+                    anchors = [candidate["source_start"]+(candidate["source_end"]-candidate["source_start"])*(row.get("frame_index",1)+.5)/3] if with_images and row.get("visual_evidence") else []
+                    cited = [e for e in candidate["subtitle_entries"] if valid_ids and e["id"] in ids]
+                    if anchors or cited:
+                        motif = {"start":min(anchors+[e["overlap_start"] for e in cited]),"end":max(anchors+[e["overlap_end"] for e in cited])}
+                    else:
+                        issue("motif_match","missing_evidence","配图符合须有本候选的实际画面或字幕依据。")
+                row["coverage"] = {"version":COVERAGE_VERSION,"requirement_hash":stable_hash(requirement),"mode":"model-fact-evidence",
+                                   "supports":supports,"constraints_match":row.get("constraints_match"),"motif_match":row.get("motif_match"),"motif_range":motif}
             if row.get("relation") in ("direct", "supporting") and not evidence:
                 issue("visual_evidence/subtitle_ids", "missing_evidence", "direct/supporting须有可核对的画面依据或本候选字幕编号。")
             # Free-form quotes/evidence from the model never become trusted evidence.
@@ -125,7 +167,7 @@ def _match_result(value, expected, with_images, *, relevance=True):
     return {"clips": result}
 
 
-def _match_pairs(value, aliases, references, with_images, *, relevance=True):
+def _match_pairs(value, aliases, references, with_images, *, relevance=True, require_owner=False):
     """Keep identifiable peers; unknown aliases never acquire another pair's identity."""
     rows = value.get("clips") if isinstance(value, dict) else None
     if not isinstance(rows, list):
@@ -138,7 +180,7 @@ def _match_pairs(value, aliases, references, with_images, *, relevance=True):
         else:
             groups[alias].append(row)
     result = []
-    for alias, (_, candidate) in aliases.items():
+    for alias, (segment, candidate) in aliases.items():
         items = groups[alias]
         if len(items) != 1:
             result.append({"scene_id": candidate["_review_id"], "_pair": alias, "_usability_valid": False,
@@ -146,15 +188,25 @@ def _match_pairs(value, aliases, references, with_images, *, relevance=True):
                     "message": "当前pair缺少回复或存在重复回复，不能猜测结果。"}]})
             continue
         original = items[0]
+        if require_owner and original.get("unit_id") != "U1":
+            result.append({"scene_id":candidate["_review_id"],"_pair":alias,"_usability_valid":False,"_raw_response":original,
+                           "_validation_issues":[{"field":"unit_id","category":"pair_identity","message":"本次仅审核U1，回复必须绑定当前单元。"}]})
+            continue
         row = {**original, "scene_id": candidate["_review_id"]}
+        if require_owner:
+            row["unit_id"] = segment.id
         row.pop("normalization", None)  # Only the local negative-only branch may issue this proof.
         if isinstance(row.get("subtitle_ids"), list):
             row["subtitle_ids"] = [references.get(x, "unknown:"+x) if isinstance(x, str) else x for x in row["subtitle_ids"]]
+        if isinstance(row.get("supports"), list):
+            row["supports"] = [{**s, "subtitle_ids":[references.get(x,"unknown:"+x) if isinstance(x,str) else x for x in s["subtitle_ids"]]}
+                               if isinstance(s,dict) and isinstance(s.get("subtitle_ids"),list) else s for s in row["supports"]]
         expected = {candidate["_review_id"]: candidate}
         checked = _match_result({"clips": [row]}, expected, with_images, relevance=relevance)["clips"][0]
         ids = row.get("subtitle_ids")
         # Only a known negative may shed redundant, entirely valid citations; positive evidence stays strict.
-        if relevance and row.get("facts_match") is False and row.get("usable") is True and row.get("content_kind") == "story" and \
+        if relevance and candidate.get("_requirement",{}).get("coverage_version") != COVERAGE_VERSION and \
+                row.get("facts_match") is False and row.get("usable") is True and row.get("content_kind") == "story" and \
                 checked["_validation_issues"] and all(i["field"] == "subtitle_ids" and i["category"] == "invalid_list"
                     for i in checked["_validation_issues"]) and isinstance(ids, list) and len(ids) > 3 and \
                 all(isinstance(x, str) and x in {e["id"] for e in candidate["subtitle_entries"]} for x in ids) and len(ids) == len(set(ids)):
@@ -189,6 +241,26 @@ class MaterialRetriever:
         self.requirement_history = {}
         self.candidate_progress = {}
         self.queue_signature = None
+        self.legacy_quarantine = {}
+        self.previous_requirements = {}
+        self.scene_aliases, self.previous_versions = {}, {}
+        migrations = sorted(store.subtitle_migrations(self.library_ids), key=lambda m: m.get("created", 0), reverse=True)
+        previous_scenes, affected_indices = list(self.scenes), set()
+        for migration in migrations:
+            if migration.get("state") != "committed":
+                continue
+            old = {row["id"]: row for row in migration.get("old_scenes", [])}
+            for old_id, new_id in migration.get("scene_map", {}).items():
+                current = self.scene_map.get(new_id)
+                prior = old.get(old_id)
+                if not current or not prior or current["asset_id"] != migration.get("asset_id") or current["fingerprint"] != migration.get("fingerprint") or any(current[k] != prior[k] for k in ("start", "end")):
+                    continue
+                index = self.scene_indices[new_id]
+                affected_indices.add(index)
+                self.scene_aliases[old_id] = new_id
+                previous_scenes[index] = {**current, **prior, "analysis":json.loads(prior["analysis"]),"visual":json.loads(prior["visual"])}
+            prior_version = stable_hash((MATCH_POLICY_VERSION,self.library_ids,[(s["id"],s["version"],s["analysis"],s["visual"],s["transcript"]) for s in previous_scenes]))
+            self.previous_versions[prior_version] = sorted(affected_indices)
         self.rejected_matches = set()
         self.rejected_scenes = set()
         self.rejected_ranges = set()
@@ -321,7 +393,7 @@ class MaterialRetriever:
             path = Path(asset["processed_path"]) if asset.get("processed_path") else None
             try:
                 text = path.read_text(encoding="utf-8-sig") if path else ""
-                cues = pysrt.from_string(text) if text else []
+                cues = plot_cues(asset) if text else []
                 rows = [(cue.start.ordinal/1000, cue.end.ordinal/1000, cue.text) for cue in cues]
                 self.subtitles[identifier] = (stable_hash((str(path), text)), rows, "processed" if rows else "missing")
             except (OSError, ValueError):
@@ -337,14 +409,19 @@ class MaterialRetriever:
     def unit_payload(segment):
         requirement = segment.requirement
         result = {"text": segment.text, "kind": requirement["kind"]}
+        if requirement.get("coverage_version") == COVERAGE_VERSION:
+            return {**result,"claim":requirement["claim"],
+                    "facts":[{k:f[k] for k in ("id","quote","description","constraints")} for f in requirement.get("facts",[])],
+                    "constraints":[{k:c[k] for k in ("quote","description")} for c in requirement.get("constraints",[])],"motifs":requirement.get("motifs",[])}
         for name in ("claim", "characters", "events", "required_facts", "avoid"):
             if requirement.get(name) and requirement[name] != segment.text:
                 result[name] = requirement[name]
         return result
 
-    def configure_requirements(self, segments, revisions, gateway):
+    def configure_requirements(self, segments, revisions, gateway, previous_plan=None):
         """Accept only reproducible revisions from the current, validated manuscript plan."""
         self.requirement_history = {}
+        self.previous_requirements = {u["id"]:u["requirement"] for u in previous_plan.get("units",[])} if isinstance(previous_plan,dict) else {}
         if not isinstance(revisions, dict) or revisions.get("version") != "gap-facts-review-v1" or \
                 revisions.get("model_signature") != gateway.signature("text"):
             return
@@ -394,7 +471,7 @@ class MaterialRetriever:
             self.requirement_history[segment.id] = {"segment": old_segment, "proof": {
                 "rule": rule, "revision": stable_hash(row), "before": stable_hash(before), "after": stable_hash(after)}}
 
-    def _match_keys(self, segment, candidate, subtitle_key, gateway):
+    def _match_keys(self, segment, candidate, subtitle_key, gateway, *, legacy_protocol=False):
         """Keep the original two cache identities shared by normal and compatibility lookup."""
         common = (MATCH_POLICY_VERSION, SUBTITLE_EVIDENCE_VERSION)
         tail = (candidate["subtitle_entries"], candidate["_verify_visual"], gateway.signature("text"), gateway.signature("vision"))
@@ -402,13 +479,37 @@ class MaterialRetriever:
             segment.text, segment.requirement, subtitle_key, *tail))
         key = "visual-unit-match:" + stable_hash((*common, "range-context-v2", candidate["_safety_key"], segment.id,
             segment.text, segment.requirement, candidate["description"], *tail))
+        if not legacy_protocol:
+            key = "visual-unit-match:" + stable_hash((REVIEW_PROTOCOL, key))
+            legacy = "visual-unit-match:" + stable_hash((REVIEW_PROTOCOL, legacy))
         return key, legacy
 
     def _compatible_judgment(self, segment, candidate, subtitle_key, gateway):
+        # An unchanged complete legacy positive keeps its original full-contract provenance.
+        # Negatives from the old mixed-unit protocol are never silently promoted or reused as new reviews.
+        prior_requirement = self.previous_requirements.get(segment.id, segment.requirement)
+        prior_segment = replace(segment, requirement=prior_requirement)
+        for old_key in self._match_keys(prior_segment,candidate,subtitle_key,gateway,legacy_protocol=True):
+            old = self.store.cache_get(candidate["library_id"],old_key)
+            if not isinstance(old,dict) or old.get("evidence_protocol") != SUBTITLE_EVIDENCE_VERSION:
+                continue
+            if old.get("facts_match") is False:
+                self.legacy_quarantine[old_key] = {"unit_id":segment.id,"asset_id":candidate["asset_id"],"source_start":candidate["source_start"],"source_end":candidate["source_end"],
+                    "reason":"旧混合单元协议的否定未按当前单单元合同确认；保留旧结果，必要时重新审核。","old_response":old}
+                continue
+            if prior_requirement != segment.requirement or segment.requirement.get("coverage_version") == COVERAGE_VERSION:
+                continue
+            try:
+                checked = _match_result({"clips":[old]},{candidate["_review_id"]:candidate},candidate["_verify_visual"])["clips"][0]
+            except (ModelFormatError, KeyError, TypeError):
+                continue
+            view = {**checked,"pending_review":False,"match_policy":MATCH_POLICY_VERSION,"visual_checked":candidate["_verify_visual"]}
+            if not checked["_validation_issues"] and old.get("usable") is True and old.get("content_kind") == "story" and self.range_allowed(candidate) and match_allowed(view,segment.requirement):
+                return {**old,"compatible_from":{"version":REVIEW_PROTOCOL,"key":old_key,"mode":"legacy-full-contract","requirement_hash":stable_hash(segment.requirement)}}
         history = self.requirement_history.get(segment.id)
         if not history or not (candidate["_verify_visual"] or candidate.get("_safety")):
             return None
-        for old_key in self._match_keys(history["segment"], candidate, subtitle_key, gateway):
+        for old_key in self._match_keys(history["segment"], candidate, subtitle_key, gateway, legacy_protocol=True):
             old = self.store.cache_get(candidate["library_id"], old_key)
             if not isinstance(old, dict) or old.get("evidence_protocol") != SUBTITLE_EVIDENCE_VERSION:
                 continue
@@ -431,7 +532,7 @@ class MaterialRetriever:
     def configure_queue(self, progress, gateway):
         """Restore per-pair scheduling only for the same review rules and configured models."""
         kinds = [k for k in ("text", "vision", "text_backup", "vision_backup") if k in gateway.settings]
-        self.queue_signature = stable_hash((CANDIDATE_QUEUE_VERSION, [(k, gateway.signature(k),
+        self.queue_signature = stable_hash((CANDIDATE_QUEUE_VERSION, REVIEW_PROTOCOL, [(k, gateway.signature(k),
             gateway.settings[k].get("enabled"), {name: gateway.settings[k].get(name) for name in
                 ("thinking_level", "max_tokens", "max_prompt_chars", "context_tokens")}) for k in kinds]))
         self.candidate_progress = {k: dict(v) for k, v in progress.items() if isinstance(k, str) and
@@ -455,6 +556,9 @@ class MaterialRetriever:
             self.evaluated[segment.id].add(key)
             candidate.update({name: judgment[name] for name in ("relation", "facts_match", "evidence", "conflicts",
                 "subtitle_quotes", "subtitle_ids", "visual_evidence", "evidence_protocol")})
+            for name in ("coverage", "review_protocol", "compatible_from"):
+                if name in judgment:
+                    candidate[name] = judgment[name]
             candidate.update(usable=judgment["usable"], content_kind=judgment["content_kind"],
                 visual_policy=VISUAL_POLICY_VERSION, match_policy=MATCH_POLICY_VERSION, visual_unit_id=segment.id,
                 visual_checked=candidate["_verify_visual"], confidence=confidence(judgment.get("confidence")),
@@ -515,6 +619,8 @@ class MaterialRetriever:
         unique = {}
         for original in candidates:
             candidate = dict(original)
+            if candidate.get("scene_id") in self.scene_aliases:
+                candidate["scene_id"] = self.scene_aliases[candidate["scene_id"]]
             asset, scene = asset_map.get(candidate.get("asset_id")), self.scene_map.get(candidate.get("scene_id"))
             if not asset or not scene or scene["asset_id"] != asset["id"] or asset["library_id"] not in self.library_ids:
                 count("invalid_source")
@@ -534,7 +640,7 @@ class MaterialRetriever:
             safety_key = "visual-usability:" + stable_hash((VISUAL_POLICY_VERSION, candidate["fingerprint"],
                 candidate["source_start"], candidate["source_end"], gateway.signature("vision")))
             candidate.update(_safety_key=safety_key, _review_id=stable_hash(safety_key)[:24], _verify_visual=verify_visual,
-                             visual_unit_id=segment.id)
+                             visual_unit_id=segment.id, _requirement=segment.requirement)
             entries, subtitle_key, state = self._range_subtitle(candidate, asset)
             candidate["subtitle_entries"] = entries
             key, legacy = self._match_keys(segment, candidate, subtitle_key, gateway)
@@ -596,7 +702,7 @@ class MaterialRetriever:
                         count("cached_rejections")
                         continue
             if not valid:
-                for name in ("match_policy", "visual_policy", "facts_match", "relation", "confidence", "usable", "content_kind"):
+                for name in ("match_policy", "visual_policy", "facts_match", "relation", "confidence", "usable", "content_kind", "coverage", "review_protocol"):
                     candidate.pop(name, None)
                 candidate["pending_review"] = True
                 progress = self.candidate_progress.get(key, {})
@@ -670,7 +776,7 @@ class MaterialRetriever:
                     rows.append({**review["response"], "scene_id": alias})
         if not rows:
             return
-        result = _match_pairs({"clips": rows}, aliases, references, verify_visual)
+        result = _match_pairs({"clips": rows}, aliases, references, verify_visual, require_owner=metadata.get("review_protocol") == REVIEW_PROTOCOL)
         for row in result["clips"]:
             segment, candidate = aliases[row["_pair"]]
             key = candidate["_review_key"]
@@ -721,6 +827,17 @@ class MaterialRetriever:
                     if not isinstance(metadata, dict) or not isinstance(metadata.get("canonical_pairs", {}), dict) or \
                             not isinstance(metadata.get("candidates", []), list):
                         continue
+                    owners = {p.get("unit_id") for p in metadata.get("canonical_pairs",{}).values() if isinstance(p,dict)}
+                    if metadata.get("usage_stage") == "visual_review" and len(owners) > 1 and metadata.get("review_protocol") != REVIEW_PROTOCOL:
+                        for review in saved.get("reviews",[]):
+                            if not isinstance(review,dict) or review.get("unit_id") not in segments:
+                                continue
+                            response = review.get("response",{})
+                            if isinstance(response,dict) and response.get("facts_match") is False and segments[review["unit_id"]].requirement.get("coverage_version") == COVERAGE_VERSION:
+                                quarantine_key = stable_hash((relative.as_posix(),review.get("unit_id"),review.get("review_id"),review.get("source_start"),review.get("source_end")))
+                                self.legacy_quarantine[quarantine_key] = {"request_file":relative.as_posix(),"candidate_file":path.name,"unit_id":review["unit_id"],
+                                    "review_id":review.get("review_id"),"source_start":review.get("source_start"),"source_end":review.get("source_end"),"old_response":response,
+                                    "reason":"旧实际审片混合多个单元，当前缺口需单单元核对；原回复保留，未转为批准。"}
                     self._restore_reply(saved, metadata, segments, assets, gateway, verify_visual, relative.as_posix())
                     pairs = list(metadata.get("canonical_pairs", {}).values())
                     if not pairs and metadata.get("visual_unit_id") == saved.get("visual_unit_id") in segments:
@@ -750,6 +867,8 @@ class MaterialRetriever:
                         result[unit].extend(rows)  # Pending ranges still need the normal approval gate.
             except (OSError, ValueError, TypeError, KeyError):
                 continue
+        if self.legacy_quarantine:
+            write_json(directory/"legacy-review-quarantine.json", {"version":REVIEW_PROTOCOL,"state":"needs_targeted_review","entries":self.legacy_quarantine})
         return result
 
     def shortlist(self, groups, gateway, directory, stop=None, *, search_round=0):
@@ -916,8 +1035,11 @@ class MaterialRetriever:
         """Only proposed pairs reach this final review; images/catalogues are shared by range."""
         from app.services.library.gateway import ModelAPIError, ModelInputBudgetError
         accepted = []
-        for offset in range(0, len(pairs), 6):
-            batch = pairs[offset:offset+6]
+        groups = defaultdict(list)
+        for segment, candidate in pairs:
+            groups[segment.id].append((segment,candidate))
+        batches = [group[offset:offset+6] for group in groups.values() for offset in range(0,len(group),6)]
+        for batch in batches:
             check_cancel(stop)
             units = {s.id: s for s, _ in batch}
             clips = {c["_safety_key"]: c for _, c in batch}
@@ -947,8 +1069,8 @@ class MaterialRetriever:
                     for key, c in clips.items()],
                 "pairs": [{"scene_id": alias, "unit": ua[s.id], "clip": ca[c["_safety_key"]]} for alias, (s, c) in aliases.items()]}
             def validate(value):
-                return _match_pairs(value, aliases, references, with_images, relevance=not _safety_only)
-            prompt = ("逐一检查pairs，仅返回每个P编号一次。clips按顺序各附3图，frame_index是该素材内0至2。"
+                return _match_pairs(value, aliases, references, with_images, relevance=not _safety_only, require_owner=not _safety_only)
+            prompt = ("本次只有一个文案单元U1，逐一检查其pairs，每个P编号一次，回复unit_id固定U1。clips按顺序各附3图，frame_index是该素材内0至2。"
                 "usable仅判断画面：剧情story为true，职员表/演职员名单credits、混合mixed、不明unknown为false；普通对白/歌词不因此禁用。"
                 "relation为direct/supporting/unrelated/unknown，facts_match只用true或false；具体事实仅部分满足时用false，禁止partial。"
                 "confidence必须为0至1的有限数字。人物/事件不符只影响relation/facts_match/conflicts，不得因此将story标为不可用。"
@@ -956,7 +1078,21 @@ class MaterialRetriever:
                 "遵守人物/时期/事件/关系及avoid，提及人物不等于出现，否认不能支持建立关系；背景仅作线索，不把窗口外剧情当本镜头。"
                 "visual_evidence仅写可见动作/状态/环境，不写对白；subtitle_ids只选本素材的C编号字幕，不跨素材、不抄引文。"
                 "字幕可能仅部分重叠，不能声称整句在范围内说完。给具体短依据，拒绝理由简短，每种依据最多3条。"
-                "返回{clips:[{scene_id,usable,content_kind,reason,confidence,frame_index,relation,facts_match,visual_evidence:[],conflicts:[],subtitle_ids:[]}]}。\n")
+                "返回{clips:[{scene_id,unit_id:U1,usable,content_kind,reason,confidence,frame_index,relation,facts_match,visual_evidence:[],conflicts:[],subtitle_ids:[]}]}。\n")
+            if batch[0][0].requirement.get("coverage_version") == COVERAGE_VERSION:
+                prompt = ("本次唯一文案单元U1，所有P候选只针对U1，不套用其他任务的人物或要求。每个P返回一次，unit_id固定U1。"
+                    "clips按顺序各附3图，frame_index是该素材内0至2。usable仅判断来源：story剧情true；credits名单/mixed混合/unknown不明false。"
+                    "facts为分别需要的原子事实，可由多个镜头共同覆盖；当前镜头只列它明确支持的F编号。未见其他F是未覆盖，不能因此写conflicts。"
+                    "每项supports:{fact_id,visual_indices:[本C的0至2图片编号],subtitle_ids:[本C字幕编号],reason:具体依据}，每F最多一次。"
+                    "人物出现不等于事件发生，被台词提及不等于出镜，不用背景剧情补未观察到的事件；字幕只有范围重叠部分可见，不宣称完整台词已说完。"
+                    "该F内部constraints只约束该事实；全局constraints约束本镜头，constraints_match表示全部全局约束满足。"
+                    "conflicts只列与当前全局限制明确矛盾的内容，不列未拍到的事实，不跨F混用前世/现世或全部人物。"
+                    "relation=direct表示直接支持至少一个具体F；supporting表示有具体同向联系的辅助配图；unrelated/unknown不能放行。"
+                    "facts_match=true仅表示单镜头已覆盖全部F，部分满足仍false并保留supports；不输出partial。"
+                    "没有F时依据motifs判断motif_match，须与原文有明确可见联系；不能靠主题词相同凑时长。"
+                    "visual_evidence只写可见内容，subtitle_ids最多3个本C编号，各依据列表最多3项。confidence为0至1有限数。"
+                    "返回{clips:[{scene_id,unit_id:U1,usable,content_kind,reason,confidence,frame_index,relation,facts_match,"
+                    "constraints_match,motif_match,visual_evidence:[],conflicts:[],subtitle_ids:[],supports:[{fact_id,visual_indices:[],subtitle_ids:[],reason}]}]}。\n")
             if not with_images:
                 prompt = prompt.replace("clips按顺序各附3图，frame_index是该素材内0至2。", "本次无新图，已独立检查画面可用性；据范围字幕和已有描述核对内容，不明细节标unknown。")
             if _safety_only:
@@ -972,9 +1108,12 @@ class MaterialRetriever:
                     old = _repair[candidate["_review_key"]]
                     previous = {k: v for k, v in old["previous"].items() if k in (
                         "usable", "content_kind", "reason", "confidence", "frame_index", "relation", "facts_match",
-                        "visual_evidence", "conflicts", "subtitle_ids")}
+                        "visual_evidence", "conflicts", "subtitle_ids", "unit_id", "supports", "constraints_match", "motif_match")}
                     if isinstance(previous.get("subtitle_ids"), list):
                         previous["subtitle_ids"] = [reverse.get(x, "invalid:"+str(x)) for x in previous["subtitle_ids"]]
+                    if isinstance(previous.get("supports"),list):
+                        previous["supports"] = [{**s,"subtitle_ids":[reverse.get(x,"invalid:"+str(x)) for x in s["subtitle_ids"]]}
+                                                 if isinstance(s,dict) and isinstance(s.get("subtitle_ids"),list) else s for s in previous["supports"]]
                     feedback.append({"scene_id": alias, "previous": previous, "issues": old["issues"]})
                 payload["repair"] = feedback
                 prompt += "这是一次失败条目的局部纠错。原回复只作待修数据，按当前P/C目录修正字段；证据不足应明确不匹配，不为了通过而改成true。\n"
@@ -1001,12 +1140,12 @@ class MaterialRetriever:
                     previous_after(details)
             gateway.after_request = after
             try:
-                result = gateway.json(text, images=images or None, model_kind="vision" if with_images else "text", max_output=2400,
+                result = gateway.json(text, images=images or None, model_kind="vision" if with_images else "text", max_output=max(2400, len(batch)*1100),
                     required={"clips": list}, result_validator=validate, attempts=1 if _repair else 3,
                     request_metadata={"usage_stage": "visual_safety" if _safety_only else "visual_review", "search_round": search_round,
                         "candidate_file": path.relative_to(directory).as_posix(), "canonical_pairs": {
                             alias: {"unit_id": s.id, "review_id": c["_review_id"]} for alias, (s, c) in aliases.items()},
-                        "subtitle_aliases": references, "local_repair": bool(_repair),
+                        "subtitle_aliases": references, "local_repair": bool(_repair), "review_protocol": REVIEW_PROTOCOL,
                         "candidates": self._request_sources(list(clips.values()), with_images=with_images)})
             finally:
                 gateway.after_request = previous_after
@@ -1015,6 +1154,7 @@ class MaterialRetriever:
                 segment, candidate = aliases[row["_pair"]]
                 candidate.pop("proposal_version", None)
                 row["review_scope"] = REVIEW_SCOPE_VERSION
+                row["review_protocol"] = REVIEW_PROTOCOL
                 if with_images and row["_usability_valid"]:
                     safety = {k: row[k] for k in ("scene_id", "usable", "content_kind", "reason")}
                     safety["scope"] = REVIEW_SCOPE_VERSION
@@ -1048,7 +1188,7 @@ class MaterialRetriever:
                 history = []
             if isinstance(previous, dict) and previous.get("reviews"):
                 history.append({k: previous[k] for k in ("reviews", "requests", "subtitle_aliases") if k in previous})
-            audit = {"key": identity, "version": MATCH_POLICY_VERSION, "value": approved, "reviews": diagnostics,
+            audit = {"key": identity, "version": MATCH_POLICY_VERSION, "value": [{k:v for k,v in c.items() if k!="_requirement"} for c in approved], "reviews": diagnostics,
                      "requests": requests, "subtitle_aliases": references, "history": history, "local_repair": bool(_repair),
                      "discarded_replies": result.get("discarded_replies", [])}
             write_json(path, audit)
