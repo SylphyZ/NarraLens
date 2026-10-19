@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from loguru import logger
 
 from app.services.library.gateway import ModelGateway, ModelUsage
-from app.services.library.retriever import MaterialRetriever
+from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION
 from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
 from app.services.library import runner
 from app.services.library.store import LibraryStore, library_ids, stable_hash, write_json, read_json
@@ -658,6 +658,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     alignment = visual_plan.get("boundary_alignment", {})
     base_key = alignment.get("base_plan_key") if alignment.get("version") == BOUNDARY_ALIGNMENT_VERSION else None
     revisions = visual_plan.get("requirement_revisions", {})
+    retriever.configure_requirements(visual_segments, revisions, gateway)
     compatible_keys = {key}
     if not any(row.get("changed") for row in revisions.get("entries", [])):
         compatible_keys.update(stable_hash((PROPOSAL_VERSION, value, *search_identity)) for value in
@@ -694,6 +695,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     examined = {u["id"]: set(saved.get("examined", {}).get(u["id"], [])) for u in units}
     exhausted = set(saved.get("exhausted", []))
     no_gain = {u["id"]: 0 for u in units}  # Explicit continue grants another bounded expansion from the saved cursor.
+    waves, processed, paused_units = {}, {u["id"]: set() for u in units}, {}
     update("寻找画面", 47, "本地重新核对已付费候选和旧判断，复用已确认结果；此步骤不请求模型")
     pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify, stop=stop)
     boundaries, fingerprint_boundaries = {}, {}
@@ -739,16 +741,13 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         ensure_boundaries(c["asset_id"] for c in batch)
         merge(identifier, retriever.prepare(visual_segments[identifier], batch, assets, gateway, verify, scene_boundaries=boundaries))
 
-    def capacity(identifier):
-        return sum(min(target, c["source_end"]-c["source_start"]) for c in pools[identifier]
-                   if c.get("pending_review") is False and retriever.range_allowed(c))
-
     def save(status, gaps, proposal):
         write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": pools,
             "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
             "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from,
             "search_signature": search_signature, "unit_signatures": unit_signatures,
-            "migration": migration or saved.get("migration")})
+            "migration": migration or saved.get("migration"), "evaluation_version": RETRIEVAL_REPAIR_VERSION,
+            "evaluation_waves": waves, "paused_units": paused_units})
         write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
             "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
         write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
@@ -758,6 +757,10 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                 "candidate_count": sum(c.get("pending_review") is False for c in pools[u["id"]]),
                 "pending_candidates": sum(c.get("pending_review") is True for c in pools[u["id"]]),
                 "exhausted": u["id"] in exhausted, "no_gain_rounds": no_gain[u["id"]],
+                "evaluation_wave": waves.get(u["id"]), "pause_reason": paused_units.get(u["id"]),
+                "processed_candidates": len(processed[u["id"]]),
+                "compatible_candidates": sum(bool(c.get("compatible_from")) for c in pools[u["id"]] if c.get("pending_review") is False),
+                "preselection": retriever.preselection.get(u["id"], {}),
                 **retriever.statistics.get(u["id"], {})} for u in units}, "gaps": gaps})
 
     structural = [{"visual_unit_id": u["id"], "segment_id": u["segment_id"], "start": a, "end": b,
@@ -793,7 +796,6 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         if visual_unit_intervals(unit, reservations) and not pools[unit["id"]] and not examined[unit["id"]]:
             fill_local(unit)
         update("寻找画面", 47, f"复用已付费结果并本地整理候选 {index+1}/{len(units)}")
-    awaiting = {}
     needed_seconds = sum(b-a for u in units for a, b in visual_unit_intervals(u, reservations))
     while True:
         check_cancel(stop)
@@ -806,17 +808,20 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             return shots, boundaries, pools
         except VisualCapacityError as exc:
             gaps = exc.gaps
-        proposal_pools = {identifier: [c for c in rows if c.get("pending_review") is False or no_gain[identifier] < no_gain_limit]
+        proposal_pools = {identifier: [c for c in rows if c.get("pending_review") is False or
+                          (c["_review_key"] in waves.get(identifier, {}).get("keys", []) and
+                           c["_review_key"] not in retriever.unconfirmed and identifier not in paused_units)]
                           for identifier, rows in pools.items()}
         proposal, _ = propose_visual_timeline(segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         confirmed, _ = propose_visual_timeline(segments, {k: [c for c in rows if c.get("pending_review") is False] for k, rows in pools.items()},
                                              target_shot_seconds=target, visual_units=units, reservations=reservations)
         covered = sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id)
+        allocated = {u["id"]: sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id == u["id"]) for u in units}
         progress = 47+22*min(1, covered/max(.001, needed_seconds))
         pair_keys, pairs = set(), []
         for shot in proposal:
             identifier = shot.visual_unit_id
-            if not identifier or no_gain[identifier] >= no_gain_limit:
+            if not identifier or identifier not in waves or identifier in paused_units:
                 continue
             candidate = next((c for c in pools[identifier] if c["asset_id"] == shot.asset_id and c["scene_id"] == shot.scene_id
                 and c["source_start"] <= shot.source_start+.000001 and c["source_end"] >= shot.source_end-.000001), None)
@@ -832,41 +837,61 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             for segment, _ in batch:
                 merge(segment.id, [])
             continue
-        for identifier, previous in awaiting.items():
-            no_gain[identifier] = 0 if capacity(identifier) > previous+.001 else no_gain[identifier]+1
-        awaiting = {}
         material = {r["visual_unit_id"] for r in gaps if r.get("category") != "short_interval"}
+        for identifier, wave in waves.items():
+            processed[identifier].update(wave["keys"])
+            if identifier not in material:
+                no_gain[identifier] = 0
+                continue
+            unresolved = set(wave["keys"])-retriever.evaluated[identifier]
+            if unresolved:
+                paused_units[identifier] = ("实际镜头审核未确认" if unresolved & retriever.unconfirmed else
+                    "本轮候选受来源分配冲突阻挡，尚未完成评估")
+            elif len(retriever.evaluated[identifier]) > wave["evaluated_before"]:
+                no_gain[identifier] = 0 if allocated[identifier] > wave["allocated_before"]+.001 else no_gain[identifier]+1
+            else:
+                paused_units[identifier] = "预选协议未完成" if wave["protocol_issues"] else "本轮检索没有可审候选"
+        waves = {}
         groups = []
         for unit in units:
             identifier = unit["id"]
-            if identifier not in material or no_gain[identifier] >= no_gain_limit:
+            if identifier not in material or identifier in paused_units or no_gain[identifier] >= no_gain_limit:
                 continue
             segment = visual_segments[identifier]
-            waiting = lambda: [c for c in pools[identifier] if c.get("pending_review") and not c.get("_screened")
-                              and c["_review_key"] not in retriever.unconfirmed]
-            before = capacity(identifier)
+            waiting = lambda: [c for c in pools[identifier] if c.get("pending_review") and
+                              c["_review_key"] not in processed[identifier] and c["_review_key"] not in retriever.unconfirmed]
+            before = len(retriever.evaluated[identifier])
             if not waiting():
                 fill_local(unit)
-            if not waiting() and identifier in exhausted and saved:
-                deferred = [c for c in pools[identifier] if c.get("pending_review") and not c.get("proposal_version")
-                            and c["_review_key"] not in retriever.unconfirmed][:3]
-                for candidate in deferred:
-                    candidate.update(_force_review=True, _screened=False)
-            if not waiting() and identifier in exhausted:
+            if not waiting():
+                if len(retriever.evaluated[identifier]) > before:
+                    # Reallocate first; settle this cache-only wave exactly once in the next loop.
+                    waves[identifier] = {"keys": [], "evaluated_before": before,
+                        "allocated_before": allocated[identifier], "protocol_issues": 0}
+                else:
+                    paused_units[identifier] = "本轮检索没有可审候选" if identifier not in exhausted else "当前检索查询已无新窗口"
                 continue
-            awaiting[identifier] = before
-            groups.append((segment, waiting(), sum(b-a for a, b in visual_unit_intervals(unit, reservations))))
-        if not groups:
+            waves[identifier] = {"keys": [], "evaluated_before": before,
+                "allocated_before": allocated[identifier], "protocol_issues": 0}
+            groups.append((segment, waiting(), sum(row["missing_seconds"] for row in gaps if row["visual_unit_id"] == identifier)))
+        if not groups and not waves:
             save("incomplete", gaps, proposal)
             unconfirmed = sum(row.get("unconfirmed", 0) for row in retriever.statistics.values())
-            held = sum(value >= no_gain_limit for value in no_gain.values())
+            held = sum(no_gain[identifier] >= no_gain_limit for identifier in material)
             short = sum(row.get("category") == "short_interval" for row in gaps)
+            protocol = sum(row.get("invalid_references", 0) > 0 for row in retriever.preselection.values())
+            pending = sum(c.get("pending_review") is True for rows in pools.values() for c in rows)
+            reasons = "；".join(f"{reason}{list(paused_units.values()).count(reason)}个单元" for reason in dict.fromkeys(paused_units.values()))
             raise JobPaused(f"画面仍有{len(gaps)}处缺口，共缺{sum(r['missing_seconds'] for r in gaps):.2f}秒；"
-                f"{held}个单元连续{no_gain_limit}轮无新增合格时长，{short}处为短残段，{unconfirmed}个候选尚未确认（格式或画面不明）。"
+                f"{held}个单元完成有效评估后连续{no_gain_limit}轮无新增可分配时长，{short}处为短残段，"
+                f"预选协议或编号问题涉及{protocol}个单元，实际镜头未确认{unconfirmed}个，候选队列待审{pending}个。"
+                f"{reasons + '。' if reasons else ''}"
                 "本次停止自动扩大以控制Token；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
                 "从3. 寻找画面继续可复用缓存并沿保存的检索进度追加候选。")
-        update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；只对拟用镜头送图，当前已确认{covered:.1f}秒")
-        retriever.shortlist(groups, gateway, directory, stop, search_round=search_round)
+        if groups:
+            update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；只对本轮拟用镜头送图，当前已确认{covered:.1f}秒")
+            for identifier, result in retriever.shortlist(groups, gateway, directory, stop, search_round=search_round).items():
+                waves[identifier].update(result)
         search_round += 1
         save("searching", gaps, proposal)
 

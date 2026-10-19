@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.5**
+**Manuscript-driven video production · v2.7.6**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.5 provides seven workspaces:
+Version 2.7.6 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -139,13 +139,17 @@ Version 2.7.4 reconciles shared visual cuts after restoring semantic groups, che
 
 Version 2.7.5 fixes the pending-state conflict that blocked new candidate approval. Valid peers are retained while necessary malformed rows get one small correction pass. Saved gaps can receive targeted review of commentary mistaken for concrete facts while retaining actual plot constraints. Unchanged units retain search progress; changed requirements revalidate existing ranges. Resume from **3. Find footage**. Necessary corrections and requirement reviews call the selected models and count toward token usage; genuine footage shortages are still reported.
 
+Version 2.7.6 filters invalid preselection IDs individually and retains valid choices. Empty selections retain only a few pending local alternatives; text protocol errors no longer mark whole groups as visually unconfirmed. Revised requirements reuse old approvals only when manuscript, source range, model cache identity and final admission checks prove compatibility. No-gain rounds require completed valid content assessment, with separate protocol, allocation and visual-review pause reasons. Resume from **3. Find footage**. New reviews still consume tokens; genuine footage gaps remain visible.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.5 fixes candidate approval state, restores and revalidates paid judgments, and corrects only malformed rows. Legacy source-usability judgments mixed with manuscript relevance are archived and rechecked by range. Unknown footage remains unconfirmed, with credits filtering and final approval gates retained. Gap requirements receive targeted fact review using the original text; grouping and unchanged-unit progress are reused. Implementation and static review are complete; live gap improvement, cache migration, and video output have not been validated.
+Version 2.7.6 repairs preselection ID handling, approval reuse after requirement revisions, and no-gain accounting. Valid choices and a few necessary pending alternatives are retained; compatible judgments are migrated only after local proof. Bounded per-unit assessment records distinct pause causes. Final factual, unique-source, credits and pending-review gates remain required. Implementation and static review are complete; live gap improvement, token consumption and video output have not been validated.
+
+Version 2.7.5 fixed candidate approval state, local format correction, legacy cache scope and targeted gap requirement review, while retaining original grouping and unchanged-unit search progress.
 
 Version 2.7.4 reconciles animation frame edges and visual cuts with the same original-text binding while retaining narration, captions, and animations. Saved project recovery records show the three reported remnants resolved; full video output still needs validation.
 
