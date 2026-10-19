@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.6**
+**Manuscript-driven video production · v2.7.7**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.6 provides seven workspaces:
+Version 2.7.7 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -141,13 +141,17 @@ Version 2.7.5 fixes the pending-state conflict that blocked new candidate approv
 
 Version 2.7.6 filters invalid preselection IDs individually and retains valid choices. Empty selections retain only a few pending local alternatives; text protocol errors no longer mark whole groups as visually unconfirmed. Revised requirements reuse old approvals only when manuscript, source range, model cache identity and final admission checks prove compatibility. No-gain rounds require completed valid content assessment, with separate protocol, allocation and visual-review pause reasons. Resume from **3. Find footage**. New reviews still consume tokens; genuine footage gaps remain visible.
 
+Version 2.7.7 saves temporary source conflicts and inconclusive reviews per candidate, then tries other ranges. Local retrieval continues past empty window batches. Resume advances the saved candidate queue and window cursor while reusing paid results. Unknown reply IDs are rejected individually and valid peers are retained. Strictly identified negative results may be validated locally without another correction request. User-configured valid no-gain stopping and final factual, pending-review, unique-source and credits gates remain required. Resume from **3. Find footage**; new reviews still consume tokens.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.6 repairs preselection ID handling, approval reuse after requirement revisions, and no-gain accounting. Valid choices and a few necessary pending alternatives are retained; compatible judgments are migrated only after local proof. Bounded per-unit assessment records distinct pause causes. Final factual, unique-source, credits and pending-review gates remain required. Implementation and static review are complete; live gap improvement, token consumption and video output have not been validated.
+Version 2.7.7 repairs premature unit pauses, empty local batch handling and repeated selection of blocked candidates on resume. Saved candidate progress tracks allocation changes and inconclusive reviews. Valid reply peers and narrowly normalized negative results retain their audit records. Implementation and static review are complete; live gap improvement, token consumption and full video output have not been validated.
+
+Version 2.7.6 repaired invalid preselection IDs, strictly compatible approval reuse and valid no-gain accounting while retaining existing audio, subtitles and footage ranges.
 
 Version 2.7.5 fixed candidate approval state, local format correction, legacy cache scope and targeted gap requirement review, while retaining original grouping and unchanged-unit search progress.
 

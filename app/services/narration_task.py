@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from loguru import logger
 
 from app.services.library.gateway import ModelGateway, ModelUsage
-from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION
+from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION, CANDIDATE_QUEUE_VERSION
 from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
 from app.services.library import runner
 from app.services.library.store import LibraryStore, library_ids, stable_hash, write_json, read_json
@@ -640,7 +640,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     from app.models.timeline import NarrationSegment
     from app.services.library.frame_extractor import scene_boundaries
     from app.services.timeline_planner import (
-        MATCH_POLICY_VERSION, PROPOSAL_VERSION, VisualCapacityError, source_shot_key,
+        MATCH_POLICY_VERSION, PROPOSAL_VERSION, VisualCapacityError, source_shot_key, unused_source,
         visual_unit_intervals, plan_visual_timeline, propose_visual_timeline,
     )
     units = visual_plan["units"]
@@ -696,6 +696,10 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     exhausted = set(saved.get("exhausted", []))
     no_gain = {u["id"]: 0 for u in units}  # Explicit continue grants another bounded expansion from the saved cursor.
     waves, processed, paused_units = {}, {u["id"]: set() for u in units}, {}
+    uncertain_waves, pause_dependencies = {u["id"]: 0 for u in units}, {}
+    local_search = {u["id"]: {} for u in units}
+    occupied, occupancy = [], stable_hash([])
+    retriever.configure_queue(saved.get("candidate_progress", {}), gateway)
     update("寻找画面", 47, "本地重新核对已付费候选和旧判断，复用已确认结果；此步骤不请求模型")
     pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify, stop=stop)
     boundaries, fingerprint_boundaries = {}, {}
@@ -717,6 +721,9 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         identifier = u["id"]
         previous = saved.get("pools", {}).get(identifier, [])
         merge(identifier, retriever.prepare(visual_segments[identifier], previous, assets, gateway, verify))
+        processed[identifier].update(c["_review_key"] for c in pools[identifier] if c["_review_key"] in retriever.candidate_progress)
+    current_keys = retriever.recorded | {c["_review_key"] for rows in pools.values() for c in rows}
+    retriever.candidate_progress = {k: v for k, v in retriever.candidate_progress.items() if k in current_keys}
 
     def ensure_boundaries(identifiers):
         for identifier in dict.fromkeys(identifiers):
@@ -729,17 +736,70 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                 fingerprint_boundaries[fingerprint] = scene_boundaries(asset, cache, stop, diagnostic_directory=directory)
             boundaries[identifier] = fingerprint_boundaries[fingerprint]
 
+    def candidate_for_shot(shot):
+        return next((c for c in pools.get(shot.visual_unit_id, []) if c["asset_id"] == shot.asset_id and c["scene_id"] == shot.scene_id
+            and c["source_start"] <= shot.source_start+.000001 and c["source_end"] >= shot.source_end-.000001), None)
+
+    def defer(identifier, candidate, owners, reason):
+        previous = retriever.candidate_progress.get(candidate["_review_key"], {})
+        retriever.candidate_progress[candidate["_review_key"]] = {"version": CANDIDATE_QUEUE_VERSION,
+            "model_signature": retriever.queue_signature, "unit_id": identifier, "state": "deferred", "stage": "allocation",
+            "occupancy": occupancy, "occupied_by": owners, "reason": reason,
+            "preselected": bool(candidate.pop("proposal_version", None) or previous.get("preselected"))}
+
+    def waiting(identifier):
+        result = []
+        for candidate in pools[identifier]:
+            key = candidate["_review_key"]
+            if not candidate.get("pending_review") or key in retriever.unconfirmed:
+                continue
+            progress = retriever.candidate_progress.get(key, {})
+            if progress.get("state") == "deferred" and progress.get("occupancy") == occupancy:
+                continue
+            owners = [{"unit_id": owner, "source": source_shot_key(other)} for owner, other in occupied
+                      if owner != identifier and not unused_source(candidate, [other])]
+            if owners:
+                defer(identifier, candidate, owners, "当前来源由其他单元临时占用，先取其他候选。")
+                continue
+            if progress.get("state") == "deferred":
+                if progress.get("preselected"):
+                    candidate["proposal_version"] = PROPOSAL_VERSION
+                retriever.candidate_progress.pop(key, None)
+            result.append(candidate)
+        return result
+
     def fill_local(unit):
         identifier = unit["id"]
-        if identifier in exhausted:
-            return
-        batch = retriever.retrieve(unit["requirement"], limit=4, excluded=examined[identifier])
-        if not batch:
-            exhausted.add(identifier)
-            return
-        examined[identifier].update(c["scene_id"] for c in batch)
-        ensure_boundaries(c["asset_id"] for c in batch)
-        merge(identifier, retriever.prepare(visual_segments[identifier], batch, assets, gateway, verify, scene_boundaries=boundaries))
+        started, scanned, before = time.monotonic(), 0, len(retriever.evaluated[identifier])
+        while identifier not in exhausted:
+            check_cancel(stop)
+            batch = retriever.retrieve(unit["requirement"], limit=4, excluded=examined[identifier])
+            if not batch:
+                exhausted.add(identifier)
+                break
+            batch = [c for c in batch if c["scene_id"] not in examined[identifier]]
+            if not batch:
+                return "stalled"
+            examined[identifier].update(c["scene_id"] for c in batch)
+            scanned += len(batch)
+            update("寻找画面", 47, f"本地整理{identifier}新增{len(batch)}个窗口及切镜缓存；未请求模型")
+            ensure_boundaries(c["asset_id"] for c in batch)
+            diagnostic = {"windows": len(batch)}
+            previous_keys = {c["_review_key"] for c in pools[identifier]}
+            candidates = retriever.prepare(visual_segments[identifier], batch, assets, gateway, verify,
+                scene_boundaries=boundaries, diagnostic=diagnostic)
+            diagnostic["existing_ranges"] = sum(c["_review_key"] in previous_keys for c in candidates)
+            merge(identifier, candidates)
+            for name, value in diagnostic.items():
+                local_search[identifier][name] = local_search[identifier].get(name, 0)+value
+            update("寻找画面", 47, f"本地续查{identifier}：本次{scanned}个窗口，累计{len(examined[identifier])}个；未请求模型")
+            if waiting(identifier):
+                return "pending"
+            if len(retriever.evaluated[identifier]) > before:
+                return "evaluated"  # Reallocate before settling new exact-cache judgments.
+            if scanned >= 32 or time.monotonic()-started >= 5:
+                return "yielded"  # Local work checkpoint, never an API limit or an exhausted query.
+        return "exhausted"
 
     def save(status, gaps, proposal):
         write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": pools,
@@ -747,7 +807,9 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from,
             "search_signature": search_signature, "unit_signatures": unit_signatures,
             "migration": migration or saved.get("migration"), "evaluation_version": RETRIEVAL_REPAIR_VERSION,
-            "evaluation_waves": waves, "paused_units": paused_units})
+            "evaluation_waves": waves, "paused_units": paused_units, "queue_version": CANDIDATE_QUEUE_VERSION,
+            "candidate_progress": retriever.candidate_progress, "pause_dependencies": pause_dependencies,
+            "uncertain_waves": uncertain_waves, "local_search": local_search})
         write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
             "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
         write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
@@ -761,7 +823,10 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                 "processed_candidates": len(processed[u["id"]]),
                 "compatible_candidates": sum(bool(c.get("compatible_from")) for c in pools[u["id"]] if c.get("pending_review") is False),
                 "preselection": retriever.preselection.get(u["id"], {}),
-                **retriever.statistics.get(u["id"], {})} for u in units}, "gaps": gaps})
+                **retriever.statistics.get(u["id"], {}), "local_search": local_search[u["id"]],
+                "unconfirmed": sum(c["_review_key"] in retriever.unconfirmed for c in pools[u["id"]]),
+                "deferred_candidates": sum(c.get("state") == "deferred" and c.get("unit_id") == u["id"]
+                    for c in retriever.candidate_progress.values())} for u in units}, "gaps": gaps})
 
     structural = [{"visual_unit_id": u["id"], "segment_id": u["segment_id"], "start": a, "end": b,
                    "category": "short_interval", "missing_seconds": round(b-a, 3), "reason": "动画与句意边界留下不足1秒原片区间。"}
@@ -808,13 +873,27 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             return shots, boundaries, pools
         except VisualCapacityError as exc:
             gaps = exc.gaps
-        proposal_pools = {identifier: [c for c in rows if c.get("pending_review") is False or
-                          (c["_review_key"] in waves.get(identifier, {}).get("keys", []) and
-                           c["_review_key"] not in retriever.unconfirmed and identifier not in paused_units)]
-                          for identifier, rows in pools.items()}
-        proposal, _ = propose_visual_timeline(segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         confirmed, _ = propose_visual_timeline(segments, {k: [c for c in rows if c.get("pending_review") is False] for k, rows in pools.items()},
                                              target_shot_seconds=target, visual_units=units, reservations=reservations)
+        occupied = [(shot.visual_unit_id, candidate_for_shot(shot)) for shot in confirmed if shot.visual_unit_id]
+        occupied = [(owner, candidate) for owner, candidate in occupied if candidate is not None]
+        occupancy = stable_hash(sorted((owner, *source_shot_key(c), c["source_start"], c["source_end"]) for owner, c in occupied))
+        for identifier, dependency in list(pause_dependencies.items()):
+            if dependency != occupancy:
+                paused_units.pop(identifier, None)
+                pause_dependencies.pop(identifier)
+        # Check availability both before ranking and after other approvals change allocation.
+        for identifier in waves:
+            available = {c["_review_key"] for c in waiting(identifier)}
+            for candidate in pools[identifier]:
+                if candidate["_review_key"] in waves[identifier]["keys"] and candidate["_review_key"] not in available:
+                    candidate.pop("proposal_version", None)
+        proposal_pools = {identifier: [c for c in rows if c.get("pending_review") is False or
+                          (c["_review_key"] in waves.get(identifier, {}).get("keys", []) and
+                           c["_review_key"] not in retriever.unconfirmed and identifier not in paused_units and
+                           retriever.candidate_progress.get(c["_review_key"], {}).get("state") != "deferred")]
+                          for identifier, rows in pools.items()}
+        proposal, _ = propose_visual_timeline(segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
         covered = sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id)
         allocated = {u["id"]: sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id == u["id"]) for u in units}
         progress = 47+22*min(1, covered/max(.001, needed_seconds))
@@ -823,8 +902,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             identifier = shot.visual_unit_id
             if not identifier or identifier not in waves or identifier in paused_units:
                 continue
-            candidate = next((c for c in pools[identifier] if c["asset_id"] == shot.asset_id and c["scene_id"] == shot.scene_id
-                and c["source_start"] <= shot.source_start+.000001 and c["source_end"] >= shot.source_end-.000001), None)
+            candidate = candidate_for_shot(shot)
             if candidate and candidate.get("pending_review") and candidate["_review_key"] not in retriever.unconfirmed:
                 pair = (identifier, candidate["_review_key"])
                 if pair not in pair_keys:
@@ -844,54 +922,72 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
                 no_gain[identifier] = 0
                 continue
             unresolved = set(wave["keys"])-retriever.evaluated[identifier]
-            if unresolved:
-                paused_units[identifier] = ("实际镜头审核未确认" if unresolved & retriever.unconfirmed else
-                    "本轮候选受来源分配冲突阻挡，尚未完成评估")
-            elif len(retriever.evaluated[identifier]) > wave["evaluated_before"]:
+            for candidate in pools[identifier]:
+                if candidate["_review_key"] in unresolved and candidate["_review_key"] not in retriever.unconfirmed:
+                    entry = retriever.candidate_progress.get(candidate["_review_key"], {})
+                    if entry.get("state") != "deferred" or entry.get("occupancy") != occupancy:
+                        defer(identifier, candidate, [], "本轮未形成可分配镜头，先取其他候选；占用变化后重新核对。")
+            if unresolved & retriever.unconfirmed:
+                uncertain_waves[identifier] += 1
+                if uncertain_waves[identifier] >= no_gain_limit:
+                    paused_units[identifier] = f"连续{no_gain_limit}批实际审核未确认，相关候选已保存待后续处理"
+            elif not unresolved and len(retriever.evaluated[identifier]) > wave["evaluated_before"]:
+                uncertain_waves[identifier] = 0
                 no_gain[identifier] = 0 if allocated[identifier] > wave["allocated_before"]+.001 else no_gain[identifier]+1
-            else:
-                paused_units[identifier] = "预选协议未完成" if wave["protocol_issues"] else "本轮检索没有可审候选"
+            elif not wave["keys"]:
+                paused_units[identifier] = "预选输入或协议未完成" if wave["protocol_issues"] else "本轮没有可审候选且无新有效结论"
         waves = {}
         groups = []
         for unit in units:
             identifier = unit["id"]
             if identifier not in material or identifier in paused_units or no_gain[identifier] >= no_gain_limit:
                 continue
-            segment = visual_segments[identifier]
-            waiting = lambda: [c for c in pools[identifier] if c.get("pending_review") and
-                              c["_review_key"] not in processed[identifier] and c["_review_key"] not in retriever.unconfirmed]
             before = len(retriever.evaluated[identifier])
-            if not waiting():
-                fill_local(unit)
-            if not waiting():
+            candidates = waiting(identifier)
+            local_state = None
+            if not candidates:
+                local_state = fill_local(unit)
+                candidates = waiting(identifier)
+            if not candidates:
                 if len(retriever.evaluated[identifier]) > before:
-                    # Reallocate first; settle this cache-only wave exactly once in the next loop.
                     waves[identifier] = {"keys": [], "evaluated_before": before,
                         "allocated_before": allocated[identifier], "protocol_issues": 0}
+                elif local_state == "yielded":
+                    paused_units[identifier] = "本地续查已保存游标让出，查询尚未耗尽"
+                elif local_state == "stalled":
+                    paused_units[identifier] = "本地检索未推进，已保存现有候选"
                 else:
-                    paused_units[identifier] = "本轮检索没有可审候选" if identifier not in exhausted else "当前检索查询已无新窗口"
+                    deferred = any(c.get("unit_id") == identifier and c.get("state") == "deferred" and c.get("occupancy") == occupancy
+                                   for c in retriever.candidate_progress.values())
+                    paused_units[identifier] = "当前可检索备选均被占用或尚未可分配，已保存候选队列" if deferred else "当前检索查询已无新窗口，未确认范围保留"
+                    if deferred:
+                        pause_dependencies[identifier] = occupancy
                 continue
             waves[identifier] = {"keys": [], "evaluated_before": before,
                 "allocated_before": allocated[identifier], "protocol_issues": 0}
-            groups.append((segment, waiting(), sum(row["missing_seconds"] for row in gaps if row["visual_unit_id"] == identifier)))
+            groups.append((visual_segments[identifier], candidates, sum(row["missing_seconds"] for row in gaps if row["visual_unit_id"] == identifier)))
         if not groups and not waves:
             save("incomplete", gaps, proposal)
-            unconfirmed = sum(row.get("unconfirmed", 0) for row in retriever.statistics.values())
+            unconfirmed = sum(c["_review_key"] in retriever.unconfirmed for rows in pools.values() for c in rows)
             held = sum(no_gain[identifier] >= no_gain_limit for identifier in material)
             short = sum(row.get("category") == "short_interval" for row in gaps)
             protocol = sum(row.get("invalid_references", 0) > 0 for row in retriever.preselection.values())
             pending = sum(c.get("pending_review") is True for rows in pools.values() for c in rows)
+            deferred = sum(row.get("state") == "deferred" for row in retriever.candidate_progress.values())
             reasons = "；".join(f"{reason}{list(paused_units.values()).count(reason)}个单元" for reason in dict.fromkeys(paused_units.values()))
             raise JobPaused(f"画面仍有{len(gaps)}处缺口，共缺{sum(r['missing_seconds'] for r in gaps):.2f}秒；"
                 f"{held}个单元完成有效评估后连续{no_gain_limit}轮无新增可分配时长，{short}处为短残段，"
-                f"预选协议或编号问题涉及{protocol}个单元，实际镜头未确认{unconfirmed}个，候选队列待审{pending}个。"
+                f"预选协议或编号问题涉及{protocol}个单元，实际镜头未确认{unconfirmed}个，候选队列待审{pending}个，分配延后{deferred}个。"
                 f"{reasons + '。' if reasons else ''}"
-                "本次停止自动扩大以控制Token；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
-                "从3. 寻找画面继续可复用缓存并沿保存的检索进度追加候选。")
+                "本次按有效评估及候选进度暂停；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
+                "从3. 寻找画面继续会复用已付费结果，沿候选队列及保存的本地检索游标向后推进。")
         if groups:
-            update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；只对本轮拟用镜头送图，当前已确认{covered:.1f}秒")
+            update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；已本地跳过占用范围，当前已确认{covered:.1f}秒")
             for identifier, result in retriever.shortlist(groups, gateway, directory, stop, search_round=search_round).items():
                 waves[identifier].update(result)
+                for review_key in result["keys"]:
+                    retriever.candidate_progress[review_key] = {"version": CANDIDATE_QUEUE_VERSION,
+                        "model_signature": retriever.queue_signature, "unit_id": identifier, "state": "selected", "stage": "text_preselect"}
         search_round += 1
         save("searching", gaps, proposal)
 
