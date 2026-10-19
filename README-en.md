@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.4**
+**Manuscript-driven video production · v2.7.5**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.4 provides seven workspaces:
+Version 2.7.5 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -137,13 +137,17 @@ Version 2.7.3 uses token-conscious footage scheduling from stage 3: restore appr
 
 Version 2.7.4 reconciles shared visual cuts after restoring semantic groups, checking original-text bindings, rendered animation reservations, and speech gaps with a half-frame rounding tolerance. Projects stopped by the three reported subsecond intervals can resume from **3. Find footage** using existing narration, captions, and animations. Search pools and cursors are reused only when the original plan key, library, and model settings match. Genuine short intervals and binding conflicts still pause with a reason.
 
+Version 2.7.5 fixes the pending-state conflict that blocked new candidate approval. Valid peers are retained while necessary malformed rows get one small correction pass. Saved gaps can receive targeted review of commentary mistaken for concrete facts while retaining actual plot constraints. Unchanged units retain search progress; changed requirements revalidate existing ranges. Resume from **3. Find footage**. Necessary corrections and requirement reviews call the selected models and count toward token usage; genuine footage shortages are still reported.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.4 fixes short remnants caused by mismatched animation frame edges and shared visual cuts while retaining semantic groups, narration, captions, and animation timing. New plans record the boundary policy and changes; search progress is reused after exact original-key checks. Older valid plan identities remain compatible, and genuine short intervals and final timeline checks remain enforced. Implementation and static review are complete; live project recovery and video output have not been validated.
+Version 2.7.5 fixes candidate approval state, restores and revalidates paid judgments, and corrects only malformed rows. Legacy source-usability judgments mixed with manuscript relevance are archived and rechecked by range. Unknown footage remains unconfirmed, with credits filtering and final approval gates retained. Gap requirements receive targeted fact review using the original text; grouping and unchanged-unit progress are reused. Implementation and static review are complete; live gap improvement, cache migration, and video output have not been validated.
+
+Version 2.7.4 reconciles animation frame edges and visual cuts with the same original-text binding while retaining narration, captions, and animations. Saved project recovery records show the three reported remnants resolved; full video output still needs validation.
 
 Version 2.7.3 added optional text preselection, provisional allocation and on-demand footage confirmation, shared request catalogues with canonical ID restoration, approved-result reuse, search checkpoints, no-gain pauses, and reported token totals. Final factual, source deduplication, credits and timeline checks remain required. Token savings and video quality still need validation.
 

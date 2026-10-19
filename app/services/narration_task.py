@@ -16,7 +16,9 @@ from app.services.library.retriever import MaterialRetriever
 from app.services.library.runner import DEFAULT_CALL_BUDGET, JobCancelled, check_cancel, library_operation
 from app.services.library import runner
 from app.services.library.store import LibraryStore, library_ids, stable_hash, write_json, read_json
-from app.services.narration_planner import BOUNDARY_ALIGNMENT_VERSION, plan_document, plan_subtitles, plan_visual_units, validate_visual_plan
+from app.services.narration_planner import (
+    BOUNDARY_ALIGNMENT_VERSION, plan_document, plan_subtitles, plan_visual_units, revise_visual_requirements, validate_visual_plan,
+)
 from app.services.narration_bgm import bgm_libraries, bgm_options, plan_bgm, prepare_bgm, validate_bgm
 from app.services.narration_motion import (
     motion_options, validate_motion, plan_motion, prepare_motion, load_motion_assets,
@@ -633,7 +635,7 @@ def _preserve_visual_result(directory):
     write_json(archive / "retained-files.json", {"original_task": str(directory), "video": str(retained) if retained.is_file() else None})
 
 
-def _find_visual_shots(segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update):
+def _find_visual_shots(segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update, *, previous_plan=None):
     """Propose globally, inspect only proposed pairs, and retain a resumable local search cursor."""
     from app.models.timeline import NarrationSegment
     from app.services.library.frame_extractor import scene_boundaries
@@ -651,24 +653,49 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     search_identity = (retriever.version, verify, target, gateway.signature("text_fast"),
                        gateway.signature("text"), gateway.signature("vision"))
     key = stable_hash((PROPOSAL_VERSION, visual_plan["key"], *search_identity))
+    search_signature = stable_hash((PROPOSAL_VERSION, *search_identity))
+    unit_signatures = {u["id"]: stable_hash(u) for u in units}
     alignment = visual_plan.get("boundary_alignment", {})
     base_key = alignment.get("base_plan_key") if alignment.get("version") == BOUNDARY_ALIGNMENT_VERSION else None
-    compatible_key = stable_hash((PROPOSAL_VERSION, base_key, *search_identity)) if base_key else key
+    revisions = visual_plan.get("requirement_revisions", {})
+    compatible_keys = {key}
+    if not any(row.get("changed") for row in revisions.get("entries", [])):
+        compatible_keys.update(stable_hash((PROPOSAL_VERSION, value, *search_identity)) for value in
+                               (base_key, revisions.get("base_plan_key")) if value)
     path = directory/"visual_search_state.json"
     try:
         saved = read_json(path, default={})
     except (OSError, ValueError):
         saved = {}
-    if not isinstance(saved, dict) or saved.get("key") not in (key, compatible_key) or \
+    if not isinstance(saved, dict) or \
             not isinstance(saved.get("pools", {}), dict) or not isinstance(saved.get("examined", {}), dict):
         saved = {}
+    migration = None
+    if saved and saved.get("key") not in compatible_keys:
+        previous_units = {u["id"]: stable_hash(u) for u in previous_plan["units"]} if previous_plan else {}
+        if saved.get("search_signature") == search_signature and isinstance(saved.get("unit_signatures"), dict):
+            known = saved["unit_signatures"]
+        elif previous_plan and saved.get("key") == stable_hash((PROPOSAL_VERSION, previous_plan["key"], *search_identity)):
+            known = previous_units
+        else:
+            known = None
+        if known is None:
+            saved = {}
+        else:
+            retained = {uid for uid, signature in unit_signatures.items() if known.get(uid) == signature}
+            saved = {**saved, "examined": {uid: rows for uid, rows in saved["examined"].items() if uid in retained},
+                     "exhausted": [uid for uid in saved.get("exhausted", []) if uid in retained]}
+            # Old ranges can be proposed again, but prepare() revalidates every current requirement/key.
+            migration = {"from_key": saved.get("key"), "retained_units": sorted(retained),
+                         "reset_units": sorted(set(unit_signatures)-retained)}
     migrated_from = saved.get("key") if saved and saved.get("key") != key else saved.get("migrated_from_key")
     if migrated_from and migrated_from != saved.get("migrated_from_key"):
-        logger.info("仅画面共享边界变化，已核对原计划键并复用检索游标和候选池：{}", migrated_from)
+        logger.info("已核对搜索身份并复用候选范围；仅变更合同的单元重置游标：{}，{}", migrated_from, migration)
     examined = {u["id"]: set(saved.get("examined", {}).get(u["id"], [])) for u in units}
     exhausted = set(saved.get("exhausted", []))
     no_gain = {u["id"]: 0 for u in units}  # Explicit continue grants another bounded expansion from the saved cursor.
-    pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify)
+    update("寻找画面", 47, "本地重新核对已付费候选和旧判断，复用已确认结果；此步骤不请求模型")
+    pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify, stop=stop)
     boundaries, fingerprint_boundaries = {}, {}
     search_round = int(saved.get("search_round", 0))
 
@@ -719,7 +746,9 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
     def save(status, gaps, proposal):
         write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": pools,
             "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
-            "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from})
+            "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from,
+            "search_signature": search_signature, "unit_signatures": unit_signatures,
+            "migration": migration or saved.get("migration")})
         write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
             "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
         write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
@@ -833,7 +862,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
             held = sum(value >= no_gain_limit for value in no_gain.values())
             short = sum(row.get("category") == "short_interval" for row in gaps)
             raise JobPaused(f"画面仍有{len(gaps)}处缺口，共缺{sum(r['missing_seconds'] for r in gaps):.2f}秒；"
-                f"{held}个单元连续{no_gain_limit}轮无新增合格时长，{short}处为短残段，{unconfirmed}个候选格式未确认。"
+                f"{held}个单元连续{no_gain_limit}轮无新增合格时长，{short}处为短残段，{unconfirmed}个候选尚未确认（格式或画面不明）。"
                 "本次停止自动扩大以控制Token；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
                 "从3. 寻找画面继续可复用缓存并沿保存的检索进度追加候选。")
         update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；只对拟用镜头送图，当前已确认{covered:.1f}秒")
@@ -1032,12 +1061,20 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                 state.update(motion_count=0, motion_seconds=0)
             visual_start = 45 if options["motion_enabled"] else 40
             update("规划句意画面", visual_start, "保留原配音与字幕，按当前句意确定画面范围")
+            try:
+                previous_visual_plan = validate_visual_plan(read_json(directory/"visual_plan.json"), segments, text, directory)
+            except (OSError, ValueError, KeyError, TypeError):
+                previous_visual_plan = None
             visual_plan = plan_visual_units(segments, text, overview, gateway, directory, stop,
                 progress=lambda p, message: update("规划句意画面", visual_start + p*2, message),
                 reservations=reservations, motion_plan=motion_plan)
+            visual_plan = revise_visual_requirements(visual_plan, previous_visual_plan, text, gateway, directory, stop,
+                progress=lambda message: update("修订缺口画面需求", visual_start + 2, message))
+            validate_visual_plan(visual_plan, segments, text, directory)
             assets = store.assets(selected_libraries) + motion_assets
             shots, boundaries, candidates_by_unit = _find_visual_shots(
-                segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update)
+                segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update,
+                previous_plan=previous_visual_plan)
             used = []
             for shot in shots:
                 if not shot.visual_unit_id:

@@ -19,6 +19,7 @@ from app.services.timeline_planner import (
 
 
 SUBTITLE_EVIDENCE_VERSION = "subtitle-evidence-ids-v1"
+REVIEW_SCOPE_VERSION = "source-usability-v1"
 
 
 def _credits_description(scene):
@@ -85,6 +86,8 @@ def _match_result(value, expected, with_images, *, relevance=True):
         if with_images and row.get("frame_index_valid") is not True:
             usability_valid = False
             issue("frame_index", "invalid_frame", "视觉检查须返回合法frame_index，范围0至2。")
+        if row.get("content_kind") == "unknown" and usability_valid:
+            issue("content_kind", "unknown_visual", "画面尚不能可靠辨认，保留为未确认，不能作为跨需求禁用依据。")
         if relevance:
             if row.get("relation") not in ("direct", "supporting", "unrelated", "unknown"):
                 issue("relation", "invalid_relation", "relation须为direct/supporting/unrelated/unknown。")
@@ -194,19 +197,31 @@ class MaterialRetriever:
         if key not in self.exclusion_keys:
             for identifier in self.source_libraries[candidate["fingerprint"]]:
                 rows = self.store.cache_get(identifier, key)
+                if isinstance(rows, list) and any(isinstance(row, dict) and row.get("content_kind") not in {"credits", "mixed"} for row in rows):
+                    self._archive_cache(identifier, key, rows)
                 for row in rows if isinstance(rows, list) else []:
                     if isinstance(row, dict) and row.get("fingerprint") == candidate["fingerprint"] and \
+                            row.get("content_kind") in {"credits", "mixed"} and \
                             all(type(row.get(k)) in (int, float) and math.isfinite(row[k]) for k in ("source_start", "source_end")) and \
                             0 <= row["source_start"] < row["source_end"]:
                         self.forbidden.append(row)
             self.exclusion_keys.add(key)
         return key
 
+    def _archive_cache(self, library_id, key, value):
+        """Keep the legacy value before changing the scope of a cached judgment."""
+        archive = key + ":before-" + REVIEW_SCOPE_VERSION
+        if self.store.cache_get(library_id, archive) is None:
+            self.store.cache_put(library_id, archive, {"key": key, "rule": REVIEW_SCOPE_VERSION, "value": value})
+
     def _reject(self, candidate, judgment, gateway):
+        if judgment["content_kind"] not in {"credits", "mixed"}:
+            return  # Unknown/irrelevant to one manuscript is not a permanent source exclusion.
         key = self._load_exclusions(candidate, gateway)
         row = {name: candidate[name] for name in ("fingerprint", "source_start", "source_end")}
         row["content_kind"] = judgment["content_kind"]
-        if row not in self.forbidden:
+        row.update(scope=REVIEW_SCOPE_VERSION, reason=judgment["reason"])
+        if not any(all(old.get(k) == row[k] for k in ("fingerprint", "source_start", "source_end", "content_kind")) for old in self.forbidden):
             self.forbidden.append(row)
             self.store.cache_put(candidate["library_id"], key, [item for item in self.forbidden if item["fingerprint"] == candidate["fingerprint"]])
         self.rejected_ranges.add(candidate["_safety_key"])
@@ -289,7 +304,8 @@ class MaterialRetriever:
                 visual_policy=VISUAL_POLICY_VERSION, match_policy=MATCH_POLICY_VERSION, visual_unit_id=segment.id,
                 visual_checked=candidate["_verify_visual"], confidence=confidence(judgment.get("confidence")),
                 reason=judgment["reason"], weak_match=judgment["relation"] != "direct" or not candidate["_verify_visual"])
-        accepted = not issues and candidate["usable"] and self.range_allowed(candidate) and match_allowed(candidate, segment.requirement)
+        reviewed = {**candidate, "pending_review": False}
+        accepted = not issues and candidate["usable"] and self.range_allowed(candidate) and match_allowed(reviewed, segment.requirement)
         if key not in self.recorded:
             self.recorded.add(key)
             stats["checked"] += 1
@@ -299,7 +315,8 @@ class MaterialRetriever:
             else:
                 if issues:
                     stats["unconfirmed"] += 1
-                    category = "字幕引用未确认" if any(item["field"] == "subtitle_ids" for item in issues) else "候选格式未确认"
+                    category = ("画面内容未确认" if any(item["category"] == "unknown_visual" for item in issues) else
+                                "字幕引用未确认" if any(item["field"] == "subtitle_ids" for item in issues) else "候选格式未确认")
                     reason = "; ".join(item["message"] for item in issues)
                 else:
                     category = "画面不可用" if not candidate["usable"] else judgment["relation"] if judgment["facts_match"] else "事实未对应"
@@ -311,6 +328,10 @@ class MaterialRetriever:
                         "relation": "unknown" if issues else judgment["relation"], "reason": reason, "validation_issues": issues})
         if accepted:
             candidate.update(pending_review=False, _screened=True)
+            candidate.pop("_unconfirmed", None)
+            candidate.pop("_rejected", None)
+            self.unconfirmed.discard(key)
+            self.rejected_matches.discard(key)
             selected = frame_index(judgment.get("frame_index", 1)) if candidate["_verify_visual"] else 1
             candidate["anchor"] = candidate["source_start"] + (candidate["source_end"]-candidate["source_start"]) * (selected+.5)/3
         elif issues:
@@ -366,16 +387,25 @@ class MaterialRetriever:
             try:
                 if safety is not None:
                     _review_result({"clips": [safety]}, {candidate["_review_id"]})
-                    if not safety["usable"]:
+                    if safety["content_kind"] == "unknown":
+                        self._archive_cache(candidate["library_id"], safety_key, safety)
+                        safety = None
+                    elif not safety["usable"]:
                         self._reject(candidate, safety, gateway)
                         continue
             except (ModelFormatError, TypeError, KeyError):
+                if safety is not None:
+                    self._archive_cache(candidate["library_id"], safety_key, safety)
                 safety = None
             candidate["_safety"] = safety
             judgment = self.store.cache_get(candidate["library_id"], key)
             migrated = judgment is None
             if judgment is None:
                 judgment = self.store.cache_get(candidate["library_id"], legacy)
+            if isinstance(judgment, dict) and judgment.get("usable") is False and judgment.get("content_kind") == "unknown" and \
+                    judgment.get("review_scope") != REVIEW_SCOPE_VERSION:
+                self._archive_cache(candidate["library_id"], legacy if migrated else key, judgment)
+                judgment = None  # Recheck this legacy source/relationship mixture without approving it.
             valid = False
             if isinstance(judgment, dict) and judgment.get("evidence_protocol") == SUBTITLE_EVIDENCE_VERSION:
                 try:
@@ -413,19 +443,70 @@ class MaterialRetriever:
                 unique[identity] = candidate
         return sorted(unique.values(), key=lambda item: (not item.get("pending_review", True), item.get("confidence", item.get("proposal_score", 0))), reverse=True)
 
-    def restore_candidates(self, directory, segments, assets, gateway, verify_visual):
-        """Recover paid positive results; database replies are revalidated for the current manuscript."""
+    def restore_candidates(self, directory, segments, assets, gateway, verify_visual, *, stop=None):
+        """Recover paid ranges, including replies that the old pending-state bug did not approve."""
         result = {identifier: [] for identifier in segments}
+        directory = Path(directory)
+        asset_map, requests, seen = {a["id"]: a for a in assets}, {}, set()
         for path in (Path(directory)/"candidates").glob("*.json"):
+            check_cancel(stop)
             try:
                 saved = read_json(path)
                 if not isinstance(saved, dict):
                     continue
-                for candidate in saved.get("value", []):
+                candidates = list(saved["value"]) if isinstance(saved.get("value"), list) else []
+                reviews = {(r["unit_id"], r["review_id"], r["source_start"], r["source_end"])
+                           for r in saved.get("reviews", []) if isinstance(r, dict) and
+                           all(k in r for k in ("unit_id", "review_id", "source_start", "source_end"))}
+                records = list(saved.get("requests", []))
+                for group in saved.get("reviews", []):
+                    if not isinstance(group, dict) or saved.get("visual_unit_id") not in segments:
+                        continue
+                    records.extend(group.get("requests", []))
+                    reviews.update((saved["visual_unit_id"], clip["scene_id"], clip["source_start"], clip["source_end"])
+                        for clip in group.get("clips", []) if isinstance(clip, dict) and
+                        all(k in clip for k in ("scene_id", "source_start", "source_end")))
+                for record in records if reviews else ():
+                    if not isinstance(record, dict):
+                        continue
+                    relative = Path(record.get("request_file", ""))
+                    if relative.parent != Path("model-requests") or not re.fullmatch(r"[a-f0-9]{32}\.json", relative.name):
+                        continue
+                    if relative.name not in requests:
+                        try:
+                            requests[relative.name] = read_json(directory/relative).get("metadata", {})
+                        except (OSError, ValueError, TypeError, AttributeError):
+                            requests[relative.name] = {}
+                    metadata = requests[relative.name]
+                    if not isinstance(metadata, dict) or not isinstance(metadata.get("canonical_pairs", {}), dict) or \
+                            not isinstance(metadata.get("candidates", []), list):
+                        continue
+                    pairs = list(metadata.get("canonical_pairs", {}).values())
+                    if not pairs and metadata.get("visual_unit_id") == saved.get("visual_unit_id") in segments:
+                        pairs = [{"unit_id": metadata["visual_unit_id"], "review_id": c.get("review_id")}
+                                 for c in metadata.get("candidates", []) if isinstance(c, dict)]
+                    for pair in pairs:
+                        if not isinstance(pair, dict):
+                            continue
+                        for source in metadata.get("candidates", []):
+                            if not isinstance(source, dict):
+                                continue
+                            owner = pair.get("unit_id")
+                            asset = asset_map.get(source.get("asset_id"))
+                            if owner not in segments or not asset or pair.get("review_id") != source.get("review_id") or \
+                                    asset.get("fingerprint") != source.get("fingerprint") or \
+                                    (owner, source["review_id"], source["source_start"], source["source_end"]) not in reviews:
+                                continue
+                            candidates.append({**source, "visual_unit_id": owner, "fps": asset["fps"]})
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
                     unit = candidate.get("visual_unit_id")
-                    if unit in segments:
+                    identity = (unit, candidate.get("asset_id"), candidate.get("scene_id"), candidate.get("source_start"), candidate.get("source_end"))
+                    if unit in segments and identity not in seen:
+                        seen.add(identity)
                         rows = self.prepare(segments[unit], [candidate], assets, gateway, verify_visual)
-                        result[unit].extend(row for row in rows if row.get("pending_review") is False)
+                        result[unit].extend(rows)  # Pending ranges still need the normal approval gate.
             except (OSError, ValueError, TypeError, KeyError):
                 continue
         return result
@@ -523,8 +604,9 @@ class MaterialRetriever:
             batch.append(pair); unique.add(source); unit_ids.add(pair[0].id)
         submit(batch)
 
-    def review_pairs(self, pairs, gateway, directory, stop=None, *, search_round=0, _safety_only=False):
+    def review_pairs(self, pairs, gateway, directory, stop=None, *, search_round=0, _safety_only=False, _repair=None):
         """Only proposed pairs reach this final review; images/catalogues are shared by range."""
+        from app.services.library.gateway import ModelAPIError, ModelInputBudgetError
         accepted = []
         for offset in range(0, len(pairs), 6):
             batch = pairs[offset:offset+6]
@@ -540,10 +622,10 @@ class MaterialRetriever:
             safety_only = not with_images and any(c.get("_safety") is None for c in clips.values())
             if safety_only:
                 safety_batch = [(s, c) for s, c in batch if c.get("_safety") is None]
-                self.review_pairs(safety_batch, gateway, directory, stop, search_round=search_round, _safety_only=True)
+                self.review_pairs(safety_batch, gateway, directory, stop, search_round=search_round, _safety_only=True, _repair=_repair)
                 batch = [(s, c) for s, c in batch if c.get("_safety") and c["_safety"]["usable"] and c["_review_key"] not in self.unconfirmed]
                 if batch:
-                    accepted.extend(self.review_pairs(batch, gateway, directory, stop, search_round=search_round))
+                    accepted.extend(self.review_pairs(batch, gateway, directory, stop, search_round=search_round, _repair=_repair))
                 continue
             images = []
             if with_images:
@@ -570,7 +652,8 @@ class MaterialRetriever:
                 return {"clips": normalized}
             prompt = ("逐一检查pairs，仅返回每个P编号一次。clips按顺序各附3图，frame_index是该素材内0至2。"
                 "usable仅判断画面：剧情story为true，职员表/演职员名单credits、混合mixed、不明unknown为false；普通对白/歌词不因此禁用。"
-                "relation为direct/supporting/unrelated/unknown，facts_match须满足本单元具体事实且方向无冲突。"
+                "relation为direct/supporting/unrelated/unknown，facts_match只用true或false；具体事实仅部分满足时用false，禁止partial。"
+                "confidence必须为0至1的有限数字。人物/事件不符只影响relation/facts_match/conflicts，不得因此将story标为不可用。"
                 "evidence类须直接证据；abstract/state/transition可用有具体同向联系的辅助画面，不要求单镜头证明整套理论。"
                 "遵守人物/时期/事件/关系及avoid，提及人物不等于出现，否认不能支持建立关系；背景仅作线索，不把窗口外剧情当本镜头。"
                 "visual_evidence仅写可见动作/状态/环境，不写对白；subtitle_ids只选本素材的C编号字幕，不跨素材、不抄引文。"
@@ -584,15 +667,30 @@ class MaterialRetriever:
                     "返回{clips:[{scene_id,usable,content_kind,reason,confidence,frame_index}]}，不判断文案关系。\n")
                 payload = {"clips": [{"id": ca[key]} for key in clips],
                            "pairs": [{"scene_id": a, "clip": ca[c["_safety_key"]]} for a, (_, c) in aliases.items()]}
+            if _repair:
+                reverse = {value: key for key, value in references.items()}
+                feedback = []
+                for alias, (_, candidate) in aliases.items():
+                    old = _repair[candidate["_review_key"]]
+                    previous = {k: v for k, v in old["previous"].items() if k in (
+                        "usable", "content_kind", "reason", "confidence", "frame_index", "relation", "facts_match",
+                        "visual_evidence", "conflicts", "subtitle_ids")}
+                    if isinstance(previous.get("subtitle_ids"), list):
+                        previous["subtitle_ids"] = [reverse.get(x, "invalid:"+str(x)) for x in previous["subtitle_ids"]]
+                    feedback.append({"scene_id": alias, "previous": previous, "issues": old["issues"]})
+                payload["repair"] = feedback
+                prompt += "这是一次失败条目的局部纠错。原回复只作待修数据，按当前P/C目录修正字段；证据不足应明确不匹配，不为了通过而改成true。\n"
             text = prompt+json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             identity = stable_hash((PROPOSAL_VERSION, [(s.id, c["_review_key"]) for s, c in batch], with_images))
+            if _repair:
+                identity = stable_hash((identity, "row-repair-v1"))
             path = Path(directory)/"candidates"/f"review-{identity[:24]}.json"
             limit = int(gateway.settings["vision" if with_images else "text"].get("max_prompt_chars", 16000))
             too_large = len(text) > limit or len(text)*2+len(images)*1600+1024 >= int(gateway.settings["vision" if with_images else "text"].get("context_tokens", 64000))
             if too_large:
                 if len(batch) > 1:
-                    accepted.extend(self.review_pairs(batch[:len(batch)//2], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only))
-                    accepted.extend(self.review_pairs(batch[len(batch)//2:], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only))
+                    accepted.extend(self.review_pairs(batch[:len(batch)//2], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only, _repair=_repair))
+                    accepted.extend(self.review_pairs(batch[len(batch)//2:], gateway, directory, stop, search_round=search_round, _safety_only=_safety_only, _repair=_repair))
                 else:
                     segment, candidate = batch[0]
                     self._remember(segment, candidate, {"_validation_issues": [{"field": "input", "category": "input_budget", "message": "单镜头输入超过本模型预算，请调整模型上下文设置。"}]})
@@ -606,36 +704,42 @@ class MaterialRetriever:
             gateway.after_request = after
             try:
                 result = gateway.json(text, images=images or None, model_kind="vision" if with_images else "text", max_output=2400,
-                    required={"clips": list}, result_validator=validate,
+                    required={"clips": list}, result_validator=validate, attempts=1 if _repair else 3,
                     request_metadata={"usage_stage": "visual_safety" if _safety_only else "visual_review", "search_round": search_round,
                         "candidate_file": path.relative_to(directory).as_posix(), "canonical_pairs": {
                             alias: {"unit_id": s.id, "review_id": c["_review_id"]} for alias, (s, c) in aliases.items()},
-                        "subtitle_aliases": references, "candidates": self._request_sources(list(clips.values()), with_images=with_images)})
+                        "subtitle_aliases": references, "local_repair": bool(_repair),
+                        "candidates": self._request_sources(list(clips.values()), with_images=with_images)})
             finally:
                 gateway.after_request = previous_after
-            approved, diagnostics = [], []
+            approved, diagnostics, deferred = [], [], []
             for row in result["clips"]:
                 segment, candidate = aliases[row["_pair"]]
                 candidate.pop("proposal_version", None)
+                row["review_scope"] = REVIEW_SCOPE_VERSION
                 if with_images and row["_usability_valid"]:
                     safety = {k: row[k] for k in ("scene_id", "usable", "content_kind", "reason")}
-                    self.store.cache_put(candidate["library_id"], candidate["_safety_key"], safety)
+                    safety["scope"] = REVIEW_SCOPE_VERSION
+                    if safety["content_kind"] != "unknown" or _safety_only:
+                        self.store.cache_put(candidate["library_id"], candidate["_safety_key"], safety)
                     candidate["_safety"] = safety
                     if not safety["usable"]:
                         self._reject(candidate, safety, gateway)
                     elif isinstance(row.get("visual_evidence"), list) and all(isinstance(x, str) for x in row["visual_evidence"]):
                         self.store.cache_put(candidate["library_id"], "visual-observation:"+stable_hash(candidate["_safety_key"]),
                                              {"partial": True, "facts": row["visual_evidence"]})
-                if _safety_only:
-                    if row["_validation_issues"]:
-                        self._remember(segment, candidate, row)
-                elif not row["_validation_issues"]:
-                    self.store.cache_put(candidate["library_id"], candidate["_review_key"], {k: v for k, v in row.items() if not k.startswith("_")})
-                if not _safety_only and self._remember(segment, candidate, row):
-                    accepted.append(candidate); approved.append(candidate)
+                if row["_validation_issues"] and not _repair and not any(
+                        issue["category"] == "unknown_visual" for issue in row["_validation_issues"]):
+                    deferred.append((segment, candidate, row))
+                else:
+                    if not _safety_only and not row["_validation_issues"]:
+                        self.store.cache_put(candidate["library_id"], candidate["_review_key"], {k: v for k, v in row.items() if not k.startswith("_")})
+                    if (not _safety_only or row["_validation_issues"]) and self._remember(segment, candidate, row) and not _safety_only:
+                        accepted.append(candidate); approved.append(candidate)
                 diagnostics.append({"unit_id": segment.id, "review_id": candidate["_review_id"],
                     "source_start": candidate["source_start"], "source_end": candidate["source_end"],
-                    "response": row["_raw_response"], "validation_issues": row["_validation_issues"]})
+                    "response": row["_raw_response"], "response_stage": "normalized_model_reply",
+                    "validation_issues": row["_validation_issues"]})
             try:
                 previous = read_json(path, default={})
             except (OSError, ValueError):
@@ -645,8 +749,19 @@ class MaterialRetriever:
                 history = []
             if isinstance(previous, dict) and previous.get("reviews"):
                 history.append({k: previous[k] for k in ("reviews", "requests", "subtitle_aliases") if k in previous})
-            write_json(path, {"key": identity, "version": MATCH_POLICY_VERSION, "value": approved, "reviews": diagnostics,
-                              "requests": requests, "subtitle_aliases": references, "history": history})
+            audit = {"key": identity, "version": MATCH_POLICY_VERSION, "value": approved, "reviews": diagnostics,
+                     "requests": requests, "subtitle_aliases": references, "history": history, "local_repair": bool(_repair)}
+            write_json(path, audit)
+            if deferred:
+                repair = {c["_review_key"]: {"previous": row, "issues": row["_validation_issues"]} for _, c, row in deferred}
+                try:
+                    accepted.extend(self.review_pairs([(s, c) for s, c, _ in deferred], gateway, directory, stop,
+                        search_round=search_round, _safety_only=_safety_only, _repair=repair))
+                except (ModelFormatError, ModelAPIError, ModelInputBudgetError) as exc:
+                    for segment, candidate, row in deferred:
+                        self._remember(segment, candidate, row)
+                    audit["repair_error"] = gateway._redact_request(str(exc))[:1000]
+                    write_json(path, audit)
         return accepted
 
     def select(self, segment, overview, gateway, directory, used=(), verify_visual=True, stop=None, *, candidates, scene_boundaries, assets):
