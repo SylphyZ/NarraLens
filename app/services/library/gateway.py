@@ -527,10 +527,20 @@ class ModelGateway:
         return value
 
     def _diagnostic(self, kind, attempt, state, error, message, finish_reason, details=None):
-        if not self.diagnostic:
-            return
         excerpt = self._redact_request(str(message or ""))
         error = self._redact_request(error)
+        if self.request_recorder and details is not None and details.get("request_file") and excerpt:
+            try:
+                details["response_file"] = self.request_recorder({
+                    "record_type": "model_response", "request_file": details["request_file"],
+                    "kind": kind, "attempt": attempt, "finish_reason": finish_reason,
+                    "response_stage": "raw_model_reply", "response_text": excerpt})
+            except OSError as exc:
+                # The unmodified reply text is auxiliary; a logging failure must not cause a paid retry.
+                details["response_record_error"] = self._redact_request(str(exc))[:500]
+                logger.warning("模型原始回复保存失败：{}", details["response_record_error"])
+        if not self.diagnostic:
+            return
         record = {**self.context, **(details or {}), "kind": kind, "model": self.settings[kind].get("model", ""), "attempt": attempt,
                   "state": state, "error": error[:1000], "finish_reason": finish_reason,
                   "response_excerpt": excerpt[:2000] if state == "failed" else ""}

@@ -100,8 +100,9 @@ def _match_result(value, expected, with_images, *, relevance=True):
                 issue("facts_match", "invalid_type", "facts_match须为布尔值。")
             for name in ("visual_evidence", "conflicts", "subtitle_ids"):
                 items = row.get(name)
-                if not isinstance(items, list) or len(items) > 3 or any(not isinstance(x, str) or not x.strip() for x in items):
-                    issue(name, "invalid_list", f"{name}须为最多3项的非空字符串列表，可为空。")
+                if not isinstance(items, list) or (name != "visual_evidence" and len(items) > 3) or \
+                        any(not isinstance(x, str) or not x.strip() for x in items):
+                    issue(name, "invalid_list", f"{name}须为非空字符串列表，可为空" + ("。" if name == "visual_evidence" else "，最多3项。"))
             entries = {entry["id"]: entry["text"] for entry in expected[row["scene_id"]]["subtitle_entries"]}
             ids = row.get("subtitle_ids")
             valid_ids = isinstance(ids, list) and all(isinstance(x, str) for x in ids)
@@ -170,13 +171,21 @@ def _match_result(value, expected, with_images, *, relevance=True):
 
 
 def _match_pairs(value, aliases, references, with_images, *, relevance=True, require_owner=False):
-    """Keep identifiable peers; unknown aliases never acquire another pair's identity."""
+    """Resolve only a unique clip-to-pair alias; conflicting replies remain unconfirmed."""
     rows = value.get("clips") if isinstance(value, dict) else None
     if not isinstance(rows, list):
         raise ModelFormatError("clips须为对象列表，scene_id仅使用本次P编号。")
     groups, discarded = defaultdict(list), []
+    clips = list(dict.fromkeys(c["_safety_key"] for _, c in aliases.values()))
+    clip_pairs = {f"C{i}": [a for a, (_, c) in aliases.items() if c["_safety_key"] == key]
+                  for i, key in enumerate(clips, 1)}
     for row in rows:
         alias = row.get("scene_id") if isinstance(row, dict) else None
+        if require_owner and len({s.id for s, _ in aliases.values()}) == 1 and \
+                isinstance(alias, str) and alias not in aliases and row.get("unit_id") == "U1":
+            matches = clip_pairs.get(alias, [])
+            if len(matches) == 1:
+                alias = matches[0]
         if not isinstance(alias, str) or alias not in aliases:
             discarded.append(row)
         else:
@@ -186,8 +195,9 @@ def _match_pairs(value, aliases, references, with_images, *, relevance=True, req
         items = groups[alias]
         if len(items) != 1:
             result.append({"scene_id": candidate["_review_id"], "_pair": alias, "_usability_valid": False,
-                "_raw_response": {"replies": items}, "_validation_issues": [{"field": "scene_id", "category": "pair_identity",
-                    "message": "当前pair缺少回复或存在重复回复，不能猜测结果。"}]})
+                "_raw_response": {"replies": items, "unassigned_replies": discarded},
+                "_validation_issues": [{"field": "scene_id", "category": "pair_identity",
+                    "message": f"当前P需要恰好一条回复，实际{len(items)}条；逐帧或冲突回复不能合并猜测。"}]})
             continue
         original = items[0]
         if require_owner and original.get("unit_id") != "U1":
@@ -217,8 +227,51 @@ def _match_pairs(value, aliases, references, with_images, *, relevance=True, req
                 checked = trimmed
                 checked["normalization"] = {"rule": "negative-citation-limit-v1", "original_count": len(ids)}
         checked.update(_pair=alias, _raw_response=original)
+        if original["scene_id"] != alias:
+            checked["normalization"] = {"rule": "unique-clip-pair-v1", "from": original["scene_id"], "to": alias}
         result.append(checked)
     return {"clips": result, "discarded_replies": discarded}
+
+
+def _repair_feedback(aliases, references, repair):
+    """Carry actual bad rows into the reduced batch using its frozen alias catalog."""
+    current_pairs = {c["_review_key"]: a for a, (_, c) in aliases.items()}
+    current_clips = {key: f"C{i}" for i, key in enumerate(dict.fromkeys(c["_safety_key"] for _, c in aliases.values()), 1)}
+    current_refs = {value: key for key, value in references.items()}
+    feedback = []
+    for alias, (segment, candidate) in aliases.items():
+        old = repair[candidate["_review_key"]]
+        previous_aliases = old["aliases"]
+        pair_ids = {a: current_pairs.get(c["_review_key"], "outside:" + a) for a, (_, c) in previous_aliases.items()}
+        clip_ids = {f"C{i}": current_clips.get(key, f"outside:C{i}") for i, key in
+                    enumerate(dict.fromkeys(c["_safety_key"] for _, c in previous_aliases.values()), 1)}
+        subtitle_ids = {a: current_refs.get(real, "outside:" + a) for a, real in old["references"].items()}
+        raw = old["previous"]
+        rows = raw.get("replies", []) + raw.get("unassigned_replies", []) if isinstance(raw, dict) and "replies" in raw else [raw]
+
+        def remap(value, catalog):
+            return catalog.get(value, "invalid:" + value) if isinstance(value, str) else value
+
+        previous = []
+        for original in rows:
+            if not isinstance(original, dict):
+                previous.append(original)
+                continue
+            row = dict(original)
+            if "scene_id" in row:
+                row["scene_id"] = remap(row["scene_id"], {**pair_ids, **clip_ids})
+            if "unit_id" in row:
+                row["unit_id"] = remap(row["unit_id"], {"U1": "U1", segment.id: "U1"})
+            if isinstance(row.get("subtitle_ids"), list):
+                row["subtitle_ids"] = [remap(x, subtitle_ids) for x in row["subtitle_ids"]]
+            if isinstance(row.get("supports"), list):
+                row["supports"] = [{**s, "subtitle_ids": [remap(x, subtitle_ids) for x in s["subtitle_ids"]]}
+                    if isinstance(s, dict) and isinstance(s.get("subtitle_ids"), list) else s for s in row["supports"]]
+            previous.append(row)
+        feedback.append({"expected_scene_id": alias, "expected_unit_id": "U1",
+            "returned_scene_ids": [r.get("scene_id") for r in rows if isinstance(r, dict)],
+            "previous": previous, "issues": old["issues"]})
+    return feedback
 
 
 class MaterialRetriever:
@@ -773,6 +826,12 @@ class MaterialRetriever:
         references = saved.get("subtitle_aliases")
         if saved.get("key") != identity or not isinstance(references, dict):
             return
+        if metadata.get("review_protocol") == REVIEW_PROTOCOL:
+            clips = {c["_safety_key"]: c for _, c in aliases.values()}
+            expected_refs = {f"C{i}:L{j}": row["id"] for i, c in enumerate(clips.values(), 1)
+                             for j, row in enumerate(c["subtitle_entries"], 1)}
+            if len({s.id for s, _ in aliases.values()}) != 1 or references != expected_refs or metadata.get("subtitle_aliases") != references:
+                return
         if receipt:
             relative = f"candidates/review-{identity[:24]}.json"
             if metadata.get("candidate_file") != relative or len({s.id for s, _ in aliases.values()}) != 1:
@@ -795,24 +854,31 @@ class MaterialRetriever:
                     self._remember(segment, candidate, row, cached=True, request_file=request_file)
             saved["application_complete"] = True
             return
-        rows = []
-        for alias, (segment, candidate) in aliases.items():
-            for review in saved.get("reviews", []):
-                if isinstance(review, dict) and review.get("response_stage") == "normalized_model_reply" and \
-                        (review.get("unit_id"), review.get("review_id"), review.get("source_start"), review.get("source_end")) == \
-                        (segment.id, candidate["_review_id"], candidate["source_start"], candidate["source_end"]) and \
-                        isinstance(review.get("response"), dict):
-                    rows.append({**review["response"], "scene_id": alias})
-        if not rows:
-            return
-        result = _match_pairs({"clips": rows}, aliases, references, verify_visual, require_owner=metadata.get("review_protocol") == REVIEW_PROTOCOL)
+        current_reply = metadata.get("review_protocol") == REVIEW_PROTOCOL and len({s.id for s, _ in aliases.values()}) == 1 and \
+            isinstance(saved.get("parsed_response"), dict)
+        value = saved.get("parsed_response") if current_reply else {"clips": []}
+        if not current_reply:
+            for alias, (segment, candidate) in aliases.items():
+                for review in saved.get("reviews", []):
+                    if isinstance(review, dict) and review.get("response_stage") == "normalized_model_reply" and \
+                            (review.get("unit_id"), review.get("review_id"), review.get("source_start"), review.get("source_end")) == \
+                            (segment.id, candidate["_review_id"], candidate["source_start"], candidate["source_end"]) and \
+                            isinstance(review.get("response"), dict):
+                        value["clips"].append({**review["response"], "scene_id": alias})
+        result = _match_pairs(value, aliases, references, verify_visual, require_owner=metadata.get("review_protocol") == REVIEW_PROTOCOL)
         for row in result["clips"]:
             segment, candidate = aliases[row["_pair"]]
             key = candidate["_review_key"]
-            if key in self.candidate_progress or self.store.cache_get(candidate["library_id"], key) is not None:
+            progress = self.candidate_progress.get(key, {})
+            latest_pending = current_reply and verify_visual and progress.get("state") == "unconfirmed" and \
+                progress.get("request_file") == request_file and not saved.get("error")
+            if (progress and not latest_pending) or self.store.cache_get(candidate["library_id"], key) is not None:
                 continue  # Current cached conclusions take precedence over an older incomplete reply.
-            if row.get("facts_match") is False and row.get("normalization") and not row["_validation_issues"]:
+            if not row["_validation_issues"] and (latest_pending or (row.get("facts_match") is False and row.get("normalization"))):
                 row["review_scope"] = REVIEW_SCOPE_VERSION
+                if current_reply:
+                    row["review_protocol"] = REVIEW_PROTOCOL
+                self._load_exclusions(candidate, gateway)
                 self.store.cache_put(candidate["library_id"], key, {k: v for k, v in row.items() if not k.startswith("_")})
                 self._remember(segment, candidate, row, cached=True, request_file=request_file)
             elif row["_validation_issues"]:
@@ -1085,53 +1151,50 @@ class MaterialRetriever:
                     "subtitles": [{"id": f"{ca[key]}:L{i}", "text": row["text"]} for i, row in enumerate(c["subtitle_entries"], 1)]}
                     for key, c in clips.items()],
                 "pairs": [{"scene_id": alias, "unit": ua[s.id], "clip": ca[c["_safety_key"]]} for alias, (s, c) in aliases.items()]}
-            prompt = ("本次只有一个文案单元U1，逐一检查其pairs，每个P编号一次，回复unit_id固定U1。clips按顺序各附3图，frame_index是该素材内0至2。"
+            prompt = ("本次只有一个文案单元U1。每个pairs中的P编号恰好返回一条结果，scene_id抄P编号，不抄C编号；unit_id固定U1。"
+                "每个C素材按clips顺序附3图，三图共同审核一个镜头，不逐图返回三行。frame_index必须填本素材内整数0、1或2，不填3。"
                 "usable仅判断画面：剧情story为true，职员表/演职员名单credits、混合mixed、不明unknown为false；普通对白/歌词不因此禁用。"
-                "relation为direct/supporting/unrelated/unknown，facts_match只用true或false；具体事实仅部分满足时用false，禁止partial。"
                 "confidence必须为0至1的有限数字。人物/事件不符只影响relation/facts_match/conflicts，不得因此将story标为不可用。"
-                "evidence类须直接证据；abstract/state/transition可用有具体同向联系的辅助画面，不要求单镜头证明整套理论。"
-                "遵守人物/时期/事件/关系及avoid，提及人物不等于出现，否认不能支持建立关系；背景仅作线索，不把窗口外剧情当本镜头。"
                 "visual_evidence仅写可见动作/状态/环境，不写对白；subtitle_ids只选本素材的C编号字幕，不跨素材、不抄引文。"
-                "字幕可能仅部分重叠，不能声称整句在范围内说完。给具体短依据，拒绝理由简短，每种依据最多3条。"
-                "返回{clips:[{scene_id,unit_id:U1,usable,content_kind,reason,confidence,frame_index,relation,facts_match,visual_evidence:[],conflicts:[],subtitle_ids:[]}]}。\n")
+                "字幕可能仅部分重叠，不能声称整句在范围内说完。依据和理由简短；visual_evidence建议最多3条，conflicts和subtitle_ids各最多3项。\n")
+            example = {"scene_id": next(iter(aliases)), "unit_id": "U1", "usable": True, "content_kind": "story",
+                "reason": "当前画面与本单元缺少明确联系", "confidence": 0.8, "frame_index": 0,
+                "relation": "unrelated", "facts_match": False, "visual_evidence": [], "conflicts": [], "subtitle_ids": []}
             if batch[0][0].requirement.get("coverage_version") == COVERAGE_VERSION:
-                prompt = ("本次唯一文案单元U1，所有P候选只针对U1，不套用其他任务的人物或要求。每个P返回一次，unit_id固定U1。"
-                    "clips按顺序各附3图，frame_index是该素材内0至2。usable仅判断来源：story剧情true；credits名单/mixed混合/unknown不明false。"
+                prompt += (
                     "facts为分别需要的原子事实，可由多个镜头共同覆盖；当前镜头只列它明确支持的F编号。未见其他F是未覆盖，不能因此写conflicts。"
-                    "每项supports:{fact_id,visual_indices:[本C的0至2图片编号],subtitle_ids:[本C字幕编号],reason:具体依据}，每F最多一次。"
+                    "supports每项含fact_id（抄当前facts的id）、visual_indices（本C的0至2整数列表）、subtitle_ids（本C字幕编号列表）、reason（具体依据）；每F最多一次。"
                     "人物出现不等于事件发生，被台词提及不等于出镜，不用背景剧情补未观察到的事件；字幕只有范围重叠部分可见，不宣称完整台词已说完。"
                     "该F内部constraints只约束该事实；全局constraints约束本镜头，constraints_match表示全部全局约束满足。"
                     "conflicts只列与当前全局限制明确矛盾的内容，不列未拍到的事实，不跨F混用前世/现世或全部人物。"
                     "relation=direct表示直接支持至少一个具体F；supporting表示有具体同向联系的辅助配图；unrelated/unknown不能放行。"
                     "facts_match=true仅表示单镜头已覆盖全部F，部分满足仍false并保留supports；不输出partial。"
-                    "没有F时依据motifs判断motif_match，须与原文有明确可见联系；不能靠主题词相同凑时长。"
-                    "visual_evidence只写可见内容，subtitle_ids最多3个本C编号，各依据列表最多3项。confidence为0至1有限数。"
-                    "返回{clips:[{scene_id,unit_id:U1,usable,content_kind,reason,confidence,frame_index,relation,facts_match,"
-                    "constraints_match,motif_match,visual_evidence:[],conflicts:[],subtitle_ids:[],supports:[{fact_id,visual_indices:[],subtitle_ids:[],reason}]}]}。\n")
+                    "facts为空时supports必须为[]，不得编造空fact_id、M1或“无”；依据motifs判断motif_match，须与原文有明确可见联系，不能靠主题词相同凑时长。"
+                    "constraints_match、motif_match、facts_match只用布尔值。\n")
+                example.update(constraints_match=True, motif_match=False, supports=[])
+            else:
+                prompt += ("relation为direct/supporting/unrelated/unknown，facts_match只用true或false，部分满足用false。"
+                    "evidence类须直接证据；abstract/state/transition可用有具体同向联系的辅助画面，不要求单镜头证明整套理论。"
+                    "遵守人物/时期/事件/关系及avoid；提及人物不等于出现，否认不能支持建立关系；背景仅作线索，不用窗口外剧情补本镜头。\n")
             if not with_images:
-                prompt = prompt.replace("clips按顺序各附3图，frame_index是该素材内0至2。", "本次无新图，已独立检查画面可用性；据范围字幕和已有描述核对内容，不明细节标unknown。")
+                prompt = prompt.replace(
+                    "每个C素材按clips顺序附3图，三图共同审核一个镜头，不逐图返回三行。frame_index必须填本素材内整数0、1或2，不填3。",
+                    "本次无新图，已独立检查画面可用性；据范围字幕和已有描述核对内容，不明细节标unknown，supports.visual_indices必须为[]。")
             if _safety_only:
                 prompt = ("仅检查实际画面可用性，每个P编号一次。每个C按顺序附3张图，frame_index为该C内0至2。"
                     "story剧情为usable=true；职员表/演职员名单credits、混合mixed、不明unknown为false。普通对白、歌词不因此禁用。"
-                    "返回{clips:[{scene_id,usable,content_kind,reason,confidence,frame_index}]}，不判断文案关系。\n")
+                    "三图共同审核一个镜头，不逐图返回三行；scene_id抄P编号，不抄C编号。不判断文案关系。\n")
+                example = {k: example[k] for k in ("scene_id", "usable", "content_kind", "reason", "confidence", "frame_index")}
+                example["reason"] = "画面为剧情内容"
                 payload = {"clips": [{"id": ca[key]} for key in clips],
                            "pairs": [{"scene_id": a, "clip": ca[c["_safety_key"]]} for a, (_, c) in aliases.items()]}
+            prompt += ("以下为一条结果的合法JSON结构示例，不预设结论，字段值按实际观察填写；实际clips须覆盖pairs的每个P一次："
+                       + json.dumps({"clips": [example]}, ensure_ascii=False, separators=(",", ":")) + "\n")
             if _repair:
-                reverse = {value: key for key, value in references.items()}
-                feedback = []
-                for alias, (_, candidate) in aliases.items():
-                    old = _repair[candidate["_review_key"]]
-                    previous = {k: v for k, v in old["previous"].items() if k in (
-                        "usable", "content_kind", "reason", "confidence", "frame_index", "relation", "facts_match",
-                        "visual_evidence", "conflicts", "subtitle_ids", "unit_id", "supports", "constraints_match", "motif_match")}
-                    if isinstance(previous.get("subtitle_ids"), list):
-                        previous["subtitle_ids"] = [reverse.get(x, "invalid:"+str(x)) for x in previous["subtitle_ids"]]
-                    if isinstance(previous.get("supports"),list):
-                        previous["supports"] = [{**s,"subtitle_ids":[reverse.get(x,"invalid:"+str(x)) for x in s["subtitle_ids"]]}
-                                                 if isinstance(s,dict) and isinstance(s.get("subtitle_ids"),list) else s for s in previous["supports"]]
-                    feedback.append({"scene_id": alias, "previous": previous, "issues": old["issues"]})
-                payload["repair"] = feedback
-                prompt += "这是一次失败条目的局部纠错。原回复只作待修数据，按当前P/C目录修正字段；证据不足应明确不匹配，不为了通过而改成true。\n"
+                payload["repair"] = _repair_feedback(aliases, references, _repair)
+                prompt += ("这是一次失败条目的局部纠错。previous保留实际坏行，已换成当前目录编号；returned_scene_ids保留旧回复原编号，仅作诊断。"
+                    "outside:/invalid:表示当前目录外或错误引用。按expected_scene_id和当前U/P/C目录输出完整结果；证据不足应明确不匹配，不为了通过而改成true。\n")
+                prompt += "frame_index_valid是本地标记，不要输出；若为false，旧frame_index可能是默认值，须根据图片重新选0至2。\n"
             prompt = prompt+json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             identity = stable_hash((PROPOSAL_VERSION, [(s.id, c["_review_key"]) for s, c in batch], with_images))
             if _repair:
@@ -1173,7 +1236,7 @@ class MaterialRetriever:
                 return _match_pairs(value, aliases, references, with_images, relevance=not job["safety_only"], require_owner=not job["safety_only"])
             previous_after = gateway.after_request
             def after(details):
-                outcome["requests"].append({k: details[k] for k in ("request_file", "usage", "http_status") if k in details})
+                outcome["requests"].append({k: details[k] for k in ("request_file", "response_file", "usage", "http_status") if k in details})
                 if previous_after:
                     previous_after(details)
             gateway.context.update(stage="检查句意与实际镜头", segment=job["unit_id"])
@@ -1217,11 +1280,12 @@ class MaterialRetriever:
             "parsed_response": outcome["parsed_response"], "error": outcome["error"], "discarded_replies": result.get("discarded_replies", []),
             "receipt_version": "frozen-review-receipt-v1", "application_complete": False}
         write_json(path, audit)  # A received reply must survive failure during cache application.
-        approved, deferred = [], []
+        approved, deferred, summary = [], [], Counter()
         request_file = outcome["requests"][-1].get("request_file") if outcome["requests"] else None
         for row in result["clips"]:
             segment, candidate = aliases[row["_pair"]]
             if candidate["_review_key"] in job.get("skip_keys", ()):
+                summary["cached"] += 1
                 continue  # Recovery never overwrites a conclusion already present under the exact current key.
             owner, frozen = job["frozen"][row["_pair"]]
             if owner.id != segment.id or owner.requirement != segment.requirement or any(candidate.get(k) != frozen.get(k) for k in
@@ -1231,6 +1295,15 @@ class MaterialRetriever:
                 candidate["frame_paths"] = frozen["frame_paths"]
             candidate.pop("proposal_version", None)
             row.update(review_scope=REVIEW_SCOPE_VERSION, review_protocol=REVIEW_PROTOCOL)
+            issues = row["_validation_issues"]
+            if issues:
+                summary["visual_unconfirmed" if any(i["category"] == "unknown_visual" for i in issues) else "protocol_unconfirmed"] += 1
+            elif not row["usable"]:
+                summary["source_excluded"] += 1
+            elif not job["safety_only"]:
+                summary["content_matched" if match_allowed({**candidate, **row, "pending_review": False,
+                    "match_policy": MATCH_POLICY_VERSION, "visual_checked": candidate["_verify_visual"]}, segment.requirement)
+                        else "content_rejected"] += 1
             if job["with_images"] and row["_usability_valid"]:
                 safety = {k: row[k] for k in ("scene_id", "usable", "content_kind", "reason")}
                 safety["scope"] = REVIEW_SCOPE_VERSION
@@ -1249,11 +1322,13 @@ class MaterialRetriever:
                 if (not job["safety_only"] or row["_validation_issues"]) and self._remember(segment, candidate, row, request_file=request_file) and not job["safety_only"]:
                     approved.append(candidate)
         audit["value"] = [{k: v for k, v in c.items() if k != "_requirement"} for c in approved]
+        audit["review_summary"] = {**summary, "approved": len(approved)}
         audit["application_complete"] = True
         write_json(path, audit)
         followups = []
         if deferred:
-            repair = {c["_review_key"]: {"previous": row, "issues": row["_validation_issues"]} for _, c, row in deferred}
+            repair = {c["_review_key"]: {"previous": row["_raw_response"], "issues": row["_validation_issues"],
+                "aliases": aliases, "references": references} for _, c, row in deferred}
             followups.extend(self.prepare_reviews([(s, c) for s, c, _ in deferred], gateway, directory,
                 search_round=job["search_round"], _safety_only=job["safety_only"], _repair=repair))
         if job["safety_only"]:

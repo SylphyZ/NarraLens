@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.11**
+**Manuscript-driven video production · v2.7.12**
 
 [简体中文](README.md) · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.11 provides seven workspaces:
+Version 2.7.12 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -151,13 +151,17 @@ Version 2.7.10 schedules footage reviews across independent manuscript units wit
 
 Version 2.7.11 repairs requirement replies with uniquely resolvable zero-padding differences and JSON-identical duplicates. Conflicting results, wrong or ambiguous IDs and invalid original-text ranges remain blocked. Correction feedback includes the actual returned IDs and rows. Pending requirements may reuse the latest saved reply only after verifying its complete input identity and passing the existing validator. Compatible successful caches and 2.7.10 concurrency remain unchanged. Restart and resume from **3. Find footage**. Offline debugging with saved replies passed; no model calls or full generation were run.
 
+Version 2.7.12 fixes footage review IDs and correction feedback. Within one manuscript unit, a clip ID may map to a pair ID only when the current catalog proves a unique match; conflicting duplicate rows remain blocked. Corrections retain actual bad rows and rebind unit, pair, clip and subtitle IDs to the current batch. Empty fact lists explicitly require empty supports. Additional valid visual evidence no longer triggers another visual request just for exceeding three entries. Progress distinguishes initial reviews, corrections and sub-batches; redacted raw replies are linked to audits. Successful caches remain reusable. Only the latest recorded unconfirmed reply with the same input identity is eligible for local revalidation. Restart and resume from **3. Find footage**. Offline replay of 276 saved replies preserved all 148 previously valid rows and validated 34 additional rows locally. These are protocol results, not 34 additional usable shots; live model and full-video acceptance remain separate.
+
 Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
 
 Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
 
 ## Version and documentation
 
-Version 2.7.11 fixes requirement ID matching, identical duplicate rows and missing correction data, with controlled recovery of paid pending replies. Offline debugging and static review are recorded separately; live model and full-video acceptance remain pending.
+Version 2.7.12 repairs footage review identity handling, correction feedback and progress reporting, and records redacted raw replies. Identity and evidence-list formatting fixes retain content, citation, credits and allocation checks. Offline replay passed; no live model or video generation was run.
+
+Version 2.7.11 fixed requirement ID matching, identical duplicate rows and missing correction data, with controlled recovery of paid pending replies. Offline debugging and static review are recorded separately; live model and full-video acceptance remain pending.
 
 Version 2.7.10 added configurable footage review concurrency, defaulting to 4 with the same serial path at 1. Frozen inputs, shared validation and task-thread commits support batch allocation and paid-result recovery. Static review is recorded separately from live concurrency, token and full-generation acceptance, which remain pending.
 

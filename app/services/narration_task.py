@@ -655,6 +655,7 @@ class _ReviewCoordinator(AnalysisCoordinator):
         self.metrics, self.inflight = metrics, []
         self.followups, self.progress = [], None
         self.last_reply = None
+        self.sub_batch, self.wave_completed = 0, 0
 
     def client(self, job):
         client = copy(self.gateway)
@@ -710,6 +711,7 @@ class _ReviewCoordinator(AnalysisCoordinator):
                     descriptor.update(state="returned", approved=len(approved), error=event[2]["error"])
                     self.metrics["completed_jobs"] += 1
                     self.metrics["approved_pairs"] += len(approved)
+                    self.wave_completed += 1
         now = time.monotonic()
         if self.progress and (force or now-self.reported >= 1):
             self.reported = now
@@ -717,13 +719,16 @@ class _ReviewCoordinator(AnalysisCoordinator):
                 active, limit = self.active, self.limit
             recent = time.strftime("%H:%M:%S", time.localtime(self.last_reply)) if self.last_reply else "尚无"
             done = sum(row["state"] != "queued" for row in self.inflight)
+            phases = "、".join(dict.fromkeys(row["phase"] for row in self.inflight))
             status = "停止派发，保存已返回结果" if self.abort.is_set() or (self.stop is not None and self.stop.is_set()) else "审核"
-            self.progress(f"{status}并发{active}/{limit}（设置{self.configured}）；第{self.metrics['waves']}波 "
-                          f"{done}/{len(self.inflight)}；单元{'、'.join(dict.fromkeys(r['unit_id'] for r in self.inflight))}；最近回包{recent}")
+            self.progress(f"{status}并发{active}/{limit}（设置{self.configured}）；第{self.metrics['waves']}波·第{self.sub_batch}批 "
+                          f"{phases} {done}/{len(self.inflight)}（本波已完成{self.wave_completed}个请求）；"
+                          f"单元{'、'.join(dict.fromkeys(r['unit_id'] for r in self.inflight))}；最近回包{recent}")
 
     def run(self, jobs, checkpoint, progress):
         self.progress = progress
         self.metrics["waves"] += 1
+        self.sub_batch, self.wave_completed = 0, 0
         started = time.monotonic()
         pending = list(jobs)
         submitted = set()
@@ -743,9 +748,12 @@ class _ReviewCoordinator(AnalysisCoordinator):
                         selected.append(job)
                         units.add(job["unit_id"])
                 submitted.update(job["key"] for job in selected)
+                self.sub_batch += 1
                 self.inflight = [{"key": j["key"], "unit_id": j["unit_id"], "file": j["file"], "state": "queued",
                     "review_keys": [c["_review_key"] for _, c in j["aliases"].values()],
-                    "safety_only": j["safety_only"], "repair": j["repair"]} for j in selected]
+                    "safety_only": j["safety_only"], "repair": j["repair"],
+                    "phase": ("来源纠错" if j["repair"] else "来源检查") if j["safety_only"] else
+                             ("局部纠错" if j["repair"] else "初审")} for j in selected]
                 self.followups = []
                 self.metrics["submitted_jobs"] += len(selected)
                 self.metrics["review_candidates"] += sum(len(j["aliases"]) for j in selected)
