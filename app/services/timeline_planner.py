@@ -11,7 +11,6 @@ from app.services.library.store import stable_hash
 
 VISUAL_POLICY_VERSION = "unique-source-credits-v1"
 MATCH_POLICY_VERSION = "semantic-visual-units-v1"
-PROPOSAL_VERSION = "token-shortlist-v1"
 COVERAGE_VERSION = "atomic-fact-coverage-v1"
 
 
@@ -103,29 +102,11 @@ def source_shot_key(item):
 
 
 def unused_source(item, used):
-    return not any(previous["fingerprint"] == item["fingerprint"] and (
+    return not any((item.get("duplicate_group") and previous.get("duplicate_group") == item["duplicate_group"]) or previous["fingerprint"] == item["fingerprint"] and (
         source_shot_key(previous) == source_shot_key(item) or
         min(previous["natural_end"], item["natural_end"]) - max(previous["natural_start"], item["natural_start"]) > .000001 or
         min(previous["source_end"], item["source_end"]) - max(previous["source_start"], item["source_start"]) > .000001
     ) for previous in used)
-
-
-def natural_candidates(candidates, scene_boundaries, assets):
-    """Split windows at real cuts, retaining the full cut identity for deduplication."""
-    asset_map = {asset["id"]: asset for asset in assets}
-    result = []
-    for candidate in candidates:
-        asset = asset_map[candidate["asset_id"]]
-        if not asset.get("fingerprint") or not math.isfinite(asset["fps"]) or asset["fps"] <= 0:
-            raise ValueError("素材指纹或帧率缺失，请更新素材登记后继续。")
-        for left, right in zip(scene_boundaries[asset["id"]], scene_boundaries[asset["id"]][1:]):
-            start = max(left, candidate["source_start"]) + .12
-            end = min(right, candidate["source_end"]) - .12
-            if end - start >= 2:
-                result.append({**candidate, "source_start": start, "source_end": end,
-                               "fingerprint": asset["fingerprint"], "fps": asset["fps"],
-                               "natural_start": left, "natural_end": right})
-    return result
 
 
 def make_visual_policy(assets, boundaries, approved, forbidden=(), *, visual_plan):
@@ -165,7 +146,7 @@ def visual_unit_intervals(unit, reservations):
     return intervals
 
 
-def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_seconds, *, visual_units, reservations, used, preview=False):
+def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_seconds, *, visual_units, reservations, used):
     """Allocate scarce factual footage first; only a complete attempt is committed."""
     shots, gaps = list(reservations), []
     allocated = list(used)
@@ -181,8 +162,7 @@ def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_secon
             return False
         approved = (item.get("visual_policy") == VISUAL_POLICY_VERSION and item.get("usable") is True
                     and item.get("content_kind") == "story" and match_allowed(item, unit["requirement"]))
-        return approved or (preview and item.get("proposal_version") == PROPOSAL_VERSION
-                            and item.get("pending_review") is True and item.get("usable") is not False)
+        return approved
 
     pools = {unit["id"]: [item for item in candidates_by_segment.get(unit["id"], []) if eligible(item, unit)] for unit in visual_units}
 
@@ -218,9 +198,9 @@ def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_secon
                 missing = [identifier for identifier in required if identifier not in covered]
                 def coverage_rank(item):
                     facts = candidate_facts(item, unit["requirement"])
-                    return (3 if missing and missing[0] in facts else 2 if missing and item.get("pending_review") else 1 if not missing else 0)
+                    return (3 if missing and missing[0] in facts else 1 if not missing else 0)
                 pool = sorted((item for item in candidates if unused_source(item, trial_used)),
-                              key=lambda item: (coverage_rank(item), not item.get("pending_review", False), item.get("relation") == "direct",
+                              key=lambda item: (coverage_rank(item), item.get("relation") == "direct",
                                                 item.get("confidence", item.get("proposal_score", 0))), reverse=True)
                 chosen = None
                 for candidate in pool if remaining >= minimum-.001 else []:
@@ -228,13 +208,14 @@ def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_secon
                     prefix = []
                     possible = set(candidate_facts(candidate,unit["requirement"]))
                     for identifier in missing:
-                        if identifier not in possible:
+                        if identifier in possible:
+                            prefix.append(identifier)
+                        elif unit["requirement"].get("ordered", True):
                             break
-                        prefix.append(identifier)
-                    if missing and not prefix and candidate.get("pending_review") is not True:
+                    if missing and not prefix:
                         continue
                     total_remaining = remaining+sum(b-a for a,b in intervals[interval_index+1:])
-                    reserve = minimum*(len(missing)-len(prefix)) if missing and candidate.get("pending_review") is not True else 0
+                    reserve = minimum*(len(missing)-len(prefix)) if missing else 0
                     maximum_length = min(available,remaining,total_remaining-reserve)
                     other_capacity = sum(item["source_end"]-item["source_start"] for item in pool
                                          if source_shot_key(item) != source_shot_key(candidate))
@@ -288,21 +269,15 @@ def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_secon
             failure = {"visual_unit_id":unit["id"], "segment_id":unit["segment_id"], "start":unit["start"], "end":unit["end"],
                        "category":"fact_coverage", "missing_seconds":round(sum(b-a for a,b in intervals),3),
                        "missing_facts":missing, "reason":"实际采用镜头尚未覆盖具体事实："+"、".join(missing)}
-        if not failure and intervals and required and fact_sequence(trial,trial_used) != required:
+        if not failure and intervals and required and unit["requirement"].get("ordered", True) and fact_sequence(trial,trial_used) != required:
             failure = {"visual_unit_id":unit["id"],"segment_id":unit["segment_id"],"start":unit["start"],"end":unit["end"],
                        "category":"fact_order","missing_seconds":round(sum(b-a for a,b in intervals),3),"reason":"具体事实首次出现顺序与原文不符，需调整镜头编排。"}
         if failure:
             gaps.append(failure)
-        if not failure or preview:
+        if not failure:
             shots.extend(trial)
             allocated = trial_used
     return sorted(shots, key=lambda row: row.timeline_start), gaps
-
-
-def propose_visual_timeline(segments, candidates_by_unit, target_shot_seconds=7.0, *, visual_units, reservations=()):
-    """A partial, unapproved proposal may choose what to inspect, never what to render."""
-    return _allocate_visual_timeline(segments, candidates_by_unit, target_shot_seconds,
-                                    visual_units=visual_units, reservations=reservations, used=(), preview=True)
 
 
 def plan_visual_timeline(segments, candidates_by_segment, target_shot_seconds=7.0, scene_boundaries=None, *, visual_units=(), reservations=(), used=()):
@@ -423,7 +398,8 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
                     raise ValueError("镜头审核与真实切镜范围不一致，请从3. 寻找画面继续。")
                 physical = {"fingerprint": identity, "fps": asset.get("fps", 30),
                             "natural_start": boundaries[index], "natural_end": boundaries[index + 1],
-                            "source_start": shot.source_start, "source_end": shot.source_end}
+                            "source_start": shot.source_start, "source_end": shot.source_end,
+                            "duplicate_group": approved.get("duplicate_group", "") if policy is not None else ""}
                 if not unused_source(physical, used):
                     raise ValueError(f"段落 {shot.segment_id} 再次使用同一自然镜头，请从3. 寻找画面重新编排。")
                 used.append(physical)
@@ -447,5 +423,5 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
             missing = {f["id"] for f in unit["requirement"].get("facts",[])}-fact_coverage[identifier]
             if unit["requirement"].get("coverage_version") == COVERAGE_VERSION and missing:
                 raise ValueError(f"画面单元{identifier}的实际镜头未覆盖事实{sorted(missing)}，请从3. 寻找画面继续。")
-            if unit["requirement"].get("coverage_version") == COVERAGE_VERSION and unit["requirement"].get("facts") and fact_sequence(original,policy["approved"]) != [f["id"] for f in unit["requirement"]["facts"]]:
+            if unit["requirement"].get("coverage_version") == COVERAGE_VERSION and unit["requirement"].get("facts") and unit["requirement"].get("ordered", True) and fact_sequence(original,policy["approved"]) != [f["id"] for f in unit["requirement"]["facts"]]:
                 raise ValueError(f"画面单元{identifier}的事实出现顺序与原文不符，请从3. 寻找画面继续。")

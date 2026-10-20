@@ -1,6 +1,7 @@
 """Local directory import and reusable material-library management."""
 
 from pathlib import Path
+import json
 
 import pandas as pd
 import streamlit as st
@@ -15,7 +16,7 @@ from webui.components.model_settings import seed_model_choices, render_model_cho
 from app.services.library.indexer import VIDEO_EXTENSIONS, SUBTITLE_EXTENSIONS, scan_directory, suggest_mappings, import_materials, build_library, audit_subtitles, restore_subtitle_text, rollback_subtitle_text
 from app.services.library.store import LibraryStore, _json_access, library_ids, read_json, write_json
 from app.services.subtitle_text import decode_subtitle_bytes
-from webui.utils.file_utils import folder_input
+from webui.utils.file_utils import folder_input, remembered_expander
 
 
 def _remember_library_selection(store, widget_key, multiple, tr):
@@ -47,7 +48,7 @@ def choose_library(store, tr, key="library_choice", multiple=False):
         st.info(tr("请先在视频素材库页面创建一个视频素材库。"))
         return [] if multiple else None
     identifiers = [item["id"] for item in libraries]
-    labels = {item["id"]: item["name"] for item in libraries}
+    labels = {item["id"]: item["name"] + (" · 旧窗口库" if store.schema(item["id"]) != 2 else " · 内容拉片") for item in libraries}
     try:
         saved = read_json(store.root / "ui-selection.json", default={})
     except (OSError, ValueError) as exc:
@@ -169,6 +170,132 @@ def _subtitle_settings(subtitles, defaults, tr, prefix):
     return settings
 
 
+@st.fragment
+def _work_panel(store, library_id, tr, busy):
+    from app.services.library.knowledge import save_work, fetch_bangumi
+    with remembered_expander(tr("作品与资料"), key="work_panel_"+library_id) as panel:
+        if not panel.open:
+            return
+        work = store.cache_get(library_id, "work") or {}
+        title = st.text_input(tr("作品名称"), value=work.get("title",""), key="work_title_"+library_id)
+        adaptation = st.text_input(tr("改编版本"), value=work.get("adaptation","动画"), key="work_adaptation_"+library_id,
+                                   help=tr("例如电视动画第一版。小说、漫画和动画不要混用为画面事实。"))
+        season = st.text_input(tr("季／篇章"), value=work.get("season",""), key="work_season_"+library_id)
+        upload = st.file_uploader(tr("导入作品资料 MD／TXT"),type=["md","txt"],key="work_file_"+library_id)
+        if upload is not None and st.button(tr("载入文档"),key="work_load_"+library_id):
+            st.session_state["work_notes_"+library_id] = upload.getvalue().decode("utf-8-sig")
+        if "work_notes_"+library_id not in st.session_state:
+            st.session_state["work_notes_"+library_id] = work.get("notes","")
+        notes = st.text_area(tr("人物别名、时期与剧情说明"),key="work_notes_"+library_id,height=180)
+        st.caption(tr("可用“## 第 4 集”区分单集资料；未分集的说明用于全部素材。资料辅助理解，不代替本地证据。"))
+        cards = st.text_area(tr("人物卡与参考镜头（JSON，可选）"),
+            value=json.dumps(work.get("characters",[]),ensure_ascii=False,indent=2),key="work_cards_"+library_id,
+            help=tr('格式：[{"name":"鲁迪","aliases":["鲁迪乌斯"],"period":"现世幼年","reference_ranges":["R..."],"identity_basis":"人工核对"}]'))
+        mapping = st.text_input(tr("集号映射（JSON，可选）"),value=json.dumps(work.get("episode_map",{}),ensure_ascii=False),
+                                key="work_mapping_"+library_id,help=tr('例如 {"1":13}：本库第1集对应外部第13集。'))
+        if st.button(tr("保存作品资料"),disabled=busy,key="save_work_"+library_id):
+            try:
+                characters, episode_map = json.loads(cards), json.loads(mapping)
+                if not isinstance(characters,list) or any(not isinstance(c,dict) or not isinstance(c.get("name"),str) for c in characters):
+                    raise ValueError("人物卡须为带name的对象列表。")
+                if not isinstance(episode_map,dict) or any(not str(k).isdigit() or not isinstance(v,(int,float)) for k,v in episode_map.items()):
+                    raise ValueError("集号映射须为编号到编号的对象。")
+                save_work(store,library_id,{**work,"title":title,"adaptation":adaptation,"season":season,
+                                          "notes":notes,"characters":characters,"episode_map":episode_map})
+                st.success(tr("资料已保存。继续拉片时仅重新分析资料身份改变的范围。"))
+            except (ValueError,OSError) as exc:
+                st.error(str(exc))
+        source = st.text_input(tr("Bangumi 作品链接或编号"),value=work.get("external",{}).get("source",""),key="work_source_"+library_id)
+        if st.button(tr("获取并保存公开资料"),disabled=busy or not source.strip(),key="fetch_work_"+library_id):
+            try:
+                with st.spinner(tr("获取作品、角色与章节资料")):
+                    external = fetch_bangumi(source, config.proxy)
+                current = store.cache_get(library_id,"work") or work
+                save_work(store,library_id,{**current,"external":external})
+                st.success(tr("公开资料已保存；请核对对应的动画版本和集号。"))
+            except Exception as exc:
+                st.warning(tr("外部资料获取失败，已有资料保留，本地拉片仍可继续：")+str(exc))
+        if work.get("external"):
+            st.caption(tr("资料来源：")+work["external"]["source"])
+
+
+@st.fragment
+def _content_panel(store, library_id, tr, busy):
+    with remembered_expander(tr("内容浏览与质量修正"),key="content_panel_"+library_id) as panel:
+        if not panel.open:
+            return
+        ranges, events = store.records(library_id), store.records(library_id,"contents")
+        ready = sum(r.get("analysis_state")=="ready" for r in ranges)
+        st.caption(f"{len(events)} 个内容段 · {len(ranges)} 个镜头范围 · {ready} 个观察就绪 · {len(ranges)-ready} 个待确认")
+        quality = read_json(store.directory(library_id)/"analysis-quality.json",default={})
+        if quality.get("issues"):
+            st.warning(tr("最近拉片存在未完成项，继续会复用成功记录。"))
+            st.dataframe(quality["issues"][:100],width="stretch",hide_index=True)
+        usage = quality.get("token_usage",{}).get("current",{})
+        if usage:
+            st.caption(f"最近拉片已报告 Token：{sum(r.get('total_tokens',0) for r in usage.values()):,} · "
+                       f"用量未报告请求：{sum(r.get('unknown',0) for r in usage.values())}")
+        if not events:
+            st.info(tr("尚无内容目录；请建立或继续拉片。"))
+            return
+        query = st.text_input(tr("搜索事件、人物、时期或地点"),key="content_search_"+library_id)
+        by_id = {r["id"]:r for r in ranges}
+        visible = [e for e in events if not query or query.casefold() in
+                   (json.dumps(e,ensure_ascii=False)+json.dumps([by_id.get(i,{}) for i in e["range_ids"]],ensure_ascii=False)).casefold()]
+        page_key = "content_page_"+library_id
+        pages = max(1,(len(visible)+9)//10)
+        st.session_state[page_key] = min(max(1,int(st.session_state.get(page_key,1))),pages)
+        page = st.number_input(tr("内容目录页码"),min_value=1,max_value=pages,step=1,key=page_key)
+        for event in visible[(page-1)*10:page*10]:
+            with st.expander(f"第{event['episode']}集 · {event['start']:.1f}–{event['end']:.1f}s · {event.get('title','')}"):
+                st.write(event["summary"])
+                st.caption(event["id"])
+                rid = st.selectbox(tr("镜头范围"),event["range_ids"],key="range_"+event["id"])
+                item = by_id[rid]
+                frames = sorted((store.directory(library_id)/"frames"/item["fingerprint"]/rid).glob("*.jpg"))
+                if frames:
+                    st.image([str(f) for f in frames],width=160)
+                st.write(item.get("summary",""))
+                st.caption(f"时期：{item.get('period','未知')} · 观察：{item.get('coverage','')} · 来源：{item.get('content_kind','unknown')}")
+                st.dataframe(item.get("observations",[]),width="stretch",hide_index=True)
+                st.caption(tr("抽帧观察的证据时间不会自动扩展到整个未采样区间。"))
+                signatures = set(item.get("frame_signatures",[]))
+                similar = [r["id"] for r in ranges if r["id"] != rid and signatures and
+                           len(signatures & set(r.get("frame_signatures",[]))) >= min(2,len(signatures))]
+                if similar:
+                    st.info(tr("相似采样画面（请人工确认是否重复）：")+"、".join(similar[:10]))
+                if st.button(tr("预览原片此处"),key="preview_"+event["id"]):
+                    st.video(item["path"],start_time=int(item["start"]),end_time=max(int(item["start"])+1,int(item["end"])))
+                if st.button(tr("补分析当前镜头"),disabled=busy,key="enrich_"+event["id"]):
+                    from app.services.model_profiles import resolve_models
+                    try:
+                        saved = next(r["settings"] for r in store.list_libraries() if r["id"]==library_id)
+                        settings = {**saved.get("build_settings",{}),"asset_ids":[item["asset_id"]],
+                                    "range_ids":[rid],"reanalyze":True}
+                        gateway = ModelGateway(resolve_models(settings.get("model_bindings")))
+                        _launch_library_job(store,library_id,"build",lambda stop:build_library(store,library_id,gateway,settings,stop))
+                        st.rerun(scope="app")
+                    except (ValueError,OSError) as exc:
+                        st.error(str(exc))
+                with st.form("correct_"+event["id"]+"_"+rid):
+                    summary = st.text_area(tr("更正当前内容"),value=item.get("summary",""))
+                    period = st.text_input(tr("时期"),value=item.get("period",""))
+                    kind = st.selectbox(tr("画面属性"),["story","credits","opening","black","unknown"],
+                                        index=["story","credits","opening","black","unknown"].index(item.get("content_kind","unknown")))
+                    duplicate = st.text_input(tr("已确认重复画面组（可选）"),value=item.get("duplicate_group",""),
+                                              help=tr("人工确认是相同实际画面后填同一组名；相似构图不应归为重复。"))
+                    people = st.text_area(tr("出镜人物与身份依据（JSON）"),value=json.dumps(item.get("visible_people",[]),ensure_ascii=False))
+                    observations = st.text_area(tr("观察更正（JSON，保留当前帧／字幕引用）"),value=json.dumps(item["observations"],ensure_ascii=False))
+                    reason = st.text_input(tr("更正依据"))
+                    if st.form_submit_button(tr("保存本镜头更正"),disabled=busy):
+                        try:
+                            store.correct_range(library_id,rid,{"summary":summary,"period":period,"content_kind":kind,
+                                "duplicate_group":duplicate,"visible_people":json.loads(people),"observations":json.loads(observations)},reason)
+                            st.success(tr("已保存修订记录；相关匹配会重新确认，其他镜头观察保持。"))
+                        except (ValueError,OSError) as exc:
+                            st.error(str(exc))
+
+
 def render_library_panel(tr):
     st.header(tr("视频素材库"))
     st.caption(tr("视频直接引用原路径。字幕、抽帧和分析结果保存在本项目，可供不同文案复用。"))
@@ -192,10 +319,22 @@ def render_library_panel(tr):
     library = next(item for item in store.list_libraries() if item["id"] == library_id)
     saved = library["settings"]
     busy = runner.library_busy(library_id)
+    current = store.schema(library_id) == 2
+    if not current:
+        st.warning(tr("此库为旧窗口库。2.8 使用独立拉片库；可复制登记信息与字幕后重新分析，原库保留。"))
+        if st.button(tr("创建 2.8 拉片副本"), disabled=busy, key="clone_content_"+library_id):
+            try:
+                new_id = store.clone_for_analysis(library_id, library["name"]+" · 2.8")
+                st.session_state["active_library_id"] = new_id
+                st.rerun()
+            except (OSError,ValueError) as exc:
+                st.error(str(exc))
+    else:
+        _work_panel(store,library_id,tr,busy)
     if busy and not runner.running("library:" + library_id):
         st.info(tr("关联生成任务正在使用视频素材库，请等待完成后修改素材。"))
     with st.expander(tr("导入本地目录"), expanded=not store.assets(library_id)):
-        st.caption(tr("请输入运行 NarratoAI 的电脑上的目录，大视频无需浏览器上传。"))
+        st.caption(tr("请输入运行 NarraLens 的电脑上的目录，大视频无需浏览器上传。"))
         video_dir = folder_input(tr("视频目录"), value=saved.get("video_dir", str(Path(config.root_dir) / "resource" / "videos")), key="lib_video_dir_" + library_id, tr=tr)
         subtitle_dir = folder_input(tr("字幕目录（可选）"), value=saved.get("subtitle_dir", str(Path(config.root_dir) / "resource" / "srt")), key="lib_subtitle_dir_" + library_id, tr=tr)
         recursive = st.checkbox(tr("扫描子目录"), value=saved.get("recursive", True), key="lib_recursive_" + library_id)
@@ -336,22 +475,25 @@ def render_library_panel(tr):
         with st.expander(tr("模型选择")):
             render_model_choices(tr, model_prefix, roles=("text", "vision"))
         build_saved = saved.get("build_settings", {})
-        visual = st.checkbox(tr("补充视觉分析"), value=bool(build_saved.get("visual", True)), key="build_visual_" + library_id)
-        window = st.number_input(tr("分析窗口（秒）"), min_value=10, max_value=120, value=int(build_saved.get("window_seconds", 15)), step=5, key="build_window_" + library_id, disabled=busy)
+        visual = True
+        st.caption(tr("2.8 拉片联合使用图片和字幕；保存实际观察及证据后供多个文案复用。"))
+        window = st.number_input(tr("长镜头采样间距（秒）"), min_value=10, max_value=120, value=int(build_saved.get("window_seconds", 15)), step=5, key="build_window_" + library_id, disabled=busy)
         left, right = st.columns(2)
         with left:
-            batch_size = st.number_input(tr("每批最多分析场景数"), min_value=1, max_value=128,
+            batch_size = st.number_input(tr("每批最多分析镜头范围数"), min_value=1, max_value=128,
                 value=int(build_saved.get("batch_size", 50)), step=1, key="build_batch_" + library_id, disabled=busy,
-                help=tr("每个场景保持3帧；按同一视频打包。超过输入/图片预算或回复不完整时会自动拆成更小批次。"))
+                help=tr("按同一视频打包。根据镜头时长和字幕密度采样1–6帧；长镜头采样范围不是事件分段。超预算时自动减小批量。"))
         with right:
             concurrency = st.number_input(tr("API 请求并发数"), min_value=1,
                 value=int(build_saved.get("concurrency", runner.DEFAULT_API_CONCURRENCY)), step=1, key="build_concurrency_" + library_id, disabled=busy,
-                help=tr("可输入任意正整数，不设固定最大值。跨视频共享请求池，字幕/视觉/后备和剧情目录一起调度；遇到429会暂时降低实际并发。"))
+                help=tr("可输入任意正整数，不设固定最大值。跨视频共享请求池，联合观察与后备请求一起调度；遇到429会暂时降低实际并发。"))
         st.caption(tr("批量和并发只影响调度，成功场景仍逐条保存。停止后不再发新请求，正在返回的请求可能需要等待；成功结果会保留。"))
-        retry_skipped = st.checkbox(tr("重试已跳过的窗口和目录"), value=False, key="retry_skipped_" + library_id,
-                                   help=tr("普通继续复用成功结果并跳过已失败输入；勾选后才再次请求这些输入。"))
-        st.caption(tr("成功场景立即保存；部分完成的素材可用于生成，剧情目录失败不会阻止场景使用。"))
-        if st.button(tr("建立／继续视频素材库"), disabled=busy, key="build_library_" + library_id):
+        selected_assets = st.multiselect(tr("本次拉片素材（留空为全部）"),[a["id"] for a in assets],
+            format_func=lambda aid:next(f"第{a['episode']}集 · {Path(a['path']).name}" for a in assets if a["id"]==aid),key="build_assets_"+library_id)
+        reanalyze = st.checkbox(tr("重新分析所选素材的已完成观察"),value=False,key="build_force_"+library_id,
+            help=tr("正常继续只补缺失；改变模型不会清除成功观察。明确重新分析会产生新的API调用。"))
+        st.caption(tr("成功观察立即保存；事件目录未完成的部分会明确列为待处理，继续不重付成功观察费用。"))
+        if st.button(tr("建立／继续视频素材库"), disabled=busy or not current, key="build_library_" + library_id):
             try:
                 check_model_choices(model_prefix, ["text", "text_backup", *(["vision", "vision_backup"] if visual else [])])
                 gateway = ModelGateway(selected_models(model_prefix))
@@ -360,7 +502,7 @@ def render_library_panel(tr):
                     gateway.require("vision")
                 if not visual and any(not item.get("processed_path") for item in assets):
                     raise ValueError(tr("无字幕素材需要启用视觉分析。"))
-                build_settings = {"visual": visual, "window_seconds": window, "retry_skipped": retry_skipped,
+                build_settings = {"visual": visual, "window_seconds": window, "reanalyze": reanalyze, "asset_ids":selected_assets,
                                   "batch_size": batch_size, "concurrency": concurrency,
                                   "model_bindings": selected_bindings(model_prefix)}
                 current_settings = next(item["settings"] for item in store.list_libraries() if item["id"] == library_id)
@@ -369,17 +511,8 @@ def render_library_panel(tr):
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
-    scenes = store.scenes(library_id)
-    if scenes:
-        with st.expander(tr("查看场景目录")):
-            search = st.text_input(tr("查找人物、事件或主题"), key="library_search_" + library_id)
-            matching = [scene for scene in scenes if not search or search.casefold() in str(scene["analysis"]).casefold() or search in scene["transcript"]]
-            st.caption(tr("已建立场景数：") + str(len(scenes)))
-            for scene in matching[:20]:
-                st.markdown(f"**{scene['episode']} · {scene['start']:.1f}–{scene['end']:.1f}s · {scene['analysis'].get('title', '')}**")
-                st.write(scene["analysis"].get("summary", ""))
-                if scene["frame_paths"]:
-                    st.image(scene["frame_paths"][:3], width=180)
+    if current:
+        _content_panel(store,library_id,tr,busy)
 
     with st.expander(tr("删除视频素材库")):
         from app.services.narration_task import list_tasks

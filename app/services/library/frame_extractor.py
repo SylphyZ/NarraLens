@@ -225,6 +225,20 @@ def extract_frames(video_path, start, end, count, output_dir):
     return frames
 
 
+def frame_signatures(paths):
+    """Similarity hints only; repeated footage still requires human confirmation."""
+    from PIL import Image
+    signatures = []
+    for path in paths:
+        with Image.open(path) as image:
+            values = list(image.convert("L").resize((9, 8)).getdata())
+        if max(values)-min(values) < 24:
+            continue
+        bits = [values[y*9+x] > values[y*9+x+1] for y in range(8) for x in range(8)]
+        signatures.append(f"{sum(int(bit)<<i for i,bit in enumerate(bits)):016x}")
+    return signatures
+
+
 def scene_boundaries(asset, cache_file, stop=None, progress=None, diagnostic_directory=None):
     """Cache local scene-change timestamps by source fingerprint, without an API."""
     threshold = .35

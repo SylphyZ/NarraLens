@@ -14,7 +14,8 @@ from uuid import UUID, uuid4
 from loguru import logger
 
 from app.services.library.gateway import ModelGateway, ModelUsage
-from app.services.library.retriever import MaterialRetriever, RETRIEVAL_REPAIR_VERSION, CANDIDATE_QUEUE_VERSION, REVIEW_PROTOCOL
+from app.services.library.retriever import MaterialRetriever
+from app.models.library import RETRIEVAL_PROTOCOL
 from app.services.library.runner import (
     DEFAULT_CALL_BUDGET, AnalysisCoordinator, JobCancelled, api_concurrency, check_cancel, library_operation, run_analysis_jobs,
 )
@@ -545,7 +546,7 @@ def fork_task(task_id, options, voice_profile, model_profile, use_current_models
         write_json(child_directory / "settings.json", settings)
         copied = 0
         try:
-            for folder in ("planning", "candidates", "alignment/cache", "bgm/planning", "motion/planning"):
+            for folder in ("planning", "matches", "alignment/cache", "bgm/planning", "motion/planning"):
                 source_folder = source_directory / folder
                 if source_folder.is_symlink() or source_folder.is_junction():
                     raise ValueError("来源任务缓存目录是链接，请检查后再创建副本。")
@@ -769,420 +770,113 @@ class _ReviewCoordinator(AnalysisCoordinator):
 
 
 def _find_visual_shots(segments, text, visual_plan, assets, reservations, retriever, gateway, directory, options, stop, update, *, previous_plan=None):
-    """Propose globally, inspect only proposed pairs, and retain a resumable local search cursor."""
-    from app.models.timeline import NarrationSegment
-    from app.services.library.frame_extractor import scene_boundaries
+    """Search event pages; match once; let the allocator report precise shortages."""
     from app.services.timeline_planner import (
-        MATCH_POLICY_VERSION, PROPOSAL_VERSION, VisualCapacityError, source_shot_key, unused_source,
-        visual_unit_intervals, plan_visual_timeline, propose_visual_timeline,
+        _allocate_visual_timeline, visual_unit_intervals, unused_source, source_shot_key, candidate_facts,
     )
-    units = visual_plan["units"]
-    visual_segments = {u["id"]: NarrationSegment(u["id"], u["text_start"], u["text_end"], text[u["text_start"]:u["text_end"]],
-                      u["requirement"], audio_start=u["start"], audio_end=u["end"]) for u in units}
-    asset_map = {a["id"]: a for a in assets}
-    verify = bool(options.get("verify_visual", True))
-    target = float(options.get("shot_seconds", 7))
-    no_gain_limit = int(options.get("visual_no_gain_rounds", 2))
-    search_identity = (retriever.version, verify, target, gateway.signature("text_fast"),
-                       gateway.signature("text"), gateway.signature("vision"))
-    key = stable_hash((PROPOSAL_VERSION, visual_plan["key"], *search_identity))
-    search_signature = stable_hash((PROPOSAL_VERSION, *search_identity))
-    unit_signatures = {u["id"]: stable_hash(u) for u in units}
-    alignment = visual_plan.get("boundary_alignment", {})
-    base_key = alignment.get("base_plan_key") if alignment.get("version") == BOUNDARY_ALIGNMENT_VERSION else None
-    revisions = visual_plan.get("requirement_revisions", {})
-    retriever.configure_requirements(visual_segments, revisions, gateway, previous_plan=previous_plan)
-    compatible_keys = {key}
-    if not any(row.get("changed") for row in revisions.get("entries", [])):
-        compatible_keys.update(stable_hash((PROPOSAL_VERSION, value, *search_identity)) for value in
-                               (base_key, revisions.get("base_plan_key")) if value)
+    units = [u for u in visual_plan["units"] if visual_unit_intervals(u,reservations)]
+    target = float(options.get("shot_seconds",7))
+    no_gain_limit = int(options.get("visual_no_gain_rounds",2))
     path = directory/"visual_search_state.json"
-    try:
-        saved = read_json(path, default={})
-    except (OSError, ValueError):
-        saved = {}
-    if not isinstance(saved, dict) or \
-            not isinstance(saved.get("pools", {}), dict) or not isinstance(saved.get("examined", {}), dict):
-        saved = {}
-    migration = None
-    repaired_indices = set()
-    if saved and saved.get("key") not in compatible_keys:
-        previous_units = {u["id"]: stable_hash(u) for u in previous_plan["units"]} if previous_plan else {}
-        previous_source = next((version for version in retriever.previous_versions if saved.get("search_signature") ==
-            stable_hash((PROPOSAL_VERSION,version,*search_identity[1:]))),None)
-        if previous_source and isinstance(saved.get("unit_signatures"),dict):
-            known = saved["unit_signatures"]
-            repaired_indices = set(retriever.previous_versions[previous_source])
-        elif saved.get("search_signature") == search_signature and isinstance(saved.get("unit_signatures"), dict):
-            known = saved["unit_signatures"]
-        elif previous_plan and saved.get("key") == stable_hash((PROPOSAL_VERSION, previous_plan["key"], *search_identity)):
-            known = previous_units
-        else:
-            known = None
-        if known is None:
-            # Unproven cursors are reset; physical ranges still pass prepare's current source/content checks.
-            saved = {"pools":saved.get("pools",{}),"key":saved.get("key"),"search_round":saved.get("search_round",0),"examined":{}}
-        else:
-            retained = {uid for uid, signature in unit_signatures.items() if known.get(uid) == signature}
-            saved = {**saved, "examined": {uid: [i for i in rows if i not in repaired_indices] for uid, rows in saved["examined"].items() if uid in retained},
-                     "exhausted": [uid for uid in saved.get("exhausted", []) if uid in retained and not repaired_indices]}
-            # Old ranges can be proposed again, but prepare() revalidates every current requirement/key.
-            migration = {"from_key": saved.get("key"), "retained_units": sorted(retained),
-                         "reset_units": sorted(set(unit_signatures)-retained),"repaired_source_indices":sorted(repaired_indices)}
-    migrated_from = saved.get("key") if saved and saved.get("key") != key else saved.get("migrated_from_key")
-    if migrated_from and migrated_from != saved.get("migrated_from_key"):
-        logger.info("已核对搜索身份并复用候选范围；仅变更合同的单元重置游标：{}，{}", migrated_from, migration)
-    examined = {u["id"]: set(saved.get("examined", {}).get(u["id"], [])) for u in units}
-    exhausted = set(saved.get("exhausted", []))
-    no_gain = {u["id"]: 0 for u in units}  # Explicit continue grants another bounded expansion from the saved cursor.
-    waves, processed, paused_units = {}, {u["id"]: set() for u in units}, {}
-    uncertain_waves, pause_dependencies = {u["id"]: 0 for u in units}, {}
-    local_search = {u["id"]: {} for u in units}
-    occupied, occupancy = [], stable_hash([])
-    retriever.configure_queue(saved.get("candidate_progress", {}), gateway)
-    update("寻找画面", 47, "本地重新核对已付费候选和旧判断，复用已确认结果；此步骤不请求模型")
-    pools = retriever.restore_candidates(directory, visual_segments, assets, gateway, verify, stop=stop)
-    boundaries, fingerprint_boundaries = {}, {}
-    search_round = int(saved.get("search_round", 0))
-    metrics = {name: 0 for name in ("waves", "submitted_jobs", "completed_jobs", "review_candidates", "approved_pairs",
-        "api_requests", "api_seconds", "wave_seconds", "planning_calls", "planning_seconds", "snapshot_calls", "snapshot_seconds", "source_conflicts", "duplicate_jobs_skipped")}
-    previous_metrics = saved.get("review_metrics", {})
-    if isinstance(previous_metrics, dict):
-        metrics.update({k: v for k, v in previous_metrics.items() if k in metrics and type(v) in (int, float) and 0 <= v < float("inf")})
-    concurrency = api_concurrency(options.get("visual_review_concurrency", 4))
-    reviews = _ReviewCoordinator(retriever, gateway, directory, stop, concurrency, len(units), metrics)
+    saved = read_json(path,default={})
+    signature = stable_hash((RETRIEVAL_PROTOCOL,retriever.index_key,visual_plan["key"],gateway.signature("text_fast")))
+    same = saved.get("key") == signature
+    cursors = {u["id"]:int(saved.get("cursors",{}).get(u["id"],0)) if same else 0 for u in units}
+    exhausted, no_gain, pools = set(), {u["id"]:0 for u in units}, {u["id"]:[] for u in units}
+    approved = {u["id"]:[] for u in units}
+    metrics = {name:0 for name in ("waves","submitted_jobs","completed_jobs","review_candidates","approved_pairs",
+        "api_requests","api_seconds","wave_seconds","duplicate_jobs_skipped")}
+    reviews = _ReviewCoordinator(retriever,gateway,directory,stop,api_concurrency(options.get("visual_review_concurrency",4)),len(units),metrics)
+    gaps, shots, round_number, completed = [], list(reservations), 0, False
 
-    def timed_plan(callback, *args, **kwargs):
-        started = time.monotonic()
-        metrics["planning_calls"] += 1
-        try:
-            return callback(*args, **kwargs)
-        finally:
-            metrics["planning_seconds"] += time.monotonic()-started
+    def save():
+        write_json(path,{"version":RETRIEVAL_PROTOCOL,"key":signature,"index_key":retriever.index_key,
+            "cursors":cursors,"exhausted":sorted(exhausted),"no_gain":no_gain,"review_metrics":metrics,
+            "review_inflight":reviews.inflight,"gaps":gaps})
+        write_json(directory/"visual_matches.json",{"version":RETRIEVAL_PROTOCOL,"plan_key":visual_plan["key"],
+            "gaps":gaps,"issues":list(retriever.issues.values()),"state":"complete" if completed else "partial",
+            "timing_method":visual_plan["timing_method"],"units":{
+                u["id"]:{"requirement":u["requirement"],"approved":approved[u["id"]],
+                          "examined":cursors[u["id"]],"exhausted":u["id"] in exhausted} for u in units}})
 
-    def merge(identifier, values):
+    def allocate():
+        return _allocate_visual_timeline(segments,approved,target,visual_units=visual_plan["units"],
+                                         reservations=reservations,used=())
+
+    def capacity(unit):
+        by_key = {c["_review_key"]:c for pool in approved.values() for c in pool}
+        occupied = [by_key[s.review_key] for s in shots if s.visual_unit_id != unit["id"] and s.review_key in by_key]
+        available = [c for c in approved[unit["id"]] if unused_source(c,occupied)]
         unique = {}
-        for c in pools[identifier]+values:
-            if c.get("_rejected") or not retriever.range_allowed(c):
-                continue
-            physical = source_shot_key(c)
-            rank = lambda row: (not row.get("pending_review", True), len(row.get("coverage",{}).get("supports",[])),
-                                row.get("confidence", row.get("proposal_score", 0)), row["source_end"]-row["source_start"])
-            if physical not in unique or rank(c) > rank(unique[physical]):
-                unique[physical] = c
-        pools[identifier] = sorted(unique.values(), key=lambda c: (not c.get("pending_review", True),
-                                     c.get("confidence", c.get("proposal_score", 0))), reverse=True)
+        for candidate in available:
+            key = source_shot_key(candidate)
+            unique[key] = max(unique.get(key,0),candidate["source_end"]-candidate["source_start"])
+        return sum(unique.values()), {f for c in available for f in candidate_facts(c,unit["requirement"])}
 
-    for u in units:
-        identifier = u["id"]
-        previous = saved.get("pools", {}).get(identifier, [])
-        merge(identifier, retriever.prepare(visual_segments[identifier], previous, assets, gateway, verify))
-        processed[identifier].update(c["_review_key"] for c in pools[identifier] if c["_review_key"] in retriever.candidate_progress)
-    current_keys = retriever.recorded | {c["_review_key"] for rows in pools.values() for c in rows}
-    retriever.candidate_progress = {k: v for k, v in retriever.candidate_progress.items() if k in current_keys}
-
-    def ensure_boundaries(identifiers):
-        for identifier in dict.fromkeys(identifiers):
-            if identifier in boundaries:
-                continue
-            asset = asset_map[identifier]
-            fingerprint = asset["fingerprint"]
-            if fingerprint not in fingerprint_boundaries:
-                cache = retriever.store.directory(asset["library_id"])/"frames"/identifier/"shot-boundaries.json"
-                fingerprint_boundaries[fingerprint] = scene_boundaries(asset, cache, stop, diagnostic_directory=directory)
-            boundaries[identifier] = fingerprint_boundaries[fingerprint]
-
-    def candidate_for_shot(shot):
-        return next((c for c in pools.get(shot.visual_unit_id, []) if c["asset_id"] == shot.asset_id and c["scene_id"] == shot.scene_id
-            and c["source_start"] <= shot.source_start+.000001 and c["source_end"] >= shot.source_end-.000001), None)
-
-    def defer(identifier, candidate, owners, reason):
-        previous = retriever.candidate_progress.get(candidate["_review_key"], {})
-        retriever.candidate_progress[candidate["_review_key"]] = {"version": CANDIDATE_QUEUE_VERSION,
-            "model_signature": retriever.queue_signature, "unit_id": identifier, "state": "deferred", "stage": "allocation",
-            "occupancy": occupancy, "occupied_by": owners, "reason": reason,
-            "preselected": bool(candidate.pop("proposal_version", None) or previous.get("preselected"))}
-
-    def waiting(identifier):
-        result = []
-        for candidate in pools[identifier]:
-            key = candidate["_review_key"]
-            if not candidate.get("pending_review") or key in retriever.unconfirmed:
-                continue
-            progress = retriever.candidate_progress.get(key, {})
-            if progress.get("state") == "deferred" and progress.get("occupancy") == occupancy:
-                continue
-            owners = [{"unit_id": owner, "source": source_shot_key(other)} for owner, other in occupied
-                      if owner != identifier and not unused_source(candidate, [other])]
-            if owners:
-                defer(identifier, candidate, owners, "当前来源由其他单元临时占用，先取其他候选。")
-                continue
-            if progress.get("state") == "deferred":
-                if progress.get("preselected"):
-                    candidate["proposal_version"] = PROPOSAL_VERSION
-                retriever.candidate_progress.pop(key, None)
-            result.append(candidate)
-        return result
-
-    def fill_local(unit):
-        identifier = unit["id"]
-        started, scanned, before = time.monotonic(), 0, len(retriever.evaluated[identifier])
-        while identifier not in exhausted:
-            check_cancel(stop)
-            batch = retriever.retrieve(unit["requirement"], limit=4, excluded=examined[identifier])
-            if not batch:
-                exhausted.add(identifier)
-                break
-            batch = [c for c in batch if c["scene_id"] not in examined[identifier]]
-            if not batch:
-                return "stalled"
-            examined[identifier].update(c["scene_id"] for c in batch)
-            scanned += len(batch)
-            update("寻找画面", 47, f"本地整理{identifier}新增{len(batch)}个窗口及切镜缓存；未请求模型")
-            ensure_boundaries(c["asset_id"] for c in batch)
-            diagnostic = {"windows": len(batch)}
-            previous_keys = {c["_review_key"] for c in pools[identifier]}
-            candidates = retriever.prepare(visual_segments[identifier], batch, assets, gateway, verify,
-                scene_boundaries=boundaries, diagnostic=diagnostic)
-            diagnostic["existing_ranges"] = sum(c["_review_key"] in previous_keys for c in candidates)
-            merge(identifier, candidates)
-            for name, value in diagnostic.items():
-                local_search[identifier][name] = local_search[identifier].get(name, 0)+value
-            update("寻找画面", 47, f"本地续查{identifier}：本次{scanned}个窗口，累计{len(examined[identifier])}个；未请求模型")
-            if waiting(identifier):
-                return "pending"
-            if len(retriever.evaluated[identifier]) > before:
-                return "evaluated"  # Reallocate before settling new exact-cache judgments.
-            if scanned >= 32 or time.monotonic()-started >= 5:
-                return "yielded"  # Local work checkpoint, never an API limit or an exhausted query.
-        return "exhausted"
-
-    def save(status, gaps, proposal):
-        started = time.monotonic()
-        metrics["snapshot_calls"] += 1
-        write_json(path, {"version": PROPOSAL_VERSION, "key": key, "pools": {uid:[{k:v for k,v in c.items() if k!="_requirement"} for c in rows] for uid,rows in pools.items()},
-            "examined": {k: sorted(v) for k, v in examined.items()}, "exhausted": sorted(exhausted),
-            "no_gain": no_gain, "search_round": search_round, "migrated_from_key": migrated_from,
-            "search_signature": search_signature, "unit_signatures": unit_signatures,
-            "migration": migration or saved.get("migration"), "evaluation_version": RETRIEVAL_REPAIR_VERSION,
-            "evaluation_waves": waves, "paused_units": paused_units, "queue_version": CANDIDATE_QUEUE_VERSION,
-            "candidate_progress": retriever.candidate_progress, "pause_dependencies": pause_dependencies,
-            "uncertain_waves": uncertain_waves, "local_search": local_search, "review_protocol":REVIEW_PROTOCOL,
-            "review_metrics": metrics, "review_inflight": reviews.inflight})
-        write_json(directory/"visual_proposal.json", {"version": PROPOSAL_VERSION, "plan_key": visual_plan["key"],
-            "approved_for_render": False, "shots": [vars(shot) for shot in proposal], "gaps": gaps})
-        write_json(directory/"visual_matches.json", {"version": MATCH_POLICY_VERSION, "plan_key": visual_plan["key"],
-            "state": status, "timing_method": visual_plan["timing_method"], "search_policy": PROPOSAL_VERSION,
-            "excluded_windows": len(retriever.rejected_scenes), "excluded_ranges": len(retriever.rejected_ranges),
-            "review_metrics": metrics, "review_inflight": reviews.inflight,
-            "units": {u["id"]: {"examined_windows": len(examined[u["id"]]),
-                "candidate_count": sum(c.get("pending_review") is False for c in pools[u["id"]]),
-                "pending_candidates": sum(c.get("pending_review") is True for c in pools[u["id"]]),
-                "exhausted": u["id"] in exhausted, "no_gain_rounds": no_gain[u["id"]],
-                "evaluation_wave": waves.get(u["id"]), "pause_reason": paused_units.get(u["id"]),
-                "processed_candidates": len(processed[u["id"]]),
-                "compatible_candidates": sum(bool(c.get("compatible_from")) for c in pools[u["id"]] if c.get("pending_review") is False),
-                "preselection": retriever.preselection.get(u["id"], {}),
-                **retriever.statistics.get(u["id"], {}), "local_search": local_search[u["id"]],
-                "unconfirmed": sum(c["_review_key"] in retriever.unconfirmed for c in pools[u["id"]]),
-                "deferred_candidates": sum(c.get("state") == "deferred" and c.get("unit_id") == u["id"]
-                    for c in retriever.candidate_progress.values())} for u in units}, "gaps": gaps})
-        elapsed = time.monotonic()-started
-        metrics["snapshot_seconds"] += elapsed
-        logger.debug("画面搜索快照{}，本次{:.3f}秒，累计{:.3f}秒", metrics["snapshot_calls"], elapsed, metrics["snapshot_seconds"])
-
-    structural = [{"visual_unit_id": u["id"], "segment_id": u["segment_id"], "start": a, "end": b,
-                   "category": "short_interval", "missing_seconds": round(b-a, 3), "reason": "动画与句意边界留下不足1秒原片区间。"}
-                  for u in units for a, b in visual_unit_intervals(u, reservations)
-                  if b-a < min(1.0, visual_segments[u["id"]].audio_end-visual_segments[u["id"]].audio_start)-.001]
-    if structural:
-        for gap in structural:
-            nearby = {s.asset_id for s in reservations if abs(s.timeline_end-gap["start"]) < .001 or
-                      abs(s.timeline_start-gap["end"]) < .001}
-            sources = {row["source"] for row in alignment.get("motions", []) if row["animation_id"] in nearby}
-            gap["animation_sources"] = sorted(sources)
-            reasons = [row["reason"] for row in alignment.get("rejected", []) if
-                       gap["visual_unit_id"] in row.get("unit_ids", []) or row.get("animation_id") in nearby or
-                       ("unit_ids" not in row and "animation_id" not in row)]
-            if not reasons:
-                reasons = ["父段或单元边界与动画原文绑定不一致，无法安全自动归并。"]
-            gap["reason"] = "；".join(dict.fromkeys(reasons))
-        proposal, _ = timed_plan(propose_visual_timeline, segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
-        save("incomplete", structural, proposal)
-        examples = "、".join(row["visual_unit_id"] for row in structural[:8])
-        reasons = "；".join(dict.fromkeys(row["reason"] for row in structural))
-        origins = {origin for row in structural for origin in row["animation_sources"]}
-        source_note = "、".join(label for value, label in (("manual", "手动"), ("auto", "自动")) if value in origins) or "未确认来源的"
-        raise JobPaused(f"发现{len(structural)}处不足1秒的原片区间（{examples}），已在候选模型复核前暂停。"
-                        f"相邻{source_note}动画未能安全归并：{reasons}"
-                        "请查看画面缺口详情，调整对应动画原文范围或合并句意范围后从3. 寻找画面继续；"
-                        "原配音、字幕、合格候选与旧成片保留。")
-
-    # Prepare all units locally before reserving scarce sources; this makes no provider calls.
-    for index, unit in enumerate(units):
-        check_cancel(stop)
-        if visual_unit_intervals(unit, reservations) and not pools[unit["id"]] and not examined[unit["id"]]:
-            fill_local(unit)
-        update("寻找画面", 47, f"复用已付费结果并本地整理候选 {index+1}/{len(units)}")
-    needed_seconds = sum(b-a for u in units for a, b in visual_unit_intervals(u, reservations))
-    while True:
-        check_cancel(stop)
-        for identifier in pools:
-            merge(identifier, [])
-        try:
-            shots = timed_plan(plan_visual_timeline, segments, pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
-            ensure_boundaries(shot.asset_id for shot in shots if shot.visual_unit_id)
-            save("complete", [], shots)
-            return shots, boundaries, pools
-        except VisualCapacityError as exc:
-            gaps = exc.gaps
-        confirmed, _ = timed_plan(propose_visual_timeline, segments, {k: [c for c in rows if c.get("pending_review") is False] for k, rows in pools.items()},
-                                             target_shot_seconds=target, visual_units=units, reservations=reservations)
-        occupied = [(shot.visual_unit_id, candidate_for_shot(shot)) for shot in confirmed if shot.visual_unit_id]
-        occupied = [(owner, candidate) for owner, candidate in occupied if candidate is not None]
-        occupancy = stable_hash(sorted((owner, *source_shot_key(c), c["source_start"], c["source_end"]) for owner, c in occupied))
-        for identifier, dependency in list(pause_dependencies.items()):
-            if dependency != occupancy:
-                paused_units.pop(identifier, None)
-                pause_dependencies.pop(identifier)
-        # Check availability both before ranking and after other approvals change allocation.
-        for identifier in waves:
-            available = {c["_review_key"] for c in waiting(identifier)}
-            for candidate in pools[identifier]:
-                if candidate["_review_key"] in waves[identifier]["keys"] and candidate["_review_key"] not in available:
-                    candidate.pop("proposal_version", None)
-        proposal_pools = {identifier: [c for c in rows if c.get("pending_review") is False or
-                          (c["_review_key"] in waves.get(identifier, {}).get("keys", []) and
-                           c["_review_key"] not in retriever.unconfirmed and identifier not in paused_units and
-                           retriever.candidate_progress.get(c["_review_key"], {}).get("state") != "deferred")]
-                          for identifier, rows in pools.items()}
-        proposal, _ = timed_plan(propose_visual_timeline, segments, proposal_pools, target_shot_seconds=target, visual_units=units, reservations=reservations)
-        covered = sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id)
-        allocated = {u["id"]: sum(s.timeline_end-s.timeline_start for s in confirmed if s.visual_unit_id == u["id"]) for u in units}
-        allocated_facts = {u["id"]:len({identifier for shot in confirmed if shot.visual_unit_id == u["id"] for identifier in shot.fact_ids}) for u in units}
-        progress = 47+22*min(1, covered/max(.001, needed_seconds))
-        pair_keys, pairs = set(), []
-        for shot in proposal:
-            identifier = shot.visual_unit_id
-            if not identifier or identifier not in waves or identifier in paused_units:
-                continue
-            candidate = candidate_for_shot(shot)
-            if candidate and candidate.get("pending_review") and candidate["_review_key"] not in retriever.unconfirmed:
-                pair = (identifier, candidate["_review_key"])
-                if pair not in pair_keys:
-                    pair_keys.add(pair); pairs.append((visual_segments[identifier], candidate))
-        if pairs:
-            selected, reserved, selected_units = [], [], set()
-            desired = {u["id"]: max(0, sum(b-a for a, b in visual_unit_intervals(u, reservations))-allocated[u["id"]]) for u in units}
-            capacity, counts = {}, {}
-            for segment, candidate in pairs:
-                identifier = segment.id
-                if identifier not in selected_units and len(selected_units) >= reviews.maximum:
-                    continue
-                if counts.get(identifier, 0) >= 6 or (counts.get(identifier, 0) and capacity[identifier] >= desired[identifier]-.001):
-                    continue
-                if not unused_source(candidate, [c for owner, c in reserved if owner != identifier]):
-                    metrics["source_conflicts"] += 1
-                    continue
-                selected.append((segment, candidate))
-                selected_units.add(identifier)
-                reserved.append((identifier, candidate))
-                counts[identifier] = counts.get(identifier, 0)+1
-                capacity[identifier] = capacity.get(identifier, 0)+min(target, candidate["source_end"]-candidate["source_start"])
-            jobs, owners = [], set()
-            for job in retriever.prepare_reviews(selected, gateway, directory, search_round=search_round):
-                if job["unit_id"] not in owners:
-                    jobs.append(job)
-                    owners.add(job["unit_id"])
-            if jobs:
-                update("寻找画面", progress, f"按缺口审核{len(jobs)}个单元；并发设置{concurrency}，当前{len(gaps)}处缺口，已确认{covered:.1f}秒")
-                try:
-                    reviews.run(jobs, lambda: save("searching", gaps, proposal),
-                        lambda message: update("寻找画面", progress, message))
-                finally:
-                    for identifier in selected_units:
-                        merge(identifier, [])
-                    save("searching", gaps, proposal)
-                continue
-        save("searching", gaps, proposal)
-        material = {r["visual_unit_id"] for r in gaps if r.get("category") != "short_interval"}
-        for identifier, wave in waves.items():
-            processed[identifier].update(wave["keys"])
-            if identifier not in material:
-                no_gain[identifier] = 0
-                continue
-            unresolved = set(wave["keys"])-retriever.evaluated[identifier]
-            for candidate in pools[identifier]:
-                if candidate["_review_key"] in unresolved and candidate["_review_key"] not in retriever.unconfirmed:
-                    entry = retriever.candidate_progress.get(candidate["_review_key"], {})
-                    if entry.get("state") != "deferred" or entry.get("occupancy") != occupancy:
-                        defer(identifier, candidate, [], "本轮未形成可分配镜头，先取其他候选；占用变化后重新核对。")
-            if unresolved & retriever.unconfirmed:
-                uncertain_waves[identifier] += 1
-                if uncertain_waves[identifier] >= no_gain_limit:
-                    paused_units[identifier] = f"连续{no_gain_limit}批实际审核未确认，相关候选已保存待后续处理"
-            elif not unresolved and len(retriever.evaluated[identifier]) > wave["evaluated_before"]:
-                uncertain_waves[identifier] = 0
-                improved = allocated[identifier] > wave["allocated_before"]+.001 or allocated_facts[identifier] > wave.get("facts_before",0)
-                no_gain[identifier] = 0 if improved else no_gain[identifier]+1
-            elif not wave["keys"]:
-                paused_units[identifier] = "预选输入或协议未完成" if wave["protocol_issues"] else "本轮没有可审候选且无新有效结论"
-        waves = {}
-        groups = []
+    try:
+        # Replay only the same fixed page IDs; pair receipts survive index changes independently.
+        initial = []
         for unit in units:
-            identifier = unit["id"]
-            if identifier not in material or identifier in paused_units or no_gain[identifier] >= no_gain_limit:
-                continue
-            before = len(retriever.evaluated[identifier])
-            candidates = waiting(identifier)
-            local_state = None
-            if not candidates:
-                local_state = fill_local(unit)
-                candidates = waiting(identifier)
-            if not candidates:
-                if len(retriever.evaluated[identifier]) > before:
-                    waves[identifier] = {"keys": [], "evaluated_before": before,
-                        "allocated_before": allocated[identifier], "facts_before":allocated_facts[identifier], "protocol_issues": 0}
-                elif local_state == "yielded":
-                    paused_units[identifier] = "本地续查已保存游标让出，查询尚未耗尽"
-                elif local_state == "stalled":
-                    paused_units[identifier] = "本地检索未推进，已保存现有候选"
+            if cursors[unit["id"]]:
+                page = retriever.search(unit,0,cursors[unit["id"]])
+                pools[unit["id"]] = page.candidates
+                initial.extend((unit,c) for c in page.candidates)
+        jobs = retriever.prepare_reviews(initial,gateway,directory)
+        if jobs:
+            reviews.run(jobs,save,lambda msg:update("寻找画面",48,msg))
+        for unit in units:
+            approved[unit["id"]] = retriever.accepted(unit,pools[unit["id"]])
+        shots,gaps = allocate()
+        while gaps:
+            check_cancel(stop)
+            needed = {g["visual_unit_id"]:g for g in gaps}
+            selected = [u for u in units if u["id"] in needed and u["id"] not in exhausted and no_gain[u["id"]] < no_gain_limit]
+            if not selected:
+                break
+            round_number += 1
+            pairs = []
+            before = {u["id"]:capacity(u) for u in selected}
+            for unit in selected:
+                uid = unit["id"]
+                page = retriever.search(unit,cursors[uid],12)
+                cursors[uid] = page.cursor
+                if page.exhausted:
+                    exhausted.add(uid)
+                pools[uid].extend(page.candidates)
+                pairs.extend((unit,c) for c in page.candidates)
+            jobs = retriever.prepare_reviews(pairs,gateway,directory,search_round=round_number)
+            save()
+            if jobs:
+                reviews.run(jobs,save,lambda msg:update("寻找画面",50,msg))
+            for unit in selected:
+                uid = unit["id"]
+                approved[uid] = retriever.accepted(unit,pools[uid])
+            shots,gaps = allocate()
+            for unit in selected:
+                seconds,facts = capacity(unit)
+                old_seconds,old_facts = before[unit["id"]]
+                uid = unit["id"]
+                no_gain[uid] = 0 if seconds > old_seconds+.01 or facts-old_facts else no_gain[uid]+1
+            for gap in gaps:
+                uid = gap["visual_unit_id"]
+                if any(i["unit_id"] == uid for i in retriever.issues.values()):
+                    gap["detail"] = "存在模型未确认项，查看匹配记录；不能当作内容不合适"
+                elif approved.get(uid):
+                    gap["detail"] = "有关联素材，但可用时长、具体事实或全片来源占用不足"
+                elif retriever.missing_analysis:
+                    gap["detail"] = "部分素材尚未完成拉片，请先补分析"
                 else:
-                    deferred = any(c.get("unit_id") == identifier and c.get("state") == "deferred" and c.get("occupancy") == occupancy
-                                   for c in retriever.candidate_progress.values())
-                    paused_units[identifier] = "当前可检索备选均被占用或尚未可分配，已保存候选队列" if deferred else "当前检索查询已无新窗口，未确认范围保留"
-                    if deferred:
-                        pause_dependencies[identifier] = occupancy
-                continue
-            waves[identifier] = {"keys": [], "evaluated_before": before,
-                "allocated_before": allocated[identifier], "facts_before":allocated_facts[identifier], "protocol_issues": 0}
-            groups.append((visual_segments[identifier], candidates, sum(row["missing_seconds"] for row in gaps if row["visual_unit_id"] == identifier)))
-        if not groups and not waves:
-            save("incomplete", gaps, proposal)
-            unconfirmed = sum(c["_review_key"] in retriever.unconfirmed for rows in pools.values() for c in rows)
-            held = sum(no_gain[identifier] >= no_gain_limit for identifier in material)
-            short = sum(row.get("category") == "short_interval" for row in gaps)
-            fact_gaps = [row for row in gaps if row.get("category") in {"fact_coverage","fact_order"}]
-            protocol = sum(row.get("invalid_references", 0) > 0 for row in retriever.preselection.values())
-            pending = sum(c.get("pending_review") is True for rows in pools.values() for c in rows)
-            deferred = sum(row.get("state") == "deferred" for row in retriever.candidate_progress.values())
-            reasons = "；".join(f"{reason}{list(paused_units.values()).count(reason)}个单元" for reason in dict.fromkeys(paused_units.values()))
-            raise JobPaused(f"画面仍有{len(gaps)}处缺口，共缺{sum(r['missing_seconds'] for r in gaps):.2f}秒；"
-                f"{held}个单元完成有效评估后连续{no_gain_limit}轮无新增可分配时长或事实覆盖，{short}处为短残段，{len(fact_gaps)}处为事实覆盖/顺序不足，"
-                f"预选协议或编号问题涉及{protocol}个单元，实际镜头未确认{unconfirmed}个，候选队列待审{pending}个，分配延后{deferred}个。"
-                f"{reasons + '。' if reasons else ''}"
-                + ("事实缺项："+"；".join(row["visual_unit_id"]+"："+row["reason"] for row in fact_gaps[:6])+"。" if fact_gaps else "") +
-                "本次按有效评估及候选进度暂停；不代表全库一定没有素材。已有配音、字幕、确认结果和旧成片保留，"
-                "从3. 寻找画面继续会复用已付费结果，沿候选队列及保存的本地检索游标向后推进。")
-        if groups:
-            update("寻找画面", progress, f"按需文字预选{len(groups)}个缺口单元；已本地跳过占用范围，当前已确认{covered:.1f}秒")
-            for identifier, result in retriever.shortlist(groups, gateway, directory, stop, search_round=search_round).items():
-                waves[identifier].update(result)
-                for review_key in result["keys"]:
-                    retriever.candidate_progress[review_key] = {"version": CANDIDATE_QUEUE_VERSION,
-                        "model_signature": retriever.queue_signature, "unit_id": identifier, "state": "selected", "stage": "text_preselect"}
-        search_round += 1
-        save("searching", gaps, proposal)
+                    gap["detail"] = "已检索页未找到对应事件，可补充人物别名、时期资料或素材"
+            save()
+            update("寻找画面",55,f"第{round_number}轮事件检索；仍有{len(gaps)}处编排缺口；本轮只匹配保存的观察文字")
+        if gaps:
+            detail = "；".join(g["visual_unit_id"]+"："+g.get("detail",g["reason"]) for g in gaps[:5])
+            raise JobPaused(f"仍有{len(gaps)}处画面缺口，共{sum(g['missing_seconds'] for g in gaps):.2f}秒。{detail}。"
+                            "已保存付费匹配与检索游标，从3. 寻找画面继续；资料缺项请到视频素材库补拉片。")
+        completed = True
+        return shots,retriever.boundaries,approved
+    finally:
+        save()
 
 
 def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *, start_stage="auto"):
@@ -1212,7 +906,7 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
         required.append("text_fast")
     # The relevance switch does not disable the independent credits/usability check.
     if level <= 3:
-        required.append("vision")
+        required.append("vision")  # Used only when a saved range still needs local enrichment.
     if required:
         if "models" not in settings or use_current_models:
             refreshed = public_models(model_profile)
@@ -1416,7 +1110,7 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                     "relation", "facts_match", "evidence", "conflicts", "subtitle_quotes", "visual_checked", "confidence",
                     "subtitle_ids", "visual_evidence", "evidence_protocol")})
                 used[-1]["review_key"] = selected["_review_key"]
-                for key in ("coverage", "review_protocol", "compatible_from"):
+                for key in ("coverage", "duplicate_group", "revision", "event_id"):
                     if key in selected:
                         used[-1][key] = selected[key]
             update("编排镜头", 70, "校验句意对应、全片来源去重与实际范围画面检查记录")

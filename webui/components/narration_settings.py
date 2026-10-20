@@ -693,7 +693,8 @@ def _library_counts(identifiers):
             assets += counts[0]
             ready += counts[1]
             partial += counts[2]
-            scenes += db.execute("SELECT COUNT(*) FROM scenes s JOIN assets a ON a.id=s.asset_id WHERE a.status IN ('ready','partial')").fetchone()[0]
+            if db.execute("PRAGMA user_version").fetchone()[0] == 2:
+                scenes += db.execute("SELECT COUNT(*) FROM content_segments").fetchone()[0]
     return assets, ready, partial, scenes
 
 
@@ -764,14 +765,14 @@ def _render_output_options(tr, prefix):
             st.caption(tr("原模式细分后对应更多配音单元，可能新增TTS调用；长段模式可复用配音和字词时间。"))
         st.checkbox(tr("遮盖原画面字幕"), value=options["mask_source_subtitles"], key=prefix + "_mask")
         st.slider(tr("目标镜头长度（秒）"), 3, 12, options["shot_seconds"], key=prefix + "_shot_seconds")
-        st.checkbox(tr("确认候选画面"), value=options["verify_visual"], key=prefix + "_verify_visual")
+        st.caption(tr("2.8 使用素材库已保存的镜头观察做文案匹配；有疑问的素材到视频素材库补拉片。"))
         st.number_input(tr("画面审核并发数"), min_value=1, value=options["visual_review_concurrency"], step=1,
                         key=prefix + "_visual_review_concurrency",
                         help=tr("默认4，设为1使用同一流程串行审核。建议4–8；不同文案单元独立请求，每波后统一编排，不改变已付费缓存。"))
         st.number_input(tr("单元连续无改善暂停轮数"), min_value=1, value=options["visual_no_gain_rounds"], step=1,
                         key=prefix+"_visual_no_gain_rounds")
-        st.caption(tr("本地收敛和文字预选后只确认拟用镜头；单元连续无新增合格时长时暂停扩大，继续可复用缓存追加检索。这不是API总次数上限。"))
-        st.caption(tr("始终按当前句意检查内容；关闭时使用已有描述与范围字幕判断，仍独立排除片尾名单。画面单元不改变TTS分段。"))
+        st.caption(tr("按事件检索镜头，再用高效率模型确认已保存的观察；连续无新增匹配时暂停，继续沿游标查询。"))
+        st.caption(tr("旧窗口库请先创建2.8拉片副本；旧项目可创建复用副本选择新库，保留配音和字幕。"))
         st.caption(tr("文案与视觉模型调用不设任务总次数上限。"))
         st.caption(tr("字幕分段由文案生成设置中的高效率模型完成，结果会校验和缓存。"))
     remember_widget_values(prefix)
@@ -1212,12 +1213,12 @@ def _render_project_results(tr, task_id):
                         unit = gap_units.get(identifier, {})
                         st.markdown(f"**{identifier} · {gap['start']:.1f}–{gap['end']:.1f}s · {gap['missing_seconds']:.2f}s**")
                         st.write(original(unit))
-                        st.caption(gap.get("reason", ""))
+                        st.caption(gap.get("detail",gap.get("reason", "")))
                         facts = unit.get("requirement", {}).get("required_facts", [])
                         if facts:
                             st.caption(tr("需要对应：") + "；".join(facts))
                         stats = report.get("units", {}).get(identifier, {})
-                        st.caption(tr("已检查窗口：") + str(stats.get("examined_windows", 0)) + " · " +
+                        st.caption(tr("已检查镜头范围：") + str(stats.get("examined",stats.get("examined_windows", 0))) + " · " +
                                    "；".join(f"{name}: {count}" for name, count in stats.get("reasons", {}).items()))
                 st.download_button(tr("下载画面匹配记录"), matches_file.read_bytes(), file_name="visual_matches.json",
                                    mime="application/json", key="visual_matches_download_" + task_id)

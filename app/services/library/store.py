@@ -12,7 +12,9 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 
-SCHEMA_VERSION = 1
+from app.models.library import LIBRARY_SCHEMA
+
+SCHEMA_VERSION = LIBRARY_SCHEMA
 _json_lock_guard = threading.Lock()
 _json_locks = {}
 _JSON_MISSING = object()
@@ -107,7 +109,7 @@ class LibraryStore:
         db.row_factory = sqlite3.Row
         try:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, SCHEMA_VERSION):
+            if version not in (0, 1, SCHEMA_VERSION):
                 raise ValueError("素材库版本与当前代码不兼容，请恢复对应版本的代码或数据库备份。")
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA journal_mode=WAL")
@@ -174,7 +176,21 @@ class LibraryStore:
                     message TEXT NOT NULL, updated REAL NOT NULL, settings TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE TABLE analysis_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                PRAGMA user_version=1;
+                CREATE TABLE shot_records (
+                    id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                    start REAL NOT NULL, end REAL NOT NULL, data TEXT NOT NULL
+                );
+                CREATE INDEX shot_records_asset ON shot_records(asset_id,start);
+                CREATE TABLE content_segments (
+                    id TEXT PRIMARY KEY, asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                    start REAL NOT NULL, end REAL NOT NULL, data TEXT NOT NULL
+                );
+                CREATE TABLE content_links (
+                    segment_id TEXT NOT NULL REFERENCES content_segments(id) ON DELETE CASCADE,
+                    range_id TEXT NOT NULL REFERENCES shot_records(id) ON DELETE CASCADE,
+                    PRIMARY KEY(segment_id,range_id)
+                );
+                PRAGMA user_version=2;
             """)
         with self.connection(self.root / "catalog.sqlite") as db:
             db.execute("INSERT INTO libraries(id,name,created) VALUES(?,?,?)", (identifier, name, time.time()))
@@ -184,6 +200,128 @@ class LibraryStore:
         self.directory(library_id)
         with self.connection(self.root / "catalog.sqlite") as db:
             db.execute("UPDATE libraries SET settings=? WHERE id=?", (json.dumps(settings, ensure_ascii=False), library_id))
+
+    def schema(self, library_id):
+        with self.database(library_id) as db:
+            return db.execute("PRAGMA user_version").fetchone()[0]
+
+    def require_content_library(self, identifiers):
+        outdated = [i for i in library_ids(identifiers) if self.schema(i) != SCHEMA_VERSION]
+        if outdated:
+            raise ValueError("选中了旧窗口库。请在视频素材库中创建“2.8 拉片副本”并完成拉片，再在制作工作台选择新库；原配音、字幕和旧库保留。")
+
+    def clone_for_analysis(self, library_id, name):
+        """Copy registrations and owned subtitle files into a separate database."""
+        from app.services.library.runner import library_operation
+        with library_operation(library_id):
+            identifier = self.create(name)
+            target = self.directory(identifier)
+            with self.database(library_id) as source, self.database(identifier) as dest:
+                assets = [dict(row) for row in source.execute("SELECT * FROM assets")]
+                for asset in assets:
+                    asset["status"] = "pending"
+                    dest.execute("INSERT INTO assets VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                 tuple(asset[k] for k in ("id","path","episode","size","mtime_ns","fingerprint","duration","width","height","fps","active_subtitle","status")))
+                for row in source.execute("SELECT * FROM subtitle_sources"):
+                    data = dict(row)
+                    for field in ("original_path", "processed_path"):
+                        original = Path(data[field])
+                        destination = target/"subtitles"/data["asset_id"]/data["id"]/original.name
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(original, destination)
+                        data[field] = str(destination)
+                    dest.execute("INSERT INTO subtitle_sources VALUES(?,?,?,?,?,?,?)",
+                                 tuple(data[k] for k in ("id","asset_id","source_path","original_path","processed_path","content_hash","settings")))
+            settings = next(r["settings"] for r in self.list_libraries() if r["id"] == library_id)
+            self.save_settings(identifier, {**settings, "source_library_id": library_id,
+                                           "schema": SCHEMA_VERSION, "cloned_at": time.time()})
+            # Only fingerprint-keyed physical boundary caches are compatible.
+            for old in (self.directory(library_id)/"boundaries").glob("*.json"):
+                destination = target/"boundaries"/old.name
+                destination.parent.mkdir(exist_ok=True)
+                shutil.copyfile(old, destination)
+            for asset in assets:
+                old = self.directory(library_id)/"frames"/asset["id"]/"shot-boundaries.json"
+                if old.is_file():
+                    destination = target/"boundaries"/(asset["fingerprint"]+".json")
+                    destination.parent.mkdir(exist_ok=True)
+                    shutil.copyfile(old,destination)
+            return identifier
+
+    def save_ranges(self, library_id, asset_id, ranges):
+        self.require_content_library(library_id)
+        with self.database(library_id) as db:
+            for item in ranges:
+                db.execute("""INSERT INTO shot_records VALUES(?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
+                           (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
+            db.execute("UPDATE assets SET status='partial' WHERE id=?", (asset_id,))
+
+    def replace_contents(self, library_id, asset_id, segments, expected_ranges):
+        """One transaction publishes a consistent event-to-range index."""
+        with self.database(library_id) as db:
+            expected = set(expected_ranges)
+            for row in db.execute("SELECT id FROM shot_records WHERE asset_id=?", (asset_id,)).fetchall():
+                if row[0] not in expected:
+                    db.execute("DELETE FROM shot_records WHERE id=?", (row[0],))
+            db.execute("DELETE FROM content_segments WHERE asset_id=?", (asset_id,))
+            for item in segments:
+                db.execute("INSERT INTO content_segments VALUES(?,?,?,?,?)",
+                           (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
+                db.executemany("INSERT INTO content_links VALUES(?,?)",
+                               [(item["id"], rid) for rid in item["range_ids"]])
+
+    def records(self, identifiers, kind="ranges"):
+        table = {"ranges": "shot_records", "contents": "content_segments"}[kind]
+        result = []
+        assets = {(a["library_id"],a["id"]):a for a in self.assets(identifiers)}
+        for identifier in library_ids(identifiers):
+            if self.schema(identifier) != SCHEMA_VERSION:
+                continue
+            with self.database(identifier) as db:
+                rows = db.execute(f"""SELECT r.data,a.id AS asset_id,a.path,a.episode,a.fingerprint,a.fps,a.duration
+                    FROM {table} r JOIN assets a ON a.id=r.asset_id ORDER BY a.episode,r.start""").fetchall()
+                generations = {r[0].split(":",1)[1]:json.loads(r[1]) for r in db.execute(
+                    "SELECT key,value FROM analysis_cache WHERE key LIKE 'analysis-generation:%'")}
+            for row in rows:
+                data = json.loads(row["data"])
+                asset = assets[(identifier,row["asset_id"])]
+                if kind == "ranges" and (data.get("fingerprint") != row["fingerprint"] or
+                        data.get("subtitle_identity") != asset.get("subtitle_identity")):
+                    continue
+                if kind == "ranges" and data.get("generation","") != generations.get(data["id"],""):
+                    data.update(analysis_state="uncertain",generation=generations[data["id"]])
+                result.append({**data, **{k: row[k] for k in row.keys() if k != "data"},
+                               "library_id": identifier})
+        return result
+
+    def correct_range(self, library_id, range_id, changes, reason):
+        """Corrections are local evidence revisions; unrelated observations stay valid."""
+        from app.services.library.runner import library_operation
+        allowed = {"visible_people", "period", "location", "summary", "tags", "content_kind", "duplicate_group", "uncertainties", "observations"}
+        if not reason.strip() or set(changes)-allowed:
+            raise ValueError("请说明更正依据，并使用允许的字段。")
+        with library_operation(library_id), self.database(library_id) as db:
+            row = db.execute("SELECT data FROM shot_records WHERE id=?", (range_id,)).fetchone()
+            if row is None:
+                raise ValueError("镜头范围不存在。")
+            item = json.loads(row[0])
+            old = dict(item)
+            item.update(changes)
+            from app.services.library.validation import observation_result
+            checked = observation_result({**item,"range_id":range_id},item)
+            item.update({k:checked[k] for k in ("observations","visible_people","summary","tags","period","location","content_kind")})
+            item["analysis_state"] = "ready" if item.get("coverage") == "sampled" and item.get("content_kind") != "unknown" else "uncertain"
+            item["correction"] = {"reason":reason.strip(),"time":time.time(),"fields":sorted(changes)}
+            # Explicit human correction becomes the current observation, with its own revision.
+            db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)",
+                       ("analysis-generation:"+range_id,json.dumps(item.get("generation",""))))
+            item["revision"] = stable_hash({k:v for k,v in item.items() if k != "revision"})
+            correction = {"before": old, "after": item, "reason": reason.strip(), "time": time.time()}
+            db.execute("INSERT INTO analysis_cache VALUES(?,?)",
+                       ("correction:"+uuid4().hex, json.dumps(correction, ensure_ascii=False)))
+            db.execute("UPDATE shot_records SET data=? WHERE id=?", (json.dumps(item, ensure_ascii=False), range_id))
+        return item
 
     def assets(self, library_id):
         result = []
@@ -330,45 +468,6 @@ class LibraryStore:
         with self.database(library_id) as db:
             db.execute("DELETE FROM analysis_cache WHERE key=?", (key,))
 
-    def begin_analysis(self, library_id, asset_id, expected_ids):
-        expected = set(expected_ids)
-        with self.database(library_id) as db:
-            existing = db.execute("SELECT id FROM scenes WHERE asset_id=?", (asset_id,)).fetchall()
-            obsolete = [(row["id"],) for row in existing if row["id"] not in expected]
-            db.executemany("DELETE FROM shots WHERE scene_id=?", obsolete)
-            db.executemany("DELETE FROM scenes WHERE id=?", obsolete)
-            count = db.execute("SELECT COUNT(*) FROM scenes WHERE asset_id=?", (asset_id,)).fetchone()[0]
-            db.execute("UPDATE assets SET status=? WHERE id=?", ("partial" if count else "pending", asset_id))
-        return count
-
-    def save_scene(self, library_id, asset_id, scene, visual=None, frames=None):
-        with self.database(library_id) as db:
-            db.execute("""INSERT INTO scenes(id,asset_id,start,end,transcript,analysis,version,visual,frame_paths)
-                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-                transcript=excluded.transcript,analysis=excluded.analysis,version=excluded.version,visual=excluded.visual,frame_paths=excluded.frame_paths""",
-                (scene["id"], asset_id, scene["start"], scene["end"], scene["transcript"],
-                 json.dumps(scene["analysis"], ensure_ascii=False), scene["version"],
-                 json.dumps(visual or {}, ensure_ascii=False), json.dumps(frames or [])))
-            db.execute("DELETE FROM shots WHERE scene_id=?", (scene["id"],))
-            db.execute("INSERT INTO shots VALUES(?,?,?,?,?,?)", (stable_hash((scene["id"], scene["version"])),
-                scene["id"], scene["start"], scene["end"], json.dumps(visual or scene["analysis"], ensure_ascii=False), scene["version"]))
-            db.execute("UPDATE assets SET status='partial' WHERE id=?", (asset_id,))
-
-    def discard_scene(self, library_id, scene_id):
-        with self.database(library_id) as db:
-            db.execute("DELETE FROM shots WHERE scene_id=?", (scene_id,))
-            db.execute("DELETE FROM scenes WHERE id=?", (scene_id,))
-
-    def scenes(self, library_id):
-        result = []
-        for identifier in library_ids(library_id):
-            with self.database(identifier) as db:
-                rows = db.execute("""SELECT s.*,a.path,a.episode,a.fingerprint,a.duration,a.status FROM scenes s
-                    JOIN assets a ON a.id=s.asset_id WHERE a.status IN ('ready','partial') ORDER BY a.episode,s.start""").fetchall()
-            result.extend({**dict(row), "library_id": identifier, "analysis": json.loads(row["analysis"]),
-                           "visual": json.loads(row["visual"]), "frame_paths": json.loads(row["frame_paths"])} for row in rows)
-        return result
-
     def job(self, library_id, identifier="build", **updates):
         with self.database(library_id) as db:
             if updates:
@@ -414,6 +513,8 @@ class LibraryStore:
             counts = {name: db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
                       for name in ("assets", "scenes", "analysis_cache")}
             running_records = db.execute("SELECT COUNT(*) FROM analysis_jobs WHERE id IN ('build','import') AND state='running'").fetchone()[0]
+            if db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+                counts["scenes"] = db.execute("SELECT COUNT(*) FROM content_segments").fetchone()[0]
         return {"directory": str(directory), **counts, "running_records": running_records}
 
     def delete_library(self, library_id, confirmation_name, interrupted_confirmed=False):
@@ -496,7 +597,8 @@ class LibraryStore:
         if self.root.is_symlink() or self.root.is_junction():
             raise ValueError("素材库根目录是链接，拒绝删除派生目录。")
         identifiers = list(dict.fromkeys(str(UUID(str(value))) for value in asset_ids))
-        known = {asset["id"] for asset in self.assets(library_id)}
+        registered = {asset["id"]:asset for asset in self.assets(library_id)}
+        known = set(registered)
         if not set(identifiers).issubset(known):
             raise ValueError("所选素材不属于此素材库。")
         tasks = [task for task in list_tasks() if library_id in library_ids(task)]
@@ -513,13 +615,14 @@ class LibraryStore:
                     parent = library_root / category
                     if parent.is_symlink() or parent.is_junction():
                         raise ValueError("派生目录是链接，拒绝移除。")
-                    logical = parent / identifier
+                    owned_name = registered[identifier]["fingerprint"] if category == "frames" and self.schema(library_id) == SCHEMA_VERSION else identifier
+                    logical = parent / owned_name
                     if not logical.exists():
                         continue
                     if logical.is_symlink() or logical.is_junction():
                         raise ValueError("素材派生目录是链接，拒绝移除。")
                     target = logical.resolve(strict=True)
-                    if target.parent != parent.resolve() or target.name != identifier or not target.is_dir():
+                    if target.parent != parent.resolve() or target.name != owned_name or not target.is_dir():
                         raise ValueError("素材派生目录越界，拒绝移除。")
                     for folder, directories, files in os.walk(target, followlinks=False):
                         if any((Path(folder) / name).is_symlink() or (Path(folder) / name).is_junction() for name in directories + files):
@@ -531,6 +634,9 @@ class LibraryStore:
                     moved.append((target, tombstone))
             with self.database(library_id) as db:
                 for identifier in identifiers:
+                    if db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+                        db.execute("DELETE FROM content_segments WHERE asset_id=?",(identifier,))
+                        db.execute("DELETE FROM shot_records WHERE asset_id=?",(identifier,))
                     db.execute("DELETE FROM shots WHERE scene_id IN (SELECT id FROM scenes WHERE asset_id=?)", (identifier,))
                     db.execute("DELETE FROM scenes WHERE asset_id=?", (identifier,))
                     db.execute("DELETE FROM subtitle_sources WHERE asset_id=?", (identifier,))

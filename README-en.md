@@ -2,9 +2,9 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.7.12**
+**Manuscript-driven video production · v2.8.0**
 
-[简体中文](README.md) · [MIT license](LICENSE)
+[简体中文](README.md) · User guide · [MIT license](LICENSE)
 
 ## About
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.7.12 provides seven workspaces:
+Version 2.8.0 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -55,20 +55,31 @@ Version 2.7.12 provides seven workspaces:
 | Model Configuration | Inspect saved models and edit service definitions and parameters |
 | Video Production | Use the inherited NarratoAI production workflow |
 
-A new session starts on Home. Existing sessions and explicit workspace navigation keep their selection. Home exposes the upstream relationship, the full local MIT license, and the production workflow.
+A new session starts on Home. Existing sessions and explicit workspace navigation keep their selection. Home exposes the upstream relationship, the full local MIT license, and a downloadable guide.
 
 ## Runtime and models
 
-Prepare Python 3.12, FFmpeg, and the application dependencies. In a prepared environment, run these commands from the source directory:
+The current Windows setup uses this layout; adapt paths to your own installation:
 
-```powershell
-python -m pip install -r requirements.txt
-python -m streamlit run webui.py --server.address=127.0.0.1 --server.port=8501
+```text
+workspace/
+├─ start.bat
+├─ .conda/
+│  ├─ narratoai/              Main application environment
+│  └─ narratoai-align/        Local alignment environment
+├─ models/
+│  └─ Qwen3-ForcedAligner-0.6B-hf/
+└─ NarraLens/                Actual code directory
+   ├─ webui.py
+   ├─ config.toml
+   └─ storage/
 ```
 
-Open `http://127.0.0.1:8501`. The repository does not include local Conda environments, model weights, source media, or generated outputs. Local alignment and explanatory animations require their own model/runtime and Node/Remotion dependencies.
+The actual code directory is NarraLens, and the old directory entry has been removed. Video and audio library paths now use the new directory while retaining material IDs, fingerprints, subtitle/frame caches, and existing analyses. Historical generation projects no longer receive old-path compatibility. The launcher uses NarraLens; existing environments and the internal package name are retained. See the library migration and old directory removal notes.
 
-This repository starts its independent commit history at NarraLens v2.5.0. Upstream attribution and the license are retained; implementation documents remain on the maintainer's computer.
+In an already prepared workspace, run `start.bat` from the parent directory and open `http://127.0.0.1:8501`. Keep the launch window open. Press Ctrl+C to stop.
+
+A new machine requires the application dependencies, FFmpeg, and the selected model services. The existing alignment deployment notes describe the current machine and need adaptation for other hardware.
 
 Media, projects, and generated outputs are managed locally. Text, vision, audio analysis, and speech services may call external APIs according to the selected configuration. Analysis sends the relevant manuscript, subtitles, images, or full music track to that service.
 
@@ -91,7 +102,7 @@ Long-form narration in the manuscript workflow uses [Qwen/Qwen3-ForcedAligner-0.
 - Prepare a separate PyTorch/Transformers environment and local model weights. The current GPU worker uses BF16 and the cuda device interface; AMD GPUs require a working ROCm environment.
 - Local alignment is enabled by default. Turning it off keeps subtitles and estimates timing from audio duration and text weights, which can differ from actual speech.
 
-Explanatory animations use separately prepared Node, Remotion, and browser dependencies.
+Explanatory animations use the configured Node, Remotion, and browser rendering environment. See the animation setup and rollback notes.
 
 ## Production workflow
 
@@ -106,6 +117,7 @@ Visual units use existing narration timestamps and do not change TTS blocks. Pag
 
 Video and music originals normally remain at their registered paths. Libraries save analysis and derived data. Successful analysis can be reused, and interrupted runs can continue.
 
+Detailed instructions are in the workflow guide.
 
 ## Storage
 
@@ -123,84 +135,32 @@ Paths below are relative to the existing code directory:
 
 Moving or deleting originals affects later reads. Update registrations or use the supported rebind actions.
 
-## Resume, reuse, and delete
+## Upgrading to 2.8
 
-Use the general continue action or numbered stages 1–5. Each stage validates its prerequisites and can reuse matching saved output. Use the workspace copy actions to apply changes to existing speech, subtitles, animations, or music.
+1. Select a legacy video library and choose **Create a 2.8 analysis copy** (创建 2.8 拉片副本). Registrations and owned subtitles are copied into a separate database. Original videos remain path references; the old library is retained.
+2. Confirm the adaptation, episode mapping and subtitles. Analyze one or two episodes first, inspect events and evidence, then continue the remaining assets.
+3. Create a new project or a reusable copy with the new libraries. Compatible narration, subtitle and alignment caches remain reusable. Requirements and shot matches use the new 2.8 protocol.
+4. Continue from **3. Find footage**. Successful observations and matches are cached independently; continuation uses saved retrieval cursors. Shortages distinguish incomplete analysis, unresolved requests, missing event matches, duration and source allocation conflicts.
 
-After upgrading to 2.7, resume old timelines from **3. Find footage**, reusing narration, captions, and alignment. Stages 4 and 5 cannot bypass the new content checks. The previous video and timeline are retained under the project's `history/visual-*` directory. When candidate visual confirmation is disabled, content relationships are still reviewed using saved descriptions and range-specific subtitles and marked as not visually rechecked. The independent credits/usability check still uses a vision model.
+The video library combines subtitles and sampled frames into attributed observations, then groups actual shot ranges into content events. Request batches are not semantic boundaries. Long-take sampling spacing controls preprocessing rather than fixed-duration event segmentation.
 
-Version 2.7.1 accepts valid zero-duration alignment entries and uses positive-duration speech anchors while retaining the full manuscript. Projects stopped by this issue can resume from stage 3 using existing narration and captions. Missing positive-duration anchors and invalid timing data still produce explicit errors.
+Optional work notes include Markdown, character aliases, periods, local reference shots, episode mapping and attributed Bangumi data. External information guides interpretation and never proves that a local shot contains an event. Local analysis works without external data.
 
-Version 2.7.2 uses range-scoped subtitle IDs and restores the original quotes in code. Identifiable row errors reject that candidate while retaining valid peers; unconfirmed formats and content shortages are recorded separately. Resume from **3. Find footage** to apply the new protocol, reusing narration, captions, alignment, and independent usability checks. Previous videos and timelines are retained; library reanalysis is unnecessary.
+The content browser shows event summaries, source previews and evidence references. Individual ranges can be reanalyzed or corrected. Similar sampled frames are suggestions; confirmed duplicate groups participate in timeline deduplication.
 
-Version 2.7.3 uses token-conscious footage scheduling from stage 3: restore approved candidates, prepare candidates locally, optionally run text-only model preselection, propose the full timeline, then inspect proposed footage as needed. Per-unit expansion pauses after successive rounds without new approved duration; continuing reuses caches and advances the search cursor. The workspace displays reported tokens for the current run and project history. Narration, captions, alignment, and previous output are retained; provisional plans cannot be rendered.
+Concrete plot events retain direct evidence requirements. Commentary and interpretation can use grounded illustrations. Explicit event chronology is preserved; lists of properties or opinions do not automatically impose shot order. Source reuse, credits and minimum shot duration remain checked.
 
-Version 2.7.4 reconciles shared visual cuts after restoring semantic groups, checking original-text bindings, rendered animation reservations, and speech gaps with a half-frame rounding tolerance. Projects stopped by the three reported subsecond intervals can resume from **3. Find footage** using existing narration, captions, and animations. Search pools and cursors are reused only when the original plan key, library, and model settings match. Genuine short intervals and binding conflicts still pause with a reason.
+Libraries and historical narration, captions, animation and final videos are not automatically rewritten. This release does not rebuild every library in the background. Use a project copy when switching libraries.
 
-Version 2.7.5 fixes the pending-state conflict that blocked new candidate approval. Valid peers are retained while necessary malformed rows get one small correction pass. Saved gaps can receive targeted review of commentary mistaken for concrete facts while retaining actual plot constraints. Unchanged units retain search progress; changed requirements revalidate existing ranges. Resume from **3. Find footage**. Necessary corrections and requirement reviews call the selected models and count toward token usage; genuine footage shortages are still reported.
+## Version 2.8.0
 
-Version 2.7.6 filters invalid preselection IDs individually and retains valid choices. Empty selections retain only a few pending local alternatives; text protocol errors no longer mark whole groups as visually unconfirmed. Revised requirements reuse old approvals only when manuscript, source range, model cache identity and final admission checks prove compatibility. No-gain rounds require completed valid content assessment, with separate protocol, allocation and visual-review pause reasons. Resume from **3. Find footage**. New reviews still consume tokens; genuine footage gaps remain visible.
+This release replaces window-based retrieval with event-to-shot retrieval, stable media range IDs, combined subtitle/frame observations, optional work knowledge, local corrections and targeted enrichment. It removes the old candidate expansion and multiple identifier translation/recovery branches while reusing the existing API gateway and concurrency coordinator.
 
-Version 2.7.7 saves temporary source conflicts and inconclusive reviews per candidate, then tries other ranges. Local retrieval continues past empty window batches. Resume advances the saved candidate queue and window cursor while reusing paid results. Unknown reply IDs are rejected individually and valid peers are retained. Strictly identified negative results may be validated locally without another correction request. User-configured valid no-gain stopping and final factual, pending-review, unique-source and credits gates remain required. Resume from **3. Find footage**; new reviews still consume tokens.
+No new local model, vector database or CUDA requirement is introduced. Existing TTS, forced alignment, subtitle layout, audio library, BGM, Remotion and FFmpeg rendering remain in use.
 
-Version 2.7.8 separates ASS language hints from dialogue, lyrics and translator annotations, preserving Chinese dialogue in neutral styles. Video Library adds subtitle checks, local dialogue/index recovery and per-asset rollback, retaining old files and visual analysis. Restored subtitle semantics are marked pending. Known dialogue loss blocks paid footage search. Each actual review handles one manuscript unit with multiple candidates. Grounded atomic facts may be covered by several shots, but only evidence inside the footage actually used counts. Unique-source, credits and minimum-duration checks remain required. Check/recover subtitle data before resuming from **3. Find footage**. Model review and full output still require live acceptance.
+Implementation and static checks are complete. Full-library API analysis, token comparisons and final-video acceptance have not been run automatically. Inspect a small sample before expanding the analysis scope; sampled frames and model judgments can remain uncertain.
 
-Version 2.7.9 uses original-text part IDs for gap requirement revision. The model selects ranges and code restores quotes, offsets and fact IDs, without repeated quotation copying or legacy fact-index remapping. Valid peers are saved immediately. Invalid units receive one local correction with field-specific feedback; unresolved work pauses with saved progress. Parsed replies, request references and application validation remain in one batch audit. Compatible successful requirements can be reused. Resume from **3. Find footage**; new revisions and corrections consume tokens. No model calls or generation were run for this release; semantic quality and full output still require live acceptance.
-
-Version 2.7.10 schedules footage reviews across independent manuscript units with bounded concurrency, defaulting to 4 and adjustable in advanced output settings. Set 1 for the same serial path. Each request still handles one unit and a small set of proposed candidates. Inputs are frozen; the task thread persists replies, updates usage and commits shared state before batch allocation. Remaining duration bounds candidate submissions, with temporary source reservations and all factual, credits, source uniqueness and minimum-shot gates retained. New reply receipts support recovery after interrupted cache application; compatible caches remain reusable. Restart and resume from **3. Find footage**. Live concurrency, speed/token comparisons and full output have not been tested; no fixed speedup is promised.
-
-Version 2.7.11 repairs requirement replies with uniquely resolvable zero-padding differences and JSON-identical duplicates. Conflicting results, wrong or ambiguous IDs and invalid original-text ranges remain blocked. Correction feedback includes the actual returned IDs and rows. Pending requirements may reuse the latest saved reply only after verifying its complete input identity and passing the existing validator. Compatible successful caches and 2.7.10 concurrency remain unchanged. Restart and resume from **3. Find footage**. Offline debugging with saved replies passed; no model calls or full generation were run.
-
-Version 2.7.12 fixes footage review IDs and correction feedback. Within one manuscript unit, a clip ID may map to a pair ID only when the current catalog proves a unique match; conflicting duplicate rows remain blocked. Corrections retain actual bad rows and rebind unit, pair, clip and subtitle IDs to the current batch. Empty fact lists explicitly require empty supports. Additional valid visual evidence no longer triggers another visual request just for exceeding three entries. Progress distinguishes initial reviews, corrections and sub-batches; redacted raw replies are linked to audits. Successful caches remain reusable. Only the latest recorded unconfirmed reply with the same input identity is eligible for local revalidation. Restart and resume from **3. Find footage**. Offline replay of 276 saved replies preserved all 148 previously valid rows and validated 34 additional rows locally. These are protocol results, not 34 additional usable shots; live model and full-video acceptance remain separate.
-
-Delete a manuscript project through **Project Management → select project → Manage Project → inspect files and deletion scope → confirm → permanently delete**. This removes the current project and its output while retaining original media and external manuscript files. Associated running work must stop first.
-
-Code archives normally exclude storage, media, environments, and weights. Back up project data separately when preserving audio, videos, and analysis.
-
-## Version and documentation
-
-Version 2.7.12 repairs footage review identity handling, correction feedback and progress reporting, and records redacted raw replies. Identity and evidence-list formatting fixes retain content, citation, credits and allocation checks. Offline replay passed; no live model or video generation was run.
-
-Version 2.7.11 fixed requirement ID matching, identical duplicate rows and missing correction data, with controlled recovery of paid pending replies. Offline debugging and static review are recorded separately; live model and full-video acceptance remain pending.
-
-Version 2.7.10 added configurable footage review concurrency, defaulting to 4 with the same serial path at 1. Frozen inputs, shared validation and task-thread commits support batch allocation and paid-result recovery. Static review is recorded separately from live concurrency, token and full-generation acceptance, which remain pending.
-
-Version 2.7.9 simplified requirement revision and validation, reuses compatible successful results, saves complete parsed replies and corrects only invalid units once. Recoverable work pauses with progress retained. Implementation and static review are recorded separately from live model and full-generation acceptance, which have not been run.
-
-Version 2.7.8 repaired lost Chinese ASS dialogue, adds reversible local index recovery, isolates actual reviews by manuscript unit and supports grounded multi-shot fact coverage. Existing narration, subtitle timing, compatible caches and old output are retained. Implementation and static review are complete; full generation and token effects have not been validated.
-
-Version 2.7.7 repaired premature unit pauses, empty local batch handling and repeated selection of blocked candidates on resume. Saved candidate progress tracks allocation changes and inconclusive reviews. Valid reply peers and narrowly normalized negative results retain their audit records. Implementation and static review are complete; live gap improvement, token consumption and full video output have not been validated.
-
-Version 2.7.6 repaired invalid preselection IDs, strictly compatible approval reuse and valid no-gain accounting while retaining existing audio, subtitles and footage ranges.
-
-Version 2.7.5 fixed candidate approval state, local format correction, legacy cache scope and targeted gap requirement review, while retaining original grouping and unchanged-unit search progress.
-
-Version 2.7.4 reconciles animation frame edges and visual cuts with the same original-text binding while retaining narration, captions, and animations. Saved project recovery records show the three reported remnants resolved; full video output still needs validation.
-
-Version 2.7.3 added optional text preselection, provisional allocation and on-demand footage confirmation, shared request catalogues with canonical ID restoration, approved-result reuse, search checkpoints, no-gain pauses, and reported token totals. Final factual, source deduplication, credits and timeline checks remain required. Token savings and video quality still need validation.
-
-Version 2.7.2 binds subtitle evidence to candidate-specific IDs and rejects local errors while retaining valid peers. Abstract claims and concrete constraints are separated, with zero-duration alignment compatibility retained.
-
-Version 2.7.1 fixes visual planning rejecting otherwise valid alignment data containing zero-duration entries. The manuscript, audio, captions, and source caches are retained; only positive-duration points serve as speech anchors. Invalid ranges, malformed times, and missing voiced anchors remain errors. Existing valid 2.7 visual plans remain compatible.
-
-Version 2.7.0 adds visual units bound to existing narration timing, reviews content relationships for actual source ranges, and removes automatic admission of unselected fallback footage. Whole-video allocation reserves footage for concrete events and scarce evidence before arranging duration. Gap diagnostics and paginated details preserve long-form TTS, captions, manual animation nodes, source-shot deduplication, and credits filtering. The implementation is in place; improvements still require review of generated footage. Three-frame sampling and model judgments cannot guarantee correct identification in every case.
-
-Version 2.6.1 connects manuscript projects to the existing TTS adapters, with per-configuration voice drafts, provider-sized requests, cached internal audio, task-scoped credentials, and recursive credential removal from saved snapshots. Existing MiMo/Edge caches, three-second logical block gaps, and local alignment remain supported. Provider connectivity and voice quality have not been validated for every service.
-
-Version 2.6.0 prohibits reuse of the same source shot within one output using content fingerprints and detected cut boundaries, expands retrieval when footage runs short, and checks actual source ranges to exclude credits, mixed footage, and uncertain results. Range checks are cached. Animation cards, arrows, progress, and subtitle space use separate layout regions. Visual near-duplicates across episodes or differently encoded files are not detected; sampled-frame checks also depend on model accuracy.
-
-Version 2.5.4 reports animation format issues together and uses the previous JSON to repair failed fields while retaining valid content and original-text bindings. Correction messages are recorded and included in input budgets.
-
-Version 2.5.3 allows chapter title animations from 2 seconds while flow and comparison animations require 4 seconds. The Production Workspace shows actual narration times and checks all manual nodes using the same duration rules as automatic planning.
-
-Version 2.5.2 fixes animation browser paths after directory moves, stores project-local browser paths relative to the Remotion directory, identifies missing runtime files, and removes unused .github configuration.
-
-Version 2.5.1 documents the local subtitle timestamp model and synchronizes the independent repository release metadata.
-
-Version 2.5.0 adds Home, the bilingual NarraLens identity, new README files, and explicit upstream/license information. Prior project creation fixes and the persistent manual animation Add Node button remain in place.
-
-Implementation notes distinguish source changes, static checks, and functional acceptance. Some changes have not yet been validated through the full UI or generation workflow.
-
+Local implementation notes stay in docs. The public repository excludes those machine-specific records, tests, credentials, media, environments and generated output.
 
 ## License and acknowledgements
 
