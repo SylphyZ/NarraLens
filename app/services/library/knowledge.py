@@ -9,28 +9,47 @@ import requests
 from app.services.library.store import stable_hash
 
 
+def validate_work(work, previous=None, range_ids=()):
+    """Validate the same document for normal forms and advanced JSON drafts."""
+    if not isinstance(work, dict):
+        raise ValueError("作品资料须为对象。")
+    previous = previous or {}
+    value = {k: work.get(k, previous.get(k, default)) for k, default in
+             (("title", ""), ("adaptation", "动画"), ("season", ""), ("notes", ""),
+              ("characters", []), ("external", {}), ("episode_map", {}))}
+    if set(work) - set(value):
+        raise ValueError("仅可导入作品可编辑字段，不能修改修订编号或外部来源。")
+    for field in ("title","adaptation","season","notes"):
+        if not isinstance(value[field],str):
+            raise ValueError(f"{field}须为文本。")
+    if not isinstance(value["characters"],list):
+        raise ValueError("人物卡应为列表。")
+    for person in value["characters"]:
+        if not isinstance(person,dict) or not isinstance(person.get("name"),str) or not person["name"].strip():
+            raise ValueError("每张人物卡需要名称。")
+        if set(person) - {"name", "aliases", "reference_ranges", "period", "identity_basis"}:
+            raise ValueError("人物卡仅允许名称、别名、时期、身份说明和参考镜头。")
+        for field in ("aliases","reference_ranges"):
+            items = person.get(field,[])
+            if not isinstance(items,list) or any(not isinstance(i,str) for i in items):
+                raise ValueError(f"人物卡{field}应为文本列表。")
+        for field in ("period", "identity_basis"):
+            if not isinstance(person.get(field, ""), str):
+                raise ValueError(f"人物卡{field}须为文本。")
+        if any(rid not in range_ids for rid in person.get("reference_ranges", [])):
+            raise ValueError("参考镜头必须选择本库已登记的镜头范围。")
+    if not isinstance(value["episode_map"],dict) or any(not str(k).isdigit() or type(v) not in (int,float) or
+            not math.isfinite(v) or v <= 0 for k,v in value["episode_map"].items()):
+        raise ValueError("集号映射须为有效正数编号。")
+    return value
+
+
 def save_work(store, library_id, work):
     from app.services.library.runner import library_operation
     with library_operation(library_id):
         previous = store.cache_get(library_id, "work") or {}
-        value = {k: work.get(k, previous.get(k, default)) for k, default in
-                 (("title", ""), ("adaptation", "动画"), ("season", ""), ("notes", ""),
-                  ("characters", []), ("external", {}), ("episode_map", {}))}
-        for field in ("title","adaptation","season","notes"):
-            if not isinstance(value[field],str):
-                raise ValueError(f"{field}须为文本。")
-        if not isinstance(value["characters"],list):
-            raise ValueError("人物卡应为列表。")
-        for person in value["characters"]:
-            if not isinstance(person,dict) or not isinstance(person.get("name"),str) or not person["name"].strip():
-                raise ValueError("每张人物卡需要名称。")
-            for field in ("aliases","reference_ranges"):
-                items = person.get(field,[])
-                if not isinstance(items,list) or any(not isinstance(i,str) for i in items):
-                    raise ValueError(f"人物卡{field}应为文本列表。")
-        if not isinstance(value["episode_map"],dict) or any(not str(k).isdigit() or type(v) not in (int,float) or
-                not math.isfinite(v) or v <= 0 for k,v in value["episode_map"].items()):
-            raise ValueError("集号映射须为有效正数编号。")
+        value = validate_work({k: v for k, v in work.items() if k not in {"revision", "updated"}}, previous,
+                              {r["id"] for r in store.records(library_id, include_stale=True)})
         value["revision"] = stable_hash(value)
         if value.get("revision") == previous.get("revision"):
             return previous
@@ -55,7 +74,7 @@ def fetch_bangumi(subject, proxy=None):
 
     def get(path, **params):
         response = requests.get("https://api.bgm.tv/v0/"+path, params=params,
-                                headers={"User-Agent": "NarraLens/2.8.0 (https://github.com/SylphyZ/NarraLens)"},
+                                headers={"User-Agent": "NarraLens/2.8.1 (https://github.com/SylphyZ/NarraLens)"},
                                 proxies=proxies, timeout=(10, 30))
         response.raise_for_status()
         return response.json()

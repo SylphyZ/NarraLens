@@ -150,6 +150,24 @@ def observation_result(row, item):
     return result
 
 
+def correction_result(item, changes):
+    """One validator for form drafts, JSON imports and committed corrections."""
+    allowed = {"visible_people", "period", "location", "summary", "tags", "content_kind",
+               "duplicate_group", "uncertainties", "observations"}
+    if not isinstance(changes, dict) or set(changes) - allowed:
+        raise ModelFormatError("仅可编辑观察字段，镜头编号、时间和来源由程序保留。")
+    for field, fields in (("observations", {"kind", "text", "frame_ids", "cue_ids"}),
+                          ("visible_people", {"name", "period", "identity_basis", "frame_ids"})):
+        if field in changes and (not isinstance(changes[field], list) or any(
+                not isinstance(row, dict) or set(row)-fields for row in changes[field])):
+            raise ModelFormatError(f"{field}仅可编辑说明和选择当前证据，不能手工修改证据编号或时间。")
+    if not isinstance(changes.get("duplicate_group", ""), str):
+        raise ModelFormatError("重复画面组须为文本。")
+    result = observation_result({**item, **changes, "range_id": item["id"]}, item)
+    result["duplicate_group"] = changes.get("duplicate_group", item.get("duplicate_group", ""))
+    return result
+
+
 def content_result(value, ranges, context_ids=()):
     """Semantic groups cover current ranges once, and may explicitly continue a prior group."""
     from app.models.library import media_id

@@ -6,12 +6,56 @@ import shutil
 import base64
 import subprocess
 import threading
+import json
+import sys
 from copy import deepcopy
 from uuid import uuid4
 from loguru import logger
 from app.utils import utils
 
 _folder_dialog_lock = threading.Lock()
+
+
+def probe_file(path, timeout=8):
+    """Explicit read-only probe in a disposable process, including blocked UNC paths."""
+    script = """
+import errno, json, os, stat, sys
+path = json.loads(sys.stdin.read())
+try:
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        result = {"state": "missing", "reason": "路径不是普通文件"}
+    else:
+        with open(path, "rb") as stream:
+            stream.read(1)
+        result = {"state": "available", "reason": ""}
+except OSError as exc:
+    code = getattr(exc, "winerror", None)
+    if isinstance(exc, PermissionError):
+        state = "denied"
+    elif code in (53, 64, 67, 121, 1203, 1231, 1232) or exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ETIMEDOUT):
+        state = "unreachable"
+    elif isinstance(exc, FileNotFoundError):
+        state = "missing"
+    else:
+        state = "unconfirmed"
+    result = {"state": state, "reason": str(exc)}
+print(json.dumps(result, ensure_ascii=True))
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", script], input=json.dumps(str(path)),
+            capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode:
+            return {"state": "unconfirmed", "reason": result.stderr[-400:]}
+        return json.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills and reaps the child; there is no abandoned probe thread.
+        return {"state": "timeout", "reason": f"超过 {timeout} 秒，结果未确认"}
+    except (OSError, ValueError) as exc:
+        return {"state": "unconfirmed", "reason": str(exc)}
 
 
 def remembered_widget_value(key, default=None):
@@ -41,10 +85,12 @@ def remember_widget_values(prefix=None):
 def remembered_expander(label, *, key, default=False):
     """Keep the expander identity fixed while restoring its saved open state."""
     import streamlit as st
-    memory = st.session_state.get("narration_widget_memory", {})
+    memory = st.session_state.setdefault("narration_widget_memory", {})
     if key not in st.session_state and (key in memory or default):
         st.session_state[key] = bool(memory.get(key, default))
-    return st.expander(label, expanded=False, key=key, on_change="rerun")
+    def remember():
+        memory[key] = bool(st.session_state.get(key, False))
+    return st.expander(label, expanded=False, key=key, on_change=remember)
 
 
 def folder_input(label, *, key, value="", help=None, disabled=False, tr=lambda text: text):
@@ -168,14 +214,14 @@ def get_file_list(directory, file_types=None, sort_by='ctime', reverse=True):
     """
     if not os.path.exists(directory):
         return []
-    
+
     files = []
     if file_types:
         for file_type in file_types:
             files.extend(glob.glob(os.path.join(directory, f"*{file_type}")))
     else:
         files = glob.glob(os.path.join(directory, "*"))
-    
+
     file_list = []
     for file_path in files:
         try:
@@ -190,11 +236,11 @@ def get_file_list(directory, file_types=None, sort_by='ctime', reverse=True):
             file_list.append(file_info)
         except Exception as e:
             logger.error(f"获取文件信息失败: {file_path}, 错误: {e}")
-    
+
     # 排序
     if sort_by in ['ctime', 'mtime', 'size', 'name']:
         file_list.sort(key=lambda x: x.get(sort_by, ''), reverse=reverse)
-    
+
     return file_list
 
 def save_uploaded_file(uploaded_file, save_dir, allowed_types=None):
@@ -209,28 +255,28 @@ def save_uploaded_file(uploaded_file, save_dir, allowed_types=None):
     try:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        
+
         file_name, file_extension = os.path.splitext(uploaded_file.name)
-        
+
         # 检查文件类型
         if allowed_types and file_extension.lower() not in allowed_types:
             logger.error(f"不支持的文件类型: {file_extension}")
             return None
-        
+
         # 如果文件已存在，添加时间戳
         save_path = os.path.join(save_dir, uploaded_file.name)
         if os.path.exists(save_path):
             timestamp = time.strftime("%Y%m%d%H%M%S")
             new_file_name = f"{file_name}_{timestamp}{file_extension}"
             save_path = os.path.join(save_dir, new_file_name)
-        
+
         # 保存文件
         with open(save_path, "wb") as f:
             f.write(uploaded_file.read())
-        
+
         logger.info(f"文件保存成功: {save_path}")
         return save_path
-    
+
     except Exception as e:
         logger.error(f"保存上传文件失败: {e}")
         return None
@@ -247,13 +293,13 @@ def create_temp_file(prefix='tmp', suffix='', directory=None):
     try:
         if directory is None:
             directory = utils.storage_dir("temp", create=True)
-        
+
         if not os.path.exists(directory):
             os.makedirs(directory)
-        
+
         temp_file = os.path.join(directory, f"{prefix}-{str(uuid4())}{suffix}")
         return temp_file
-    
+
     except Exception as e:
         logger.error(f"创建临时文件失败: {e}")
         return None
@@ -268,7 +314,7 @@ def get_file_size(file_path, format='MB'):
     """
     try:
         size_bytes = os.path.getsize(file_path)
-        
+
         if format.upper() == 'B':
             return size_bytes
         elif format.upper() == 'KB':
@@ -279,7 +325,7 @@ def get_file_size(file_path, format='MB'):
             return size_bytes / (1024 * 1024 * 1024)
         else:
             return size_bytes
-    
+
     except Exception as e:
         logger.error(f"获取文件大小失败: {file_path}, 错误: {e}")
         return 0
@@ -312,22 +358,22 @@ def create_zip(files: list, zip_path: str, base_dir: str = None, folder_name: st
     """
     try:
         import zipfile
-        
+
         # 确保目标目录存在
         os.makedirs(os.path.dirname(zip_path), exist_ok=True)
-        
+
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for file in files:
                 if not os.path.exists(file):
                     logger.warning(f"文件不存在，跳过: {file}")
                     continue
-                    
+
                 # 计算文件在zip中的路径，添加folder_name作为前缀目录
                 if base_dir:
                     arcname = os.path.join(folder_name, os.path.relpath(file, base_dir))
                 else:
                     arcname = os.path.join(folder_name, os.path.basename(file))
-                
+
                 try:
                     zipf.write(file, arcname)
                 except Exception as e:
@@ -335,7 +381,7 @@ def create_zip(files: list, zip_path: str, base_dir: str = None, folder_name: st
                     continue
 
         return True
-        
+
     except Exception as e:
         logger.error(f"创建zip文件失败: {e}")
         return False

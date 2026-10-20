@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.8.0**
+**Manuscript-driven video production · v2.8.1**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.8.0 provides seven workspaces:
+Version 2.8.1 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -137,12 +137,12 @@ Moving or deleting originals affects later reads. Update registrations or use th
 
 ## Upgrading to 2.8
 
-1. Select a legacy video library and choose **Create a 2.8 analysis copy** (创建 2.8 拉片副本). Registrations and owned subtitles are copied into a separate database. Original videos remain path references; the old library is retained.
+1. Libraries already using the content schema (schema 2) can be opened directly. Only legacy window libraries show **Create a 2.8 analysis copy** (创建 2.8 拉片副本): copy registrations and owned subtitles into a separate database while referencing the same original videos and retaining the old library.
 2. Confirm the adaptation, episode mapping and subtitles. Analyze one or two episodes first, inspect events and evidence, then continue the remaining assets.
 3. Create a new project or a reusable copy with the new libraries. Compatible narration, subtitle and alignment caches remain reusable. Requirements and shot matches use the new 2.8 protocol.
 4. Continue from **3. Find footage**. Successful observations and matches are cached independently; continuation uses saved retrieval cursors. Shortages distinguish incomplete analysis, unresolved requests, missing event matches, duration and source allocation conflicts.
 
-The video library combines subtitles and sampled frames into attributed observations, then groups actual shot ranges into content events. Request batches are not semantic boundaries. Long-take sampling spacing controls preprocessing rather than fixed-duration event segmentation.
+The video library combines subtitles and sampled frames into attributed observations, then groups actual shot ranges into content events. Request batches are not semantic boundaries. The long-take target duration divides analysis ranges; it is not a frame sampling interval or a fixed event duration.
 
 Optional work notes include Markdown, character aliases, periods, local reference shots, episode mapping and attributed Bangumi data. External information guides interpretation and never proves that a local shot contains an event. Local analysis works without external data.
 
@@ -152,13 +152,24 @@ Concrete plot events retain direct evidence requirements. Commentary and interpr
 
 Libraries and historical narration, captions, animation and final videos are not automatically rewritten. This release does not rebuild every library in the background. Use a project copy when switching libraries.
 
-## Version 2.8.0
+## Version 2.8.1
 
-This release replaces window-based retrieval with event-to-shot retrieval, stable media range IDs, combined subtitle/frame observations, optional work knowledge, local corrections and targeted enrichment. It removes the old candidate expansion and multiple identifier translation/recovery branches while reusing the existing API gateway and concurrency coordinator.
+This patch updates video library controls and state handling:
+
+- Overview, work notes, registered assets, analysis jobs, browsing and maintenance have separate sections with remembered expansion state.
+- Forms and tables edit character cards, episode mapping and observations. Frame/caption references are selected from the current range. Advanced JSON is collapsed by default and imports into the same validated form draft.
+- Observations remain browsable when the event directory is incomplete. Missing or outdated references show an explanation.
+- The **long-take analysis target duration** defaults to 15 seconds, with up to 50 ranges per request and a concurrency limit of 32. Scope is explicitly all assets or selected assets; the target duration is not a sampling interval.
+- Source availability is checked explicitly in the background with an eight-second per-file timeout. Permission, network, missing-file and timeout results are separate; page refreshes do not probe every source path.
+- Subtitle restoration marks related observations and events for rebuilding. Targeted repairs preserve other observations; directory continuation reuses successful results.
+
+The database stays at schema 2. Nothing is migrated, cleared or rebuilt automatically. Older 2.8 event records without observation revision links need a normal continuation for the affected assets; saved observations remain reusable. Import, analysis, subtitle restoration and source checks require explicit user actions.
+
+The 2.8 core continues to use event-to-shot retrieval, stable media range IDs, combined subtitle/frame observations, optional work knowledge, local corrections and targeted enrichment. It removes the old candidate expansion and multiple identifier translation/recovery branches while reusing the existing API gateway and concurrency coordinator.
 
 No new local model, vector database or CUDA requirement is introduced. Existing TTS, forced alignment, subtitle layout, audio library, BGM, Remotion and FFmpeg rendering remain in use.
 
-Implementation and static checks are complete. Full-library API analysis, token comparisons and final-video acceptance have not been run automatically. Inspect a small sample before expanding the analysis scope; sampled frames and model judgments can remain uncertain.
+Static source checks are complete. Automated tests, live WebUI interaction, model-powered library builds, token comparisons and final-video acceptance have not been run for this patch. Inspect a small sample before expanding the analysis scope; sampled frames and model judgments can remain uncertain.
 
 Local implementation notes stay in docs. The public repository excludes those machine-specific records, tests, credentials, media, environments and generated output.
 

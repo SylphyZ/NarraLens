@@ -265,16 +265,21 @@ class LibraryStore:
                 if row[0] not in expected:
                     db.execute("DELETE FROM shot_records WHERE id=?", (row[0],))
             db.execute("DELETE FROM content_segments WHERE asset_id=?", (asset_id,))
+            revisions = {r["id"]: json.loads(r["data"]).get("revision") for r in
+                         db.execute("SELECT id,data FROM shot_records WHERE asset_id=?", (asset_id,))}
             for item in segments:
+                item = {**item, "range_revisions": {rid: revisions[rid] for rid in item["range_ids"]}}
                 db.execute("INSERT INTO content_segments VALUES(?,?,?,?,?)",
                            (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
                 db.executemany("INSERT INTO content_links VALUES(?,?)",
                                [(item["id"], rid) for rid in item["range_ids"]])
 
-    def records(self, identifiers, kind="ranges"):
+    def records(self, identifiers, kind="ranges", *, include_stale=False):
+        """Read current evidence; the browser may also request retained, outdated records."""
         table = {"ranges": "shot_records", "contents": "content_segments"}[kind]
         result = []
         assets = {(a["library_id"],a["id"]):a for a in self.assets(identifiers)}
+        ranges = {(r["library_id"], r["id"]): r for r in self.records(identifiers, include_stale=True)} if kind == "contents" else {}
         for identifier in library_ids(identifiers):
             if self.schema(identifier) != SCHEMA_VERSION:
                 continue
@@ -286,32 +291,92 @@ class LibraryStore:
             for row in rows:
                 data = json.loads(row["data"])
                 asset = assets[(identifier,row["asset_id"])]
-                if kind == "ranges" and (data.get("fingerprint") != row["fingerprint"] or
-                        data.get("subtitle_identity") != asset.get("subtitle_identity")):
+                reasons = []
+                if kind == "ranges":
+                    if data.get("fingerprint") != row["fingerprint"]:
+                        reasons.append("原视频身份已改变")
+                    if data.get("subtitle_identity") != asset.get("subtitle_identity"):
+                        reasons.append("字幕登记已改变")
+                    if data.get("generation", "") != generations.get(data["id"], ""):
+                        data.update(analysis_state="uncertain", generation=generations.get(data["id"], ""))
+                        reasons.append("已要求重新分析，尚未保存新观察")
+                else:
+                    missing = []
+                    if set(data.get("range_revisions", {})) != set(data["range_ids"]):
+                        reasons.append("内容段尚无完整观察修订记录，请继续本集内容分段")
+                    for rid in data["range_ids"]:
+                        item = ranges.get((identifier, rid))
+                        if not item or item.get("stale_reasons") or (
+                                rid in data.get("range_revisions", {}) and
+                                data["range_revisions"][rid] != item.get("revision")):
+                            missing.append(rid)
+                    if missing:
+                        reasons.append("关联观察缺失或已更新，请继续内容分段")
+                    data["missing_range_ids"] = missing
+                if reasons and not include_stale:
                     continue
-                if kind == "ranges" and data.get("generation","") != generations.get(data["id"],""):
-                    data.update(analysis_state="uncertain",generation=generations[data["id"]])
+                if include_stale:
+                    data["stale_reasons"] = reasons
+                    if kind == "ranges":
+                        data["observed_fingerprint"] = data.get("fingerprint")
                 result.append({**data, **{k: row[k] for k in row.keys() if k != "data"},
                                "library_id": identifier})
         return result
 
-    def correct_range(self, library_id, range_id, changes, reason):
+    def content_status(self, identifiers):
+        """Derive UI availability from the same current evidence used by retrieval."""
+        assets = self.assets(identifiers)
+        ranges = self.records(identifiers, include_stale=True)
+        contents = self.records(identifiers, "contents", include_stale=True)
+        result = {}
+        for asset in assets:
+            own = [r for r in ranges if (r["library_id"], r["asset_id"]) == (asset["library_id"], asset["id"])]
+            events = [e for e in contents if (e["library_id"], e["asset_id"]) == (asset["library_id"], asset["id"])]
+            current = [r for r in own if not r["stale_reasons"]]
+            valid = [e for e in events if not e["stale_reasons"]]
+            linked = {rid for e in valid for rid in e["range_ids"]}
+            usable_ids = {r["id"] for r in current if r["id"] in linked and r.get("analysis_state") == "ready" and
+                          r.get("content_kind") == "story" and r["end"]-r["start"] >= 1.24}
+            usable = len(usable_ids)
+            stale = sum(bool(r["stale_reasons"]) for r in own)
+            uncertain = sum(r.get("analysis_state") != "ready" for r in current)
+            if stale or any(e["stale_reasons"] for e in events):
+                label = "资料待更新"
+            elif not current:
+                label = "待分析"
+            elif not valid or any(r["id"] not in linked for r in current):
+                label = "观察已保存，目录待完成"
+            elif uncertain:
+                label = "目录已保存，观察待确认"
+            elif asset["status"] != "ready":
+                label = "部分结果已保存，继续拉片可补缺项"
+            else:
+                label = "拉片完成" if usable else "拉片完成，无可用剧情镜头"
+            result[(asset["library_id"], asset["id"])] = {
+                "label": label, "observations": len(current), "contents": len(valid),
+                "usable": usable, "stale": stale, "uncertain": uncertain,
+                "searchable_contents": sum(bool(usable_ids.intersection(e["range_ids"])) for e in valid),
+                "incomplete": asset["status"] != "ready" or not current or bool(stale or uncertain or
+                    any(e["stale_reasons"] for e in events) or any(r["id"] not in linked for r in current)),
+            }
+        return result
+
+    def correct_range(self, library_id, range_id, changes, reason, *, expected_revision=None):
         """Corrections are local evidence revisions; unrelated observations stay valid."""
         from app.services.library.runner import library_operation
-        allowed = {"visible_people", "period", "location", "summary", "tags", "content_kind", "duplicate_group", "uncertainties", "observations"}
-        if not reason.strip() or set(changes)-allowed:
-            raise ValueError("请说明更正依据，并使用允许的字段。")
+        if not reason.strip():
+            raise ValueError("请说明更正依据。")
         with library_operation(library_id), self.database(library_id) as db:
             row = db.execute("SELECT data FROM shot_records WHERE id=?", (range_id,)).fetchone()
             if row is None:
                 raise ValueError("镜头范围不存在。")
             item = json.loads(row[0])
+            current = next((r for r in self.records(library_id) if r["id"] == range_id), None)
+            if current is None or (expected_revision is not None and item.get("revision") != expected_revision):
+                raise ValueError("该镜头或来源已更新，请刷新后再更正。")
             old = dict(item)
-            item.update(changes)
-            from app.services.library.validation import observation_result
-            checked = observation_result({**item,"range_id":range_id},item)
-            item.update({k:checked[k] for k in ("observations","visible_people","summary","tags","period","location","content_kind")})
-            item["analysis_state"] = "ready" if item.get("coverage") == "sampled" and item.get("content_kind") != "unknown" else "uncertain"
+            from app.services.library.validation import correction_result
+            item = correction_result(item, changes)
             item["correction"] = {"reason":reason.strip(),"time":time.time(),"fields":sorted(changes)}
             # Explicit human correction becomes the current observation, with its own revision.
             db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)",
@@ -360,78 +425,23 @@ class LibraryStore:
                        (identifier, identifier, asset_id))
         return previous != identifier
 
-    def restore_subtitle(self, library_id, asset, subtitle, scenes, manifest):
-        """Commit one asset and its exact-window mapping together; keep old files and a rollback record."""
-        key = "subtitle-migration:" + manifest["id"]
+    def restore_subtitle(self, library_id, asset, subtitle, manifest):
+        """Update the registration only; retained observations become stale by identity."""
+        self.require_content_library(library_id)
         with self.database(library_id) as db:
             db.execute("BEGIN IMMEDIATE")
-            active = db.execute("SELECT active_subtitle FROM assets WHERE id=?", (asset["id"],)).fetchone()
-            if not active or active[0] != asset["active_subtitle"]:
-                raise ValueError("字幕登记已变化，请重新校验后恢复。")
-            old_scenes = [dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end", (asset["id"],))]
-            if stable_hash(old_scenes) != manifest["old_scenes_hash"]:
-                raise ValueError("场景已变化，请停止关联任务并重新校验。")
-            old_shots = [dict(row) for row in db.execute("SELECT sh.* FROM shots sh JOIN scenes s ON sh.scene_id=s.id WHERE s.asset_id=?", (asset["id"],))]
-            old_directory = db.execute("SELECT value FROM analysis_cache WHERE key=?", ("episode-summary:"+asset["id"],)).fetchone()
+            active = db.execute("SELECT active_subtitle,fingerprint FROM assets WHERE id=?", (asset["id"],)).fetchone()
+            if not active or tuple(active) != (asset["active_subtitle"], asset["fingerprint"]):
+                raise ValueError("素材或字幕登记已变化，请重新校验后恢复。")
             db.execute("INSERT OR IGNORE INTO subtitle_sources VALUES(?,?,?,?,?,?,?)", (
                 subtitle["id"], asset["id"], subtitle["source_path"], subtitle["original_path"],
                 subtitle["processed_path"], subtitle["content_hash"], json.dumps(subtitle["settings"], ensure_ascii=False)))
-            mapping = {}
-            for row in scenes:
-                mapping[row["old_id"]] = row["id"]
-                db.execute("INSERT INTO scenes VALUES(?,?,?,?,?,?,?,?,?)", (
-                    row["id"], asset["id"], row["start"], row["end"], row["transcript"],
-                    json.dumps(row["analysis"], ensure_ascii=False), row["version"], row["visual"], row["frame_paths"]))
-                db.execute("UPDATE shots SET scene_id=?,version=? WHERE scene_id=?", (row["id"], row["version"], row["old_id"]))
-                db.execute("DELETE FROM scenes WHERE id=?", (row["old_id"],))
-            db.execute("DELETE FROM analysis_cache WHERE key=?", ("episode-summary:"+asset["id"],))
-            db.execute("UPDATE assets SET active_subtitle=?,status=? WHERE id=?", (subtitle["id"], "partial" if scenes else "pending", asset["id"]))
-            committed = {**manifest, "state": "committed", "scene_map": mapping, "old_scenes": old_scenes,
-                         "old_shots": old_shots, "old_episode_directory": old_directory[0] if old_directory else None,
+            db.execute("UPDATE assets SET active_subtitle=?,status='pending' WHERE id=?", (subtitle["id"], asset["id"]))
+            committed = {**manifest, "state": "committed", "schema": SCHEMA_VERSION,
                          "old_status": asset["status"], "new_subtitle": subtitle}
-            committed["new_scenes_hash"] = stable_hash([dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end",(asset["id"],))])
-            committed["new_shots_hash"] = stable_hash([dict(row) for row in db.execute("SELECT sh.* FROM shots sh JOIN scenes s ON sh.scene_id=s.id WHERE s.asset_id=? ORDER BY sh.id",(asset["id"],))])
-            db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)", (key, json.dumps(committed, ensure_ascii=False)))
+            db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)",
+                       ("subtitle-migration:" + manifest["id"], json.dumps(committed, ensure_ascii=False)))
         return committed
-
-    def rollback_subtitle(self, library_id, migration_id):
-        with self.database(library_id) as db:
-            db.execute("BEGIN IMMEDIATE")
-            key = "subtitle-migration:"+migration_id
-            saved = db.execute("SELECT value FROM analysis_cache WHERE key=?",(key,)).fetchone()
-            manifest = json.loads(saved[0]) if saved else {}
-            if manifest.get("state") != "committed":
-                raise ValueError("此字幕恢复记录不存在或已回退。")
-            asset_id = manifest["asset_id"]
-            active = db.execute("SELECT active_subtitle FROM assets WHERE id=?",(asset_id,)).fetchone()
-            scenes = [dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end",(asset_id,))]
-            shots = [dict(row) for row in db.execute("SELECT sh.* FROM shots sh JOIN scenes s ON sh.scene_id=s.id WHERE s.asset_id=? ORDER BY sh.id",(asset_id,))]
-            if not active or active[0] != manifest["new_subtitle"]["id"] or stable_hash(scenes) != manifest.get("new_scenes_hash") or stable_hash(shots) != manifest.get("new_shots_hash"):
-                raise ValueError("恢复后资料已有新修改，拒绝覆盖后续工作；请按备份与manifest定点处理。")
-            for row in scenes:
-                db.execute("DELETE FROM shots WHERE scene_id=?",(row["id"],))
-            db.execute("DELETE FROM scenes WHERE asset_id=?",(asset_id,))
-            for row in manifest["old_scenes"]:
-                db.execute("INSERT INTO scenes VALUES(?,?,?,?,?,?,?,?,?)",tuple(row[k] for k in ("id","asset_id","start","end","transcript","analysis","version","visual","frame_paths")))
-            for row in manifest["old_shots"]:
-                db.execute("INSERT INTO shots VALUES(?,?,?,?,?,?)",tuple(row[k] for k in ("id","scene_id","start","end","description","version")))
-            db.execute("UPDATE assets SET active_subtitle=?,status=? WHERE id=?",(manifest["old_subtitle"],manifest["old_status"],asset_id))
-            directory_key = "episode-summary:"+asset_id
-            if manifest.get("old_episode_directory") is None:
-                db.execute("DELETE FROM analysis_cache WHERE key=?",(directory_key,))
-            else:
-                db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)",(directory_key,manifest["old_episode_directory"]))
-            manifest.update(state="rolled_back",rolled_back=time.time())
-            db.execute("UPDATE analysis_cache SET value=? WHERE key=?",(json.dumps(manifest,ensure_ascii=False),key))
-        return manifest
-
-    def subtitle_migrations(self, library_id):
-        result = []
-        for identifier in library_ids(library_id):
-            with self.database(identifier) as db:
-                rows = db.execute("SELECT value FROM analysis_cache WHERE key LIKE 'subtitle-migration:%'").fetchall()
-            result.extend({**json.loads(row[0]), "library_id": identifier} for row in rows)
-        return result
 
     def rebind(self, library_id, asset_id, media):
         from app.services.library.runner import library_operation
@@ -512,7 +522,7 @@ class LibraryStore:
         with self.database(library_id) as db:
             counts = {name: db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
                       for name in ("assets", "scenes", "analysis_cache")}
-            running_records = db.execute("SELECT COUNT(*) FROM analysis_jobs WHERE id IN ('build','import') AND state='running'").fetchone()[0]
+            running_records = db.execute("SELECT COUNT(*) FROM analysis_jobs WHERE id IN ('build','import','subtitle','files') AND state='running'").fetchone()[0]
             if db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
                 counts["scenes"] = db.execute("SELECT COUNT(*) FROM content_segments").fetchone()[0]
         return {"directory": str(directory), **counts, "running_records": running_records}

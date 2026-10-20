@@ -173,8 +173,9 @@ def audit_subtitles(store, library_id, stop=None):
 
 
 def restore_subtitle_text(store, library_id, stop=None):
-    """Repair only confirmed affected assets locally, preserving visual results and original files."""
+    """Restore current subtitles locally; affected observations require rebuilding."""
     with library_operation(library_id):
+        store.require_content_library(library_id)
         report = audit_subtitles(store, library_id, stop)
         if any(row["state"] == "error" for row in report):
             raise ValueError("字幕校验有原件／路径错误，请先处理：" + "；".join(row.get("error", "") for row in report if row["state"] == "error"))
@@ -186,39 +187,17 @@ def restore_subtitle_text(store, library_id, stop=None):
                 continue
             prepared = prepare_subtitle(asset["original_path"], json.loads(asset["subtitle_settings"]), with_report=True)
             subtitle = _write_subtitle(store, library_id, asset["id"], asset["subtitle_path"], prepared, json.loads(asset["subtitle_settings"]))
-            with store.database(library_id) as db:
-                old = [dict(row) for row in db.execute("SELECT * FROM scenes WHERE asset_id=? ORDER BY start,end", (asset["id"],))]
-            cues = pysrt.from_string(prepared[1])
-            restored = []
-            for scene in old:
-                previous = json.loads(scene["analysis"])
-                base = previous.get("_analysis_version", scene["version"])
-                version = stable_hash((base, subtitle["id"]))
-                transcript = _window_text(cues, scene["start"], scene["end"])
-                analysis = {"title": "正文已恢复·字幕语义待补", "summary": "", "characters": [], "events": [], "themes": [],
-                            "subtitle_semantics": "pending", "_analysis_version": base, "subtitle_identity": subtitle["id"]}
-                restored.append({**scene, "old_id": scene["id"], "id": stable_hash((asset["id"], asset["fingerprint"], subtitle["id"], scene["start"], scene["end"], version)),
-                                 "transcript": transcript, "analysis": analysis, "version": version})
             manifest = {"id": stable_hash((asset["id"], asset["active_subtitle"], subtitle["id"])), "state": "prepared",
-                        "rule": ASS_SELECTION_VERSION, "created": time.time(), "asset_id": asset["id"], "fingerprint": asset["fingerprint"],
-                        "old_subtitle": asset["active_subtitle"], "old_scenes_hash": stable_hash(old),
-                        "scene_map": {row["old_id"]: row["id"] for row in restored}, "new_subtitle": subtitle}
+                        "rule": ASS_SELECTION_VERSION, "created": time.time(), "asset_id": asset["id"],
+                        "fingerprint": asset["fingerprint"], "old_subtitle": asset["active_subtitle"], "new_subtitle": subtitle}
             path = store.directory(library_id)/"subtitle-migrations"/(manifest["id"]+".json")
             write_json(path, manifest)
-            committed = store.restore_subtitle(library_id, asset, subtitle, restored, manifest)
+            committed = store.restore_subtitle(library_id, asset, subtitle, manifest)
             write_json(path, committed)
-            repaired.append({"asset_id": asset["id"], "episode": asset["episode"], "windows": len(restored), "manifest": str(path)})
-            store.job(library_id, "subtitle", progress=100*len(repaired)/max(1,len(targets)), message=f"已恢复{len(repaired)}/{len(targets)}个素材正文；原片及视觉结果保留，字幕语义待补。")
-        store.job(library_id, "subtitle", state="complete", progress=100, message=f"本地恢复完成：{len(repaired)}个素材；未调用API。可继续寻找画面，或用原分析入口补字幕语义。")
+            repaired.append({"asset_id": asset["id"], "episode": asset["episode"], "manifest": str(path)})
+            store.job(library_id, "subtitle", progress=100*len(repaired)/max(1,len(targets)), message=f"已恢复{len(repaired)}/{len(targets)}个素材正文；受影响的观察和内容段需要重新拉片。")
+        store.job(library_id, "subtitle", state="complete", progress=100, message=f"本地恢复完成：{len(repaired)}个素材；未调用API。请在“拉片任务”指定这些素材后点击建立／继续；其他素材保持。")
         return repaired
-
-
-def rollback_subtitle_text(store, library_id, migration_id):
-    """Rollback one untouched local repair, without replacing a whole library database."""
-    with library_operation(library_id):
-        manifest = store.rollback_subtitle(library_id, migration_id)
-        write_json(store.directory(library_id)/"subtitle-migrations"/(migration_id+".json"),manifest)
-        return manifest
 
 
 def import_materials(store, library_id, mappings, subtitle_settings, stop=None):
@@ -254,11 +233,6 @@ def _import_materials(store, library_id, mappings, subtitle_settings, stop=None)
             failures.append(f"{Path(mapping.video_path).name}: {exc}")
     store.job(library_id, "import", state="failed" if failures else "complete", progress=100,
               message=("\n".join(failures) if failures else "素材登记完成，视频仍位于原路径。") + (f"\n跳过 {len(duplicates)} 个相同内容的视频副本。" if duplicates else ""))
-
-
-def _window_text(cues, start, end):
-    return "\n".join(f"{item.start} --> {item.end} {item.text.replace(chr(10), ' ')}" for item in cues
-                     if item.start.ordinal / 1000 < end and item.end.ordinal / 1000 > start)
 
 
 def plot_cues(asset):
@@ -372,6 +346,7 @@ class _BuildCoordinator(AnalysisCoordinator):
         super().__init__(concurrency, stop, gateway.before_request)
         self.store, self.library_id, self.gateway = store, library_id, gateway
         self.total, self.events, self.errors = total, SimpleQueue(), []
+        self.stage = "镜头观察"
         self.usage = ModelUsage(store.directory(library_id))
         self.settings = copy.deepcopy(gateway.settings)
         for kind in ("text", "vision", "text_backup", "vision_backup"):
@@ -412,11 +387,12 @@ class _BuildCoordinator(AnalysisCoordinator):
         if force or now-self.reported >= 1:
             self.reported = now
             self.store.job(self.library_id, progress=min(90, 90*self.done/max(1,self.total)),
-                message=f"拉片观察 {self.done}/{self.total}；API并发{self.active}/{self.limit}（设置{self.maximum}）；本次调用{self.calls}次")
+                message=f"{self.stage}；已保存观察 {self.done}/{self.total}；实际在途请求{self.active}/{self.limit}（并发设置{self.maximum}）；本次调用{self.calls}次")
 
 
 def build_library(store, library_id, gateway, settings, stop=None):
     """Persist observations first, then assemble semantic events from their evidence."""
+    settings = copy.deepcopy(settings)
     with library_operation(library_id):
         store.require_content_library(library_id)
         gateway.require("vision")
@@ -428,21 +404,35 @@ def build_library(store, library_id, gateway, settings, stop=None):
         work = store.cache_get(library_id, "work") or {}
         root = store.directory(library_id)
         plans, jobs = [], []
+        targets = set(settings.get("range_ids") or [])
+        saved_ranges = store.records(library_id) if targets else []
+        if targets and not targets.issubset({r["id"] for r in saved_ranges if r["asset_id"] in {a["id"] for a in assets}}):
+            raise ValueError("所选镜头已失效，请刷新后按素材继续拉片。")
         batch_size = max(1, int(settings.get("batch_size", 50)))
         for asset in assets:
             check_cancel(stop)
             store.job(library_id, message=f"第{asset['episode']}集：本地准备镜头边界与字幕")
-            ranges = prepare_ranges(store, library_id, asset, settings, stop)
+            if targets:
+                actual = inspect_video(asset["path"], stop)
+                if actual.fingerprint != asset["fingerprint"] or abs(actual.duration-asset["duration"]) > .01:
+                    raise ValueError("源视频已经改变，请重新登记；现有拉片资料保留。")
+                # A local repair uses the saved boundaries, not potentially changed UI spacing.
+                source_fields = set(ShotRange.__dataclass_fields__) | {
+                    "frames", "cues", "fingerprint", "asset_id", "subtitle_identity", "generation"}
+                ranges = [{**{k: v for k, v in r.items() if k in source_fields}, "analysis_state": "pending"}
+                          for r in saved_ranges if r["asset_id"] == asset["id"]]
+            else:
+                ranges = prepare_ranges(store, library_id, asset, settings, stop)
             if settings.get("reanalyze"):
                 for item in ranges:
-                    if not settings.get("range_ids") or item["id"] in settings["range_ids"]:
+                    if not targets or item["id"] in targets:
                         item["generation"] = uuid4().hex
                         store.cache_put(library_id,"analysis-generation:"+item["id"],item["generation"])
             context = episode_context(work, asset["episode"])
             plan = {"asset": asset, "ranges": ranges, "context": context}
             plans.append(plan)
             for i in range(0, len(ranges), batch_size):
-                subset = [r for r in ranges[i:i+batch_size] if not settings.get("range_ids") or r["id"] in settings["range_ids"]]
+                subset = [r for r in ranges[i:i+batch_size] if not targets or r["id"] in targets]
                 if subset:
                     jobs.append((plan, subset))
         coordinator = _BuildCoordinator(store, library_id, gateway, stop,
@@ -479,7 +469,11 @@ def build_library(store, library_id, gateway, settings, stop=None):
             for item in items:
                 key = observation_key(item, plan["context"])
                 cached = store.cache_get(library_id, key) or received.get(key)
-                if cached and isinstance(cached.get("value"), dict) and not settings.get("reanalyze"):
+                current = existing.get(item["id"])
+                if current and current.get("input_key") == key and not settings.get("reanalyze"):
+                    # Manual corrections and already saved observations do not depend on a second cache copy.
+                    coordinator.events.put(("range", (current, key, cached.get("receipt", "") if cached else "")))
+                elif cached and isinstance(cached.get("value"), dict) and not settings.get("reanalyze"):
                     # User corrections survive rebuilding the same observation identity.
                     value = existing.get(item["id"], cached["value"])
                     if value.get("input_key") != key:
@@ -534,12 +528,19 @@ def build_library(store, library_id, gateway, settings, stop=None):
             _run_build_jobs(coordinator, jobs, analyze)
         finally:
             coordinator.report(force=True)
+        coordinator.stage = "内容分段"
         # Group events using saved observations. A failed grouping never loses paid pictures.
         records = {r["id"]:r for r in store.records(library_id)}
+        retained_events = store.records(library_id, "contents")
         for plan in plans:
             check_cancel(stop)
             asset, ranges = plan["asset"], plan["ranges"]
+            coordinator.stage = f"内容分段 · 第{asset['episode']}集"
+            coordinator.report(force=True)
             events, previous = [], []
+            expected = {r["id"] for r in ranges}
+            retained = [e for e in retained_events if e["asset_id"] == asset["id"] and set(e["range_ids"]).issubset(expected)]
+            published = retained
             offset = 0
             client = coordinator.client(asset, "内容分段")
             while offset < len(ranges):
@@ -608,14 +609,20 @@ def build_library(store, library_id, gateway, settings, stop=None):
                         previous = []
                     offset += len(ready)
                     break
-                store.replace_contents(library_id,asset["id"],events,[r["id"] for r in ranges])
+                covered = {rid for e in events for rid in e["range_ids"]}
+                published = sorted(events + [e for e in retained if covered.isdisjoint(e["range_ids"])], key=lambda e: e["start"])
+                store.replace_contents(library_id,asset["id"],published,expected)
                 coordinator.report()
-            complete = sum(len(e["range_ids"]) for e in events) == len(ranges)
+            complete = (sum(len(e["range_ids"]) for e in published) == len(ranges) and
+                        sum(r["end"]-r["start"] for r in ranges) >= asset["duration"]-.05)
             uncertain = [r["id"] for r in ranges if records.get(r["id"],{}).get("analysis_state") != "ready"]
             if uncertain:
                 coordinator.errors.append({"asset_id":asset["id"],"stage":"观察覆盖","range_ids":uncertain,
                                            "reason":"人物/内容或画面属性尚不明确，可补拉片或人工修正。"})
                 complete = False
+            elif not complete:
+                coordinator.errors.append({"asset_id": asset["id"], "stage": "内容分段",
+                                           "reason": "本集仍有未完成范围，请指定本集建立／继续；成功观察保持。"})
             store.set_asset_status(library_id,asset["id"],"ready" if complete else "partial")
         coordinator.report(force=True)
         write_json(root/"analysis-quality.json", {"protocol":ANALYSIS_PROTOCOL,"issues":coordinator.errors,
