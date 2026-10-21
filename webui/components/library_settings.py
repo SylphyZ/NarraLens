@@ -224,15 +224,13 @@ def _advanced_json(prefix, draft, validate, tr, busy):
 
 
 def _range_images(store, library_id, item):
-    if item.get("analysis_baseline"):
-        root = store.directory(library_id)
-        frames = [root / f["image"] for f in item["frames"] if (root / f["image"]).resolve().is_relative_to(root.resolve()) and (root / f["image"]).is_file()]
-    else:
-        frames = sorted((store.directory(library_id)/"frames"/item.get("observed_fingerprint", item["fingerprint"])/item["id"]).glob("*.jpg"))
+    root = store.directory(library_id)
+    available = [(root/f["image"], f) for f in item.get("frames", []) if f.get("image")
+                 and (root/f["image"]).resolve().is_relative_to(root.resolve()) and (root/f["image"]).is_file()]
+    frames = [path for path, _ in available]
     if frames:
         st.image([str(f) for f in frames], width=160,
-                 caption=[f"帧 {i+1} · {frame['time']:.2f}s" for i, frame in enumerate(item.get("frames", []))][:len(frames)]
-                 if len(frames) == len(item.get("frames", [])) else None)
+                 caption=[f"源帧 {frame['frame_index']} · {frame['time']:.3f}s" for _, frame in available])
 
 
 @st.fragment
@@ -331,12 +329,18 @@ def _start_build(store, library_id, settings, *, models=None, persist=False):
 
 def _range_detail(store, library_id, item, ranges, tr):
     from app.services.library.validation import correction_result
+    from app.models.library import FRAME_PROTOCOL
+    if item.get("index_protocol") != FRAME_PROTOCOL:
+        st.warning(tr("旧解析不能用于2.9.1，请重新建立拉片。"))
+        return
     busy = runner.library_busy(library_id)
     rid = item["id"]
     prefix = "library_range_" + library_id + "_" + rid
     if item.get("stale_reasons"):
         st.warning("；".join(item["stale_reasons"]) + tr("。请在拉片任务中选择本集继续，旧结果仅供查看。"))
     _range_images(store, library_id, item)
+    if "start_frame" in item:
+        st.caption(f"源帧 [{item['start_frame']}, {item['end_frame']}) · {item['start']:.3f}–{item['end']:.3f}s · 起始帧包含，结束帧不包含")
     st.write(item.get("summary", ""))
     st.caption(f"{tr('画面属性')}：{tr(_KINDS.get(item.get('content_kind'), '不确定'))} · {tr('时期')}：{item.get('period') or tr('未知')}")
     if item.get("uncertainties"):
@@ -375,7 +379,7 @@ def _range_detail(store, library_id, item, ranges, tr):
         epoch = str(st.session_state.get(prefix + "_epoch", 0))
         frames, cues = {f["id"]: f for f in item["frames"]}, {c["id"]: c for c in item["cues"]}
         frame_col = st.column_config.MultiselectColumn(tr("可见帧"), options=list(frames), accept_new_options=False,
-                       format_func=lambda fid: f"帧 {list(frames).index(fid)+1} · {frames[fid]['time']:.2f}s")
+                       format_func=lambda fid: f"源帧 {frames[fid]['frame_index']} · {frames[fid]['time']:.3f}s")
         cue_col = st.column_config.MultiselectColumn(tr("字幕引用"), options=list(cues), accept_new_options=False,
                      format_func=lambda cid: f"{cues[cid]['start']:.1f}s · {cues[cid]['text']}" + ("（跨界，仅作上下文）" if cues[cid].get("partial") else ""))
         with st.form(prefix + "_form_" + epoch):
@@ -801,7 +805,8 @@ def _build_panel(store, library_id, tr):
             st.caption(tr("图片和字幕联合拉片。普通继续只补缺项；内容目录失败时复用已保存观察。"))
         window = st.number_input(tr("长镜头分析范围目标时长（秒）"), min_value=10, max_value=120,
             value=int(draft.get("window_seconds", 15)), step=5, key=prefix + "_window", disabled=busy,
-            help=tr("用于细分长镜头，可能就近采用字幕边界，不保证等长。不是抽帧间隔；每个范围按时长与字幕密度采样1–6帧。"))
+            help=tr("用于细分长镜头，优先参考字幕结束位置，再落到实际源帧边界，不保证等长。每个范围按时长与字幕密度采样1–6帧。"))
+        st.caption(tr("2.9.1 使用真实帧号与PTS。首次准备会本地解码全片建立索引，后续复用；旧解析和旧Agent任务需要重新建立。"))
         if analysis_mode == "auto":
             left, right = st.columns(2)
             with left:

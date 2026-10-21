@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 
-from app.models.library import LIBRARY_SCHEMA
+from app.models.library import FRAME_PROTOCOL, LIBRARY_SCHEMA
 
 SCHEMA_VERSION = LIBRARY_SCHEMA
 _json_lock_guard = threading.Lock()
@@ -79,11 +79,12 @@ def library_ids(value):
     return list(dict.fromkeys(str(UUID(str(identifier))) for identifier in value))
 
 
-def write_json(path, value):
+def write_json(path, value, *, compact=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
-    serialized = json.dumps(value, ensure_ascii=False, indent=2)
+    serialized = json.dumps(value, ensure_ascii=False, indent=None if compact else 2,
+                            separators=(",", ":") if compact else None)
     with _json_access(path):
         try:
             _retry_json_io(lambda: temporary.write_text(serialized, encoding="utf-8"))
@@ -235,17 +236,6 @@ class LibraryStore:
             settings = next(r["settings"] for r in self.list_libraries() if r["id"] == library_id)
             self.save_settings(identifier, {**settings, "source_library_id": library_id,
                                            "schema": SCHEMA_VERSION, "cloned_at": time.time()})
-            # Only fingerprint-keyed physical boundary caches are compatible.
-            for old in (self.directory(library_id)/"boundaries").glob("*.json"):
-                destination = target/"boundaries"/old.name
-                destination.parent.mkdir(exist_ok=True)
-                shutil.copyfile(old, destination)
-            for asset in assets:
-                old = self.directory(library_id)/"frames"/asset["id"]/"shot-boundaries.json"
-                if old.is_file():
-                    destination = target/"boundaries"/(asset["fingerprint"]+".json")
-                    destination.parent.mkdir(exist_ok=True)
-                    shutil.copyfile(old,destination)
             return identifier
 
     def save_ranges(self, library_id, asset_id, ranges):
@@ -256,7 +246,9 @@ class LibraryStore:
 
     @staticmethod
     def _write_ranges(db, asset_id, ranges):
+        from app.services.library.validation import validate_source_range
         for item in ranges:
+            validate_source_range(item)
             db.execute("""INSERT INTO shot_records VALUES(?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
                        (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
@@ -321,6 +313,7 @@ class LibraryStore:
         """Read current evidence; the browser may also request retained, outdated records."""
         table = {"ranges": "shot_records", "contents": "content_segments"}[kind]
         result = []
+        indices = {}
         assets = {(a["library_id"],a["id"]):a for a in self.assets(identifiers)}
         ranges = {(r["library_id"], r["id"]): r for r in self.records(identifiers, include_stale=True)} if kind == "contents" else {}
         for identifier in library_ids(identifiers):
@@ -336,6 +329,25 @@ class LibraryStore:
                 asset = assets[(identifier,row["asset_id"])]
                 reasons = []
                 if kind == "ranges":
+                    if data.get("index_protocol") != FRAME_PROTOCOL:
+                        reasons.append("旧解析需要按2.9.1重新建立源帧索引与拉片")
+                    else:
+                        from app.services.library.frame_extractor import source_index
+                        from app.services.library.validation import validate_source_range
+                        key = (identifier, row["asset_id"])
+                        if key not in indices:
+                            try:
+                                indices[key] = source_index(asset, self.directory(identifier))
+                            except (ValueError, OSError):
+                                indices[key] = None
+                        index = indices[key]
+                        if index is None or any(data.get(k) != v for k, v in index.binding().items()):
+                            reasons.append("源帧索引缺失或已更新，请重新拉片")
+                        else:
+                            try:
+                                validate_source_range(data)
+                            except ValueError as exc:
+                                reasons.append(str(exc))
                     if data.get("fingerprint") != row["fingerprint"]:
                         reasons.append("原视频身份已改变")
                     if data.get("subtitle_identity") != asset.get("subtitle_identity"):

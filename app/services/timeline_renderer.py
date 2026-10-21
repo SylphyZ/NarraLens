@@ -54,7 +54,9 @@ def render_timeline(segments, shots, assets, audio_path, subtitle_path, director
     for asset_id in {shot.asset_id for shot in shots}:
         check_cancel(stop)
         asset = next(item for item in assets if item["id"] == asset_id)
-        if inspect_video(asset["path"], stop).fingerprint != asset["fingerprint"]:
+        actual = inspect_video(asset["path"], stop)
+        if actual.fingerprint != asset["fingerprint"] or any(
+                shot.source_stream_index != actual.stream_index for shot in shots if shot.asset_id == asset_id):
             raise ValueError("来源视频已变化，请更新素材库后继续。")
     directory = Path(directory)
     clips_dir = directory / "clips"
@@ -69,17 +71,21 @@ def render_timeline(segments, shots, assets, audio_path, subtitle_path, director
         frames = round(shot.timeline_end * fps) - round(shot.timeline_start * fps)
         if frames <= 0:
             continue
-        key = stable_hash((asdict(shot), width, height, fps, "render-v1"))
+        key = stable_hash((asdict(shot), width, height, fps, "render-source-frames-v2"))
         output = clips_dir / f"{index:05d}-{key[:16]}.mp4"
         info = _video_info(output)
         if not _video_matches(info, frames, fps):
             temporary = output.with_suffix(".tmp.mp4")
-            video_filter = (f"trim=duration={shot.source_end-shot.source_start:.6f},setpts=PTS-STARTPTS,"
+            absolute_start = shot.source_origin_seconds + shot.source_start
+            absolute_end = shot.source_origin_seconds + shot.source_end
+            video_filter = (f"trim=start={absolute_start:.9f}:end={absolute_end:.9f},setpts=PTS-STARTPTS,"
                             f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                             f"setsar=1,fps={fps},tpad=stop_mode=clone:stop_duration=1")
-            basic = [ffmpeg_binary(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{shot.source_start:.6f}",
-                     "-i", shot.video_path, "-map", "0:v:0", "-an", "-sn", "-dn", "-map_chapters", "-1", "-map_metadata", "-1",
-                     "-vf", video_filter, "-frames:v", str(frames), "-pix_fmt", "yuv420p"]
+            basic = [ffmpeg_binary(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-copyts"]
+            if absolute_start > 0:
+                basic += ["-seek_timestamp", "1", "-ss", f"{absolute_start:.9f}"]
+            basic += ["-i", shot.video_path, "-map", f"0:{shot.source_stream_index}", "-an", "-sn", "-dn", "-map_chapters", "-1", "-map_metadata", "-1",
+                      "-vf", video_filter, "-frames:v", str(frames), "-pix_fmt", "yuv420p"]
             chosen = encoder if encoder in {"h264_amf", "h264_nvenc", "h264_videotoolbox", "libx264"} else "libx264"
             args = ["-c:v", chosen, "-b:v", "6M"] if chosen != "libx264" else ["-c:v", "libx264", "-preset", "fast", "-crf", "21"]
             if info and info["frames"] == frames and abs(info["video_duration"] - frames / fps) <= 2 / fps:

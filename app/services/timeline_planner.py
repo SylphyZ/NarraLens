@@ -4,12 +4,14 @@ import math
 import re
 from bisect import bisect_right
 from dataclasses import replace
+from fractions import Fraction
 
 from app.models.timeline import VisualShot
+from app.models.library import FRAME_PROTOCOL, SOURCE_INDEX_FIELDS
 from app.services.library.store import stable_hash
 
 
-VISUAL_POLICY_VERSION = "unique-source-credits-v1"
+VISUAL_POLICY_VERSION = "unique-source-frames-v2"
 MATCH_POLICY_VERSION = "semantic-visual-units-v1"
 COVERAGE_VERSION = "atomic-fact-coverage-v1"
 
@@ -98,11 +100,16 @@ def matching_policy(plan):
 
 def source_shot_key(item):
     """Analysis windows and library registrations do not define physical shots."""
-    return (item["fingerprint"], round(item["natural_start"] * item["fps"]), round(item["natural_end"] * item["fps"]))
+    if item.get("index_protocol") != FRAME_PROTOCOL or not (
+            type(item.get("shot_start_frame")) is int and type(item.get("shot_end_frame")) is int
+            and 0 <= item["shot_start_frame"] < item["shot_end_frame"]):
+        raise ValueError("镜头缺少2.9.1真实帧身份，请重建拉片后重新寻找画面。")
+    return (item["fingerprint"], item["stream_index"], item["shot_start_frame"], item["shot_end_frame"])
 
 
 def unused_source(item, used):
-    return not any((item.get("duplicate_group") and previous.get("duplicate_group") == item["duplicate_group"]) or previous["fingerprint"] == item["fingerprint"] and (
+    return not any((item.get("duplicate_group") and previous.get("duplicate_group") == item["duplicate_group"]) or
+        (previous["fingerprint"], previous["stream_index"]) == (item["fingerprint"], item["stream_index"]) and (
         source_shot_key(previous) == source_shot_key(item) or
         min(previous["natural_end"], item["natural_end"]) - max(previous["natural_start"], item["natural_start"]) > .000001 or
         min(previous["source_end"], item["source_end"]) - max(previous["source_start"], item["source_start"]) > .000001
@@ -112,9 +119,11 @@ def unused_source(item, used):
 def make_visual_policy(assets, boundaries, approved, forbidden=(), *, visual_plan):
     used_ids = {item["asset_id"] for item in approved}
     fingerprints = {item["fingerprint"] for item in approved}
+    indexed = {item["asset_id"]: item for item in approved}
     return {"version": VISUAL_POLICY_VERSION, "approved": approved, "matching": matching_policy(visual_plan),
             "forbidden": [item for item in forbidden if item["fingerprint"] in fingerprints],
             "sources": {asset["id"]: {**{key: asset[key] for key in ("fingerprint", "fps", "duration")},
+                                      **{key: indexed[asset["id"]][key] for key in SOURCE_INDEX_FIELDS},
                                       "boundaries": boundaries[asset["id"]]}
                         for asset in assets if asset["id"] in used_ids}}
 
@@ -258,6 +267,9 @@ def _allocate_visual_timeline(segments, candidates_by_segment, target_shot_secon
                     candidate["asset_id"], candidate["scene_id"], candidate["video_path"], source_start, source_start + length,
                     position, position + length, segment.id,
                     candidate.get("reason", ""), bool(candidate.get("weak_match", True)), unit["id"], fact_ids, candidate.get("_review_key", ""),
+                    source_stream_index=candidate["stream_index"],
+                    source_origin_seconds=float(candidate["origin_pts"]*Fraction(*candidate["time_base"])),
+                    source_index_key=candidate["index_key"],
                 ))
                 trial_used.append(candidate)
                 covered.update(fact_ids)
@@ -350,6 +362,9 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
                 raise ValueError("连续动画超出配音范围。")
         is_motion = bool(re.fullmatch(r"motion-[a-f0-9]{16}", shot.asset_id))
         if not is_motion:
+            if (not re.fullmatch(r"[a-f0-9]{64}", shot.source_index_key) or type(shot.source_stream_index) is not int
+                    or shot.source_stream_index < 0 or not math.isfinite(shot.source_origin_seconds)):
+                raise ValueError("镜头缺少源帧索引或实际视频流，请重新寻找画面。")
             identity = asset.get("fingerprint") or shot.video_path
             ranges = source_ranges.setdefault(identity, [])
             if any(min(shot.source_end, right) - max(shot.source_start, left) > .000001 for left, right in ranges):
@@ -371,6 +386,11 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
                                  and item["source_end"] >= shot.source_end - .000001), None)
                 if approved is None or approved["fingerprint"] != asset["fingerprint"]:
                     raise ValueError("镜头缺少实际来源范围的合格画面记录，请从3. 寻找画面继续。")
+                source_shot_key(approved)
+                if (any(source.get(key) != approved.get(key) for key in SOURCE_INDEX_FIELDS) or
+                        shot.source_index_key != approved["index_key"] or shot.source_stream_index != approved["stream_index"] or
+                        abs(shot.source_origin_seconds-float(approved["origin_pts"]*Fraction(*approved["time_base"]))) > 1e-9):
+                    raise ValueError("镜头与审核记录的源帧索引或时钟不一致，请重新寻找画面。")
                 if unit["requirement"].get("coverage_version") == COVERAGE_VERSION:
                     facts = candidate_facts(approved, unit["requirement"], shot.source_start, shot.source_end)
                     if shot.fact_ids != facts or not shot.review_key or shot.review_key != approved.get("review_key"):
@@ -396,10 +416,9 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
                 if policy is not None and (abs(approved["natural_start"] - boundaries[index]) > .000001 or
                                            abs(approved["natural_end"] - boundaries[index + 1]) > .000001):
                     raise ValueError("镜头审核与真实切镜范围不一致，请从3. 寻找画面继续。")
-                physical = {"fingerprint": identity, "fps": asset.get("fps", 30),
-                            "natural_start": boundaries[index], "natural_end": boundaries[index + 1],
-                            "source_start": shot.source_start, "source_end": shot.source_end,
-                            "duplicate_group": approved.get("duplicate_group", "") if policy is not None else ""}
+                if policy is None:
+                    raise ValueError("真实切镜去重需要完整源帧审核策略，请重新寻找画面。")
+                physical = {**approved, "source_start": shot.source_start, "source_end": shot.source_end}
                 if not unused_source(physical, used):
                     raise ValueError(f"段落 {shot.segment_id} 再次使用同一自然镜头，请从3. 寻找画面重新编排。")
                 used.append(physical)

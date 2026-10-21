@@ -1,6 +1,10 @@
 """Validate model replies and cached results before they reach indexing or editing."""
 
 import math
+import re
+from fractions import Fraction
+
+from app.models.library import FRAME_PROTOCOL, media_id
 
 
 class ModelFormatError(ValueError):
@@ -87,10 +91,52 @@ def selected_ids(value, allowed, field, *, required=False):
     return value
 
 
+def validate_source_range(item):
+    """Reject stale frame protocols at every producer/consumer boundary."""
+    if item.get("index_protocol") != FRAME_PROTOCOL:
+        raise ModelFormatError("旧解析不能用于2.9.1，请重新建立源帧索引和拉片。")
+    if (not re.fullmatch(r"[a-f0-9]{64}", str(item.get("index_key", ""))) or
+            not re.fullmatch(r"[a-f0-9]{64}", str(item.get("fingerprint", "")))):
+        raise ModelFormatError("源帧索引或视频摘要无效。")
+    fields = ("start_frame", "end_frame", "shot_start_frame", "shot_end_frame", "source_frame_count", "stream_index", "origin_pts")
+    if any(type(item.get(k)) is not int for k in fields) or not (
+            0 <= item["shot_start_frame"] <= item["start_frame"] < item["end_frame"] <= item["shot_end_frame"] <= item["source_frame_count"]
+            and item["stream_index"] >= 0):
+        raise ModelFormatError("源帧范围必须是物理镜头内的有效半开区间。")
+    clock = item.get("time_base")
+    if not isinstance(clock, list) or len(clock) != 2 or any(type(v) is not int or v <= 0 for v in clock):
+        raise ModelFormatError("源帧时间基无效。")
+    if (any(type(item.get(k)) not in (int, float) or not math.isfinite(item[k]) for k in
+            ("natural_start", "start", "end", "natural_end", "source_duration")) or
+            not 0 <= item["natural_start"] <= item["start"] < item["end"] <= item["natural_end"] <= item["source_duration"]):
+        raise ModelFormatError("源帧范围的实际时间无效。")
+    identity = (FRAME_PROTOCOL, item["fingerprint"], item["stream_index"])
+    if item["id"] != media_id("R", *identity, item["start_frame"], item["end_frame"]) or item["shot_id"] != media_id(
+            "S", *identity, item["shot_start_frame"], item["shot_end_frame"]):
+        raise ModelFormatError("源帧范围编号不对应实际帧区间。")
+    frames = item.get("frames")
+    if not isinstance(frames, list) or not frames or not isinstance(item.get("analysis_baseline", {}).get("frames"), list):
+        raise ModelFormatError("源帧证据或分析输入基线缺失。")
+    for frame in frames:
+        number = frame.get("frame_index")
+        source_clock = frame.get("source_clock", {})
+        if (type(number) is not int or not item["start_frame"] <= number < item["end_frame"] or
+                frame.get("id") != media_id("F", *identity, number) or source_clock.get("time_base") != clock or
+                type(source_clock.get("pts")) is not int):
+            raise ModelFormatError("证据帧身份或时间戳不属于当前范围。")
+        actual_time = float((source_clock["pts"]-item["origin_pts"])*Fraction(*clock))
+        if (type(frame.get("time")) not in (int, float) or not math.isfinite(frame["time"]) or
+                abs(frame["time"]-actual_time) > 1e-9 or not item["start"] <= actual_time < item["end"]):
+            raise ModelFormatError("证据帧时间与PTS不符或超出当前范围。")
+    if len({f["id"] for f in frames}) != len(frames):
+        raise ModelFormatError("当前范围重复登记了相同源帧。")
+
+
 def observation_result(row, item):
     """Validate only this range; a malformed peer cannot discard a paid valid result."""
     from app.models.library import ANALYSIS_PROTOCOL, media_id
     from app.services.library.store import stable_hash
+    validate_source_range(item)
     if not isinstance(row, dict) or row.get("range_id") != item["id"]:
         raise ModelFormatError("range_id必须等于当前给定ID。")
     if not isinstance(row.get("content_kind"), str) or row.get("content_kind") not in {"story", "credits", "opening", "black", "unknown"}:

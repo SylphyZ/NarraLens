@@ -1106,6 +1106,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                     and item["scene_id"] == shot.scene_id and item["source_start"] <= shot.source_start+.000001
                     and item["source_end"] >= shot.source_end-.000001)
                 used.append({key: selected[key] for key in ("asset_id", "scene_id", "fingerprint", "fps", "natural_start", "natural_end",
+                    "index_protocol", "index_key", "stream_index", "time_base", "origin_pts", "source_frame_count", "source_duration",
+                    "shot_start_frame", "shot_end_frame", "start_frame", "end_frame",
                     "source_start", "source_end", "usable", "content_kind", "visual_policy", "match_policy", "visual_unit_id",
                     "relation", "facts_match", "evidence", "conflicts", "subtitle_quotes", "visual_checked", "confidence",
                     "subtitle_ids", "visual_evidence", "evidence_protocol")})

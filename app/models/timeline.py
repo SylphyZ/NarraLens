@@ -30,6 +30,9 @@ class VisualShot:
     visual_unit_id: str = ""
     fact_ids: list[str] = field(default_factory=list)
     review_key: str = ""
+    source_stream_index: int = 0
+    source_origin_seconds: float = 0.0
+    source_index_key: str = ""
 
 
 def timeline_dict(segments, shots):

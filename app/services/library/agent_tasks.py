@@ -21,7 +21,7 @@ from app.services.library.store import LibraryStore, read_json, write_json, stab
 from app.services.library.runner import check_cancel, library_operation
 from app.services.library.validation import observation_result, content_result
 
-PROTOCOL = "agent-film-analysis-v1"
+PROTOCOL = "agent-film-analysis-v2"
 PROJECT = Path(__file__).resolve().parents[3]
 TASK_ROOT = PROJECT / "storage" / "agent_analysis_tasks"
 
@@ -89,7 +89,7 @@ def _load(identifier, *, ready=True):
     root = task_directory(identifier)
     manifest = read_json(_owned(root, "manifest.json"))
     if manifest.get("id") != str(UUID(str(identifier))) or manifest.get("protocol") != PROTOCOL:
-        raise ValueError("任务身份或协议不兼容。")
+        raise ValueError("任务身份或协议已过期，请按2.9.1重新创建Agent拉片任务。")
     library_id = str(UUID(manifest["library_id"]))
     database = _owned(PROJECT / "storage" / "libraries", library_id + "/library.sqlite")
     # CLI evidence tools never create or write the library database.
@@ -187,13 +187,16 @@ def _verify_source(asset):
     return actual
 
 
-def _capture(root, manifest, registry, packet, item, timestamp, crop=None, stop=None):
-    from app.services.library.frame_extractor import extract_evidence_frame
+def _capture(root, manifest, registry, packet, item, timestamp=None, crop=None, stop=None, *, frame_index=None):
+    from app.services.library.frame_extractor import extract_evidence_frame, source_index
     check_cancel(_Stop(root, stop))
     asset = packet["asset"]
     _verify_source(asset)
-    frame = extract_evidence_frame(asset, timestamp, _owned(root, "evidence/" + asset["id"]),
-                                   bounds=(item["start"], item["end"]), crop=crop, stop=_Stop(root, stop))
+    index = source_index({**asset, "index_key": item["index_key"]},
+                         _owned(PROJECT/"storage"/"libraries", manifest["library_id"]), _Stop(root, stop))
+    frame = extract_evidence_frame(asset, index, _owned(root, "evidence/" + asset["id"]),
+        timestamp=timestamp, frame_index=frame_index, bounds=(item["start_frame"], item["end_frame"]),
+        crop=crop, stop=_Stop(root, stop))
     _verify_source(asset)
     frame["image"] = Path(frame.pop("path")).relative_to(root).as_posix()
     value = {"kind": "frame", "task_id": manifest["id"], "input_hash": manifest["input_hash"],
@@ -222,7 +225,7 @@ def _evidence(root, manifest, registry, packet, item, identifiers=None):
         # Crops cite the same parent frame; a full frame remains necessary evidence.
         if frame.get("crop") is None:
             frames[frame["id"]] = frame
-    return sorted(frames.values(), key=lambda f: f["time"]), sorted(images, key=lambda f: (f["time"], f.get("crop") is not None)), stable_hash(ids)
+    return sorted(frames.values(), key=lambda f: f["frame_index"]), sorted(images, key=lambda f: (f["frame_index"], f.get("crop") is not None)), stable_hash(ids)
 
 
 def _find_range(root, manifest, identifier):
@@ -258,13 +261,15 @@ Set-Location -LiteralPath {quote(PROJECT)}
 {command} view --task {manifest['id']} --range <镜头ID>
 {command} references --task {manifest['id']}
 {command} capture --task {manifest['id']} --range <镜头ID> --time <原片秒数>
+{command} capture --task {manifest['id']} --range <镜头ID> --frame <源帧序号>
 {command} capture --task {manifest['id']} --range <镜头ID> --time <原片秒数> --crop 0.1 0.1 0.7 0.8
 {command} submit --task {manifest['id']} --file proposals/你的提案.json
 ```
 
 1. describe给出素材、资料、已保存提案和待处理情况；overview给出本集字幕快照及稀疏预览；ranges分页提供范围及相邻ID。
 2. view取得实际图片路径、帧ID、字幕和可填写的观察提案模板。必须用你的看图能力打开图片；读取路径文字不等于看过画面。
-3. 无法确认人物、动作或时期时capture补帧。引用裁剪图时仍使用父帧ID，保留完整帧作为证据。
+3. 无法确认人物、动作或时期时capture补帧。--time与--frame二选一，帧号从0开始；范围起点包含、终点不包含。
+   秒数会在当前范围内选取最近实际帧，响应包含真实帧号、PTS和时间基；同帧裁剪仍引用父帧ID，保留完整帧作为证据。
 4. 将模板填写为JSON保存到本任务proposals目录，然后submit。工具会报告字段问题。JSON为UTF-8，可带BOM。
 5. submit只保存任务草稿，不写素材库。再次更正时，supersedes须等于describe/view返回的当前回执ID。
 6. 分组提案格式由describe提供；同集分组累计覆盖已完成范围，更新时保留上次覆盖的范围。
@@ -313,10 +318,7 @@ def create_task(store, library_id, asset_ids, settings, stop=None):
                 if item is None:
                     continue
                 library_root = store.directory(library_id)
-                if item.get("analysis_baseline"):
-                    candidates = [_owned(library_root, f["image"]) for f in item["frames"]]
-                else:
-                    candidates = sorted(_owned(library_root, f"frames/{item['fingerprint']}/{rid}").glob("*.jpg"))
+                candidates = [_owned(library_root, f["image"]) for f in item["frames"]]
                 if candidates:
                     try:
                         source = _owned(library_root, candidates[0].relative_to(library_root))
@@ -353,7 +355,10 @@ def prepare_task(store, identifier, stop=None):
                 if not current or (current["fingerprint"], current["subtitle_identity"]) != (asset["fingerprint"], asset["subtitle_identity"]):
                     raise ValueError("登记已变化，请创建新任务。")
                 context = episode_context(manifest["work"], asset["episode"])
-                ranges = prepare_ranges(store, manifest["library_id"], current, manifest["settings"], _Stop(root, stop))
+                ranges = prepare_ranges(store, manifest["library_id"], current, manifest["settings"], _Stop(root, stop),
+                    progress=lambda p, message: store.job(manifest["library_id"], "agent",
+                        progress=100*(index+p)/len(manifest["assets"]),
+                        message=f"准备Agent任务 {identifier[:8]} · 第{asset['episode']}集：{message} {p:.0%}；不调用模型"))
                 packet = {"asset": asset, "context": context, "ranges": ranges,
                           "subtitle_sha256": _sha(asset["processed_path"]) if asset.get("processed_path") else None,
                           "existing": {r["id"]: r for r in store.records(manifest["library_id"]) if r["asset_id"] == aid and
@@ -408,13 +413,13 @@ def control_task(identifier, stopped):
     write_json(_owned(root, "control.json"), {"stop": bool(stopped), "updated": time.time()})
 
 
-def capture(identifier, range_id, timestamp, crop=None):
+def capture(identifier, range_id, timestamp=None, crop=None, *, frame_index=None):
     with _task_lock(identifier):
         root, manifest, registry = _load(identifier)
         packet, item = _find_range(root, manifest, range_id)
         if crop is not None:
-            _capture(root, manifest, registry, packet, item, timestamp)
-        return _capture(root, manifest, registry, packet, item, timestamp, crop)
+            _capture(root, manifest, registry, packet, item, timestamp, frame_index=frame_index)
+        return _capture(root, manifest, registry, packet, item, timestamp, crop, frame_index=frame_index)
 
 
 def _observation(root, manifest, registry, value):
@@ -429,7 +434,7 @@ def _observation(root, manifest, registry, value):
     def library_image(frame):
         return {k: v for k, v in {**frame, "image": f"frames/{item['fingerprint']}/{item['id']}/{frame['image_id']}.jpg"}.items()
                 if k not in {"path", "file"}}
-    source = {**item, "analysis_baseline": {"frames": copy.deepcopy(item.get("analysis_baseline", {}).get("frames", item["frames"]))},
+    source = {**item, "analysis_baseline": copy.deepcopy(item["analysis_baseline"]),
               "frames": [library_image(f) for f in frames], "evidence_images": [library_image(f) for f in images]}
     result = observation_result(value["value"], source)
     result.update(input_key=observation_key(item, packet["context"]),
@@ -607,15 +612,23 @@ def overview(identifier, asset_id):
 
 
 def view(identifier, range_id):
+    from app.services.library.frame_extractor import extract_frames, source_index
     with _task_lock(identifier):
         root, manifest, registry = _load(identifier)
         packet, item = _find_range(root, manifest, range_id)
         _, images, _ = _evidence(root, manifest, registry, packet, item)
-        for requested in item["frames"]:
-            if not any(image["requested_time"] == requested["time"] and image.get("crop") is None for image in images):
-                _capture(root, manifest, registry, packet, item, requested["time"])
+        pending = [f["frame_index"] for f in item["frames"]
+                   if not any(image["id"] == f["id"] and image.get("crop") is None for image in images)]
+        if pending:
+            _verify_source(packet["asset"])
+            index = source_index({**packet["asset"], "index_key": item["index_key"]},
+                _owned(PROJECT/"storage"/"libraries", manifest["library_id"]), _Stop(root))
+            extract_frames(packet["asset"], index, pending, _owned(root, "evidence/"+packet["asset"]["id"]), stop=_Stop(root))
+            for number in pending:
+                _capture(root, manifest, registry, packet, item, frame_index=number)
         frames, images, revision = _evidence(root, manifest, registry, packet, item)
-        return {"range_id": range_id, "start": item["start"], "end": item["end"], "images": images, "cues": item["cues"],
+        return {"range_id": range_id, "start": item["start"], "end": item["end"],
+                "start_frame": item["start_frame"], "end_frame": item["end_frame"], "images": images, "cues": item["cues"],
                 "existing_observation": packet["existing"].get(range_id),
                 "template": {"kind": "observation", "input_hash": manifest["input_hash"], "range_id": range_id,
                     "evidence_revision": revision, "supersedes": _heads(root, registry).get("range:"+range_id, ""), "producer": "",
@@ -627,6 +640,7 @@ def view(identifier, range_id):
 
 def _import_plan(store, root, manifest, registry, stop=None):
     from app.services.library.indexer import observation_key
+    from app.services.library.frame_extractor import source_index
     from app.services.library.knowledge import episode_context
     selected = list(manifest["assets"])
     snapshot = store.analysis_snapshot(manifest["library_id"], selected)
@@ -648,6 +662,8 @@ def _import_plan(store, root, manifest, registry, stop=None):
             if stable_hash(episode_context(current_work, asset["episode"])) != stable_hash(packet["context"]):
                 raise ValueError("本集作品资料已变化，请重新创建受影响任务。")
             _verify_source(asset)
+            source_index({**asset, "index_key": packet["ranges"][0]["index_key"]},
+                         store.directory(manifest["library_id"]), stop)
             if (_sha(asset["processed_path"]) if asset.get("processed_path") else None) != packet["subtitle_sha256"]:
                 raise ValueError("当前派生字幕内容已变化。")
             prepared = {r["id"]: r for r in packet["ranges"]}
@@ -819,6 +835,7 @@ def main():
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--time", type=float)
+    parser.add_argument("--frame", type=int, dest="frame_index")
     parser.add_argument("--crop", nargs=4, type=float)
     parser.add_argument("--file")
     parser.add_argument("--person", default="")
@@ -833,7 +850,7 @@ def main():
         elif args.command == "view":
             result = view(args.task, args.range_id)
         elif args.command == "capture":
-            result = capture(args.task, args.range_id, args.time, args.crop)
+            result = capture(args.task, args.range_id, args.time, args.crop, frame_index=args.frame_index)
         elif args.command == "submit":
             result = submit(args.task, args.file)
         elif args.command == "references":

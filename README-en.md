@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.9.0**
+**Manuscript-driven video production · v2.9.1**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.9.0 provides seven workspaces:
+Version 2.9.1 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,19 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. Generated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.9.1
+
+Source frames now use presentation-order ordinals together with integer PTS and a rational time base. Physical shots and analysis ranges use half-open frame intervals. Shot identities and source deduplication no longer estimate frame numbers from average FPS.
+
+- One sequential scan records the frame table and scene cuts. Only metadata and requested evidence images are stored. Completed indices are reused; an interrupted video needs a new scan.
+- Automatic analysis and external agents share frame capture. The agent `capture` command accepts either `--time` or `--frame`, verifies decoded source positions and keeps crops attached to the same parent frame.
+- Long-take duration remains a setting in seconds, with subtitle-adjacent boundaries mapped onto real frames. Range details display source ordinals and timestamps.
+- Targeted retrieval retains the full range and evidence baseline. Editing carries the selected video stream and source time origin while narration and output-frame clocks remain independent.
+
+**Previous indices, analysis results and agent tasks are not compatible.** Keep video/subtitle registrations and work notes, then rebuild analysis and create new agent tasks. Old source caches cannot drive new editing. Opening a page does not delete existing data. Original media, external subtitle files and audio libraries are unaffected by this protocol change.
+
+Static source checks have been performed. Automated tests, actual frame extraction, model-powered analysis, agent runs, live WebUI interaction and final-video acceptance have not been run. The initial scan still decodes the full video on the CPU. Precise indexing does not guarantee correct scene detection or visual interpretation.
 
 ## Version 2.9.0
 

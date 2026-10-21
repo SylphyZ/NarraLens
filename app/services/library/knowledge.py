@@ -74,7 +74,7 @@ def fetch_bangumi(subject, proxy=None):
 
     def get(path, **params):
         response = requests.get("https://api.bgm.tv/v0/"+path, params=params,
-                                headers={"User-Agent": "NarraLens/2.9.0 (https://github.com/SylphyZ/NarraLens)"},
+                                headers={"User-Agent": "NarraLens/2.9.1 (https://github.com/SylphyZ/NarraLens)"},
                                 proxies=proxies, timeout=(10, 30))
         response.raise_for_status()
         return response.json()

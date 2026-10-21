@@ -7,7 +7,7 @@ from collections import defaultdict
 
 import jieba
 
-from app.models.library import RETRIEVAL_PROTOCOL, SearchPage
+from app.models.library import RETRIEVAL_PROTOCOL, SearchPage, range_input
 from app.services.library.store import library_ids, stable_hash, read_json, write_json
 from app.services.library.validation import ModelFormatError, selected_ids
 from app.services.library.gateway import ModelAPIError
@@ -47,7 +47,7 @@ class MaterialRetriever:
                                       for rid in e["range_ids"]]) for e in self.events])
         self.boundaries = {}
         for item in self.ranges.values():
-            self.boundaries.setdefault(item["asset_id"],set()).update((0.0,item["duration"],item["natural_start"],item["natural_end"]))
+            self.boundaries.setdefault(item["asset_id"],set()).update((0.0,item["source_duration"],item["natural_start"],item["natural_end"]))
         self.boundaries = {k:sorted(v) for k,v in self.boundaries.items()}
         linked = {rid for e in self.events for rid in e["range_ids"]}
         self.missing_analysis = sum(r.get("analysis_state") != "ready" or r["id"] not in linked for r in self.ranges.values())
@@ -180,7 +180,7 @@ class MaterialRetriever:
             from app.services.library.indexer import observe_ranges
             from app.services.library.knowledge import episode_context
             candidate = next(iter(job["aliases"].values()))[1]
-            item = {k:candidate[k] for k in ("id","shot_id","start","end","natural_start","natural_end","frames","cues","fingerprint","asset_id","subtitle_identity","generation")}
+            item = range_input(candidate)
             work = self.store.cache_get(candidate["library_id"],"work") or {}
             outcome = {"key":job["key"],"response":None,"error":"","context":episode_context(work,candidate["episode"]),"input":item}
             old = read_json(job["file"],default={})
