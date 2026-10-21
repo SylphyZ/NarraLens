@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.8.1**
+**Manuscript-driven video production · v2.9.0**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.8.1 provides seven workspaces:
+Version 2.9.0 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -151,6 +151,30 @@ The content browser shows event summaries, source previews and evidence referenc
 Concrete plot events retain direct evidence requirements. Commentary and interpretation can use grounded illustrations. Explicit event chronology is preserved; lists of properties or opinions do not automatically impose shot order. Source reuse, credits and minimum shot duration remain checked.
 
 Libraries and historical narration, captions, animation and final videos are not automatically rewritten. This release does not rebuild every library in the background. Use a project copy when switching libraries.
+
+## Independent agent analysis (2.9)
+
+In the video library analysis section, choose **Automatic analysis / External Agent**:
+
+1. Select assets, expand **External Agent tasks**, and create a local analysis task.
+2. Local preparation saves shot ranges, subtitle snapshots and sparse previews. Copy the task instruction into an agent with local file, image-viewing and command capabilities.
+3. The agent follows the generated `TASK.md`, reviews episodes, requests extra frames or crops, and submits observation and event drafts through the CLI.
+4. Refresh the task in NarraLens, inspect the result check, then import accepted results. Existing results, input conflicts and unfinished items are reported separately.
+5. Imported observations use the existing content browser and manuscript retrieval. Partial observations may be imported before the whole directory is complete.
+
+Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain read-only path references. Each task owns its subtitle snapshot, evidence, proposals and receipts. Imported evidence is copied into library ownership and survives removal of the task directory.
+
+The CLI entry is `python -m app.services.library.agent_tasks`, with `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. Generated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
+
+Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.9.0
+
+Adds one agent task service and CLI while sharing existing media processing, observation/event validators and library transactions. Task operations use process-level file locks and source-bound receipts. Extra frames record decoder timestamps. Partial imports retain unrelated records, detect later edits and skip duplicate results.
+
+The analysis baseline is distinct from evidence revisions, allowing normal continuation to reuse imported observations even when extra images were obtained. The automatic workflow, schema 2, TTS, alignment, BGM, explanatory animation and final rendering remain available.
+
+Static source checks have been performed. Automated tests, actual frame extraction, external-agent runs, live WebUI interaction, model-powered library builds and final-video acceptance have not been run for this release. Quality and performance improvements need a real comparison.
 
 ## Version 2.8.1
 

@@ -1,6 +1,7 @@
 """Local media inspection, cached frames/cuts and cancellable FFmpeg execution."""
 
 import hashlib
+import math
 import json
 import os
 import shutil
@@ -17,9 +18,9 @@ from fractions import Fraction
 from dataclasses import asdict
 from pathlib import Path
 
-from app.models.library import VideoInspection
+from app.models.library import VideoInspection, media_id
 from app.services.library.runner import check_cancel
-from app.services.library.store import read_json, write_json
+from app.services.library.store import read_json, write_json, stable_hash
 
 
 def execute_ffmpeg(command, stop=None, timeout=240, duration=0, progress=None, *, directory=None, stage="ffmpeg", line_callback=None, diagnostic_group="ffmpeg-diagnostics", process_name="FFmpeg", terminate_tree=False):
@@ -225,6 +226,86 @@ def extract_frames(video_path, start, end, count, output_dir):
     return frames
 
 
+def extract_evidence_frame(asset, timestamp, output_dir, *, bounds=None, crop=None, stop=None):
+    """Capture a source frame with decoder PTS; keep the existing uniform-frame API intact."""
+    timestamp = float(timestamp)
+    start, end = bounds or (0.0, asset["duration"])
+    if not math.isfinite(timestamp) or not 0 <= start <= timestamp < end <= asset["duration"]:
+        raise ValueError("取帧时间须在当前镜头范围内。")
+    if crop is not None and (not isinstance(crop, (list, tuple)) or len(crop) != 4 or
+            any(type(v) not in (int, float) or not math.isfinite(v) for v in crop) or
+            not (0 <= crop[0] < crop[2] <= 1 and 0 <= crop[1] < crop[3] <= 1)):
+        raise ValueError("裁剪须为归一化坐标[x1,y1,x2,y2]，范围0至1。")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    key = stable_hash(("decoded-frame-v1", asset["fingerprint"], timestamp, crop))
+    cache = output_dir / (key + ".json")
+    saved = read_json(cache, default={})
+    if (isinstance(saved, dict) and saved.get("fingerprint") == asset["fingerprint"] and
+            isinstance(saved.get("file"), str) and Path(saved["file"]).name == saved["file"] and
+            re.fullmatch(r"I[0-9a-f]{20}\.jpg", saved["file"]) and (output_dir / saved["file"]).is_file()):
+        if hashlib.sha256((output_dir / saved["file"]).read_bytes()).hexdigest() == saved["sha256"]:
+            if start <= saved["time"] < end:
+                return {**saved, "path": str(output_dir / saved["file"])}
+
+    def decode(command):
+        clock, frame = None, None
+        def collect(line):
+            nonlocal clock, frame
+            match = re.search(r"config in time_base:\s*(\d+)/(\d+)", line)
+            if "showinfo" in line and match:
+                clock = [int(match[1]), int(match[2])]
+            match = re.search(r"\bn:\s*0\s+pts:\s*(-?\d+)", line)
+            if "showinfo" in line and match and clock and clock[1]:
+                frame = {"pts": int(match[1]), "time_base": clock}
+        code, tail = execute_ffmpeg(command, stop, timeout=90, line_callback=collect)
+        if code or frame is None:
+            raise ValueError("取帧失败或没有可信解码时间：" + tail[-600:])
+        return frame
+
+    binary = ffmpeg_binary()
+    base = [binary, "-nostdin", "-hide_banner", "-y", "-copyts"]
+    origin_path = output_dir / "origin.json"
+    origin = read_json(origin_path, default={})
+    if origin.get("fingerprint") != asset["fingerprint"]:
+        origin = {**decode(base + ["-i", asset["path"], "-map", "0:v:0", "-an", "-sn", "-vf", "showinfo",
+                                  "-frames:v", "1", "-fps_mode", "passthrough", "-f", "null", "-"]),
+                  "fingerprint": asset["fingerprint"]}
+        write_json(origin_path, origin)
+    first = Fraction(origin["pts"]) * Fraction(*origin["time_base"])
+    temporary = output_dir / (uuid4().hex + ".tmp.jpg")
+    filters = ["showinfo"]
+    if crop is not None:
+        x1, y1, x2, y2 = crop
+        filters.append(f"crop=iw*{x2-x1}:ih*{y2-y1}:iw*{x1}:ih*{y1}")
+    filters.append("scale=768:-2")
+    try:
+        for position in dict.fromkeys((timestamp, start)):
+            actual = decode(base + ["-seek_timestamp", "1", "-ss", f"{float(first)+position-0.0000001:.9f}",
+                "-i", asset["path"], "-map", "0:v:0", "-an", "-sn", "-vf", ",".join(filters),
+                "-frames:v", "1", "-fps_mode", "passthrough", "-q:v", "4", str(temporary)])
+            actual_time = float(Fraction(actual["pts"]) * Fraction(*actual["time_base"]) - first)
+            if start <= actual_time < end:
+                break
+        if not math.isfinite(actual_time) or not start <= actual_time < end or not temporary.is_file():
+            raise ValueError("解码帧落在当前范围外，请换一个范围内取帧位置。")
+        fid = media_id("F", asset["fingerprint"], round(actual_time * 1000))
+        digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        iid = media_id("I", "decoded-frame-v1", fid, crop, digest)
+        target = output_dir / (iid + ".jpg")
+        if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            raise ValueError("同一证据编号的图片内容不一致，已有证据保留。")
+        if not target.exists():
+            temporary.replace(target)
+        saved = {"id": fid, "image_id": iid, "time": actual_time, "requested_time": timestamp,
+                 "source_clock": actual, "origin_clock": origin, "crop": crop,
+                 "file": target.name, "sha256": digest, "fingerprint": asset["fingerprint"]}
+        write_json(cache, saved)
+        return {**saved, "path": str(target)}
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def frame_signatures(paths):
     """Similarity hints only; repeated footage still requires human confirmation."""
     from PIL import Image
@@ -255,12 +336,16 @@ def scene_boundaries(asset, cache_file, stop=None, progress=None, diagnostic_dir
                 and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in boundaries)
                 and all(0 <= left < right <= asset["duration"] for left, right in zip(boundaries, boundaries[1:]))):
             return boundaries
-    cuts = []
+    cuts, clock = [], None
 
     def collect(line):
-        match = re.search(r"pts_time:([0-9]+(?:\.[0-9]+)?)", line)
-        if match:
-            point = float(match.group(1))
+        nonlocal clock
+        match = re.search(r"config in time_base:\s*(\d+)/(\d+)", line)
+        if "showinfo" in line and match:
+            clock = Fraction(int(match[1]), int(match[2]))
+        match = re.search(r"\bn:\s*\d+\s+pts:\s*(-?\d+)", line)
+        if "showinfo" in line and match and clock is not None:
+            point = float(int(match[1]) * clock)
             if 0 < point < asset["duration"]:
                 cuts.append(point)
 

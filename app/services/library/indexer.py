@@ -297,7 +297,8 @@ def prepare_ranges(store, library_id, asset, settings, stop=None):
 
 
 def observation_key(item, context):
-    return stable_hash((ANALYSIS_PROTOCOL, item["id"], item["frames"], item["cues"], context, item.get("generation","")))
+    frames = item.get("analysis_baseline", {}).get("frames", item["frames"])
+    return stable_hash((ANALYSIS_PROTOCOL, item["id"], frames, item["cues"], context, item.get("generation","")))
 
 
 def observe_ranges(items, asset, context, gateway, root, stop=None, media_slots=None):
@@ -315,8 +316,18 @@ def observe_ranges(items, asset, context, gateway, root, stop=None, media_slots=
                     images.append(("REFERENCE:"+person["name"]+":"+str(person.get("period","")),str(references[0])))
         for item in items:
             check_cancel(stop)
-            paths = extract_frames(asset["path"], item["start"], item["end"], len(item["frames"]),
-                                   Path(root)/"frames"/asset["fingerprint"]/item["id"])
+            if item.get("analysis_baseline"):
+                paths = []
+                for frame in item["frames"]:
+                    path = Path(root) / frame["image"]
+                    if not path.resolve().is_relative_to(Path(root).resolve()) or not path.is_file():
+                        raise ValueError("已登记取证图片缺失，请在外部Agent任务中重新取证并导入。")
+                    if hashlib.sha256(path.read_bytes()).hexdigest() != frame["sha256"]:
+                        raise ValueError("已登记取证图片发生变化，拒绝作为原有证据发送。")
+                    paths.append(str(path))
+            else:
+                paths = extract_frames(asset["path"], item["start"], item["end"], len(item["frames"]),
+                                       Path(root)/"frames"/asset["fingerprint"]/item["id"])
             for frame, path in zip(item["frames"], paths):
                 images.append((frame["id"], path))
     catalog = [{k: r[k] for k in ("id","start","end","frames","cues")} for r in items]
@@ -418,7 +429,7 @@ def build_library(store, library_id, gateway, settings, stop=None):
                     raise ValueError("源视频已经改变，请重新登记；现有拉片资料保留。")
                 # A local repair uses the saved boundaries, not potentially changed UI spacing.
                 source_fields = set(ShotRange.__dataclass_fields__) | {
-                    "frames", "cues", "fingerprint", "asset_id", "subtitle_identity", "generation"}
+                    "frames", "cues", "fingerprint", "asset_id", "subtitle_identity", "generation", "analysis_baseline"}
                 ranges = [{**{k: v for k, v in r.items() if k in source_fields}, "analysis_state": "pending"}
                           for r in saved_ranges if r["asset_id"] == asset["id"]]
             else:

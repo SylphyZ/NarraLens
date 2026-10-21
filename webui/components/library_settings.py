@@ -106,7 +106,7 @@ def _launch_library_job(store, library_id, kind, callback):
 def _job_status(library_id, tr):
     store = LibraryStore()
     key = "library:" + library_id
-    jobs = [job for job in (store.job(library_id, "import"), store.job(library_id, "build"), store.job(library_id, "subtitle"), store.job(library_id, "files")) if job]
+    jobs = [job for job in (store.job(library_id, kind) for kind in ("import", "build", "subtitle", "files", "agent")) if job]
     if not jobs:
         return
     job = max(jobs, key=lambda item: item["updated"])
@@ -224,7 +224,11 @@ def _advanced_json(prefix, draft, validate, tr, busy):
 
 
 def _range_images(store, library_id, item):
-    frames = sorted((store.directory(library_id)/"frames"/item.get("observed_fingerprint", item["fingerprint"])/item["id"]).glob("*.jpg"))
+    if item.get("analysis_baseline"):
+        root = store.directory(library_id)
+        frames = [root / f["image"] for f in item["frames"] if (root / f["image"]).resolve().is_relative_to(root.resolve()) and (root / f["image"]).is_file()]
+    else:
+        frames = sorted((store.directory(library_id)/"frames"/item.get("observed_fingerprint", item["fingerprint"])/item["id"]).glob("*.jpg"))
     if frames:
         st.image([str(f) for f in frames], width=160,
                  caption=[f"帧 {i+1} · {frame['time']:.2f}s" for i, frame in enumerate(item.get("frames", []))][:len(frames)]
@@ -667,6 +671,106 @@ def _registered_panel(store, library_id, tr):
 
 
 @st.fragment
+def _agent_panel(store, library_id, targets, settings, tr):
+    from app.services.library import agent_tasks
+    prefix = "library_agent_" + library_id
+    with remembered_expander(tr("外部 Agent 任务"), key=prefix + "_open") as panel:
+        if not panel.open:
+            return
+        busy = runner.library_busy(library_id)
+        st.caption(tr("先创建本地任务，再将指令交给支持看图和本地命令的Agent。准备不调用模型，原视频保留原路径。"))
+        if st.button(tr("创建 Agent 拉片任务"), disabled=busy or not targets, key=prefix + "_create"):
+            try:
+                selected = [a["id"] for a in targets]
+                snapshot = copy.deepcopy(settings)
+                _launch_library_job(store, library_id, "agent", lambda stop: agent_tasks.create_task(store, library_id, selected, snapshot, stop))
+                st.rerun(scope="app")
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
+        tasks = agent_tasks.list_tasks(library_id)
+        if not tasks:
+            st.info(tr("尚无外部Agent任务。"))
+            return
+        identifiers = [r["id"] for r in tasks]
+        if st.session_state.get(prefix + "_task") not in identifiers:
+            st.session_state.pop(prefix + "_task", None)
+        identifier = st.selectbox(tr("选择 Agent 任务"), identifiers, key=prefix + "_task",
+            format_func=lambda tid: next(f"{time.strftime('%m-%d %H:%M', time.localtime(r['created']))} · {tid[:8]} · {len(r['assets'])}个素材" for r in tasks if r["id"] == tid))
+        if st.button(tr("刷新任务进度"), key=prefix + "_refresh"):
+            st.rerun(scope="fragment")
+        try:
+            status = agent_tasks.describe(identifier)
+            root = agent_tasks.task_directory(identifier)
+        except (ValueError, OSError) as exc:
+            st.error(str(exc))
+            return
+        state_labels = {"preparing": "准备尚未完成", "partial": "已准备部分素材", "ready": "本地任务已准备"}
+        st.write(tr(state_labels.get(status["state"], status["state"])))
+        st.caption(f"已收到观察草稿 {sum(r['kind']=='observation' for r in status['saved'])} 项 · 内容分组 {sum(r['kind']=='contents' for r in status['saved'])} 份")
+        st.caption(tr("尚无观察草稿或可复用结果的范围：") + str(status["pending_observations"]))
+        st.caption(tr("最近收到结果：") + (time.strftime("%m-%d %H:%M:%S", time.localtime(status["last_received"])) if status["last_received"] else tr("尚未收到")))
+        st.caption(tr("这里显示已落盘成果；外部Agent是否正在运行，请在其应用中查看。"))
+        st.caption(tr("任务指令（点击代码框右上角复制）"))
+        st.code(f"请阅读 {status['instructions']}，按其中工具和要求完成拉片；先查看已有进度，逐项提交结果，最后告知我回到NarraLens检查并导入。", language=None)
+        if st.button(tr("打开任务文件夹"), key=prefix + "_folder"):
+            try:
+                import os
+                if os.name == "nt":
+                    os.startfile(str(root))
+                else:
+                    st.info(str(root))
+            except OSError as exc:
+                st.warning(str(exc))
+        if status["state"] in {"preparing", "partial"} and st.button(tr("继续本地准备"), disabled=busy, key=prefix + "_prepare"):
+            try:
+                agent_tasks.control_task(identifier, False)
+                _launch_library_job(store, library_id, "agent", lambda stop: agent_tasks.prepare_task(store, identifier, stop))
+                st.rerun(scope="app")
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
+        left, right = st.columns(2)
+        check = left.button(tr("检查结果"), disabled=busy or status["state"] == "preparing", key=prefix + "_check")
+        commit = right.button(tr("导入合格结果"), disabled=busy or not status["saved"] or status["state"] == "preparing", key=prefix + "_import")
+        if check or commit:
+            try:
+                def process(stop):
+                    result = agent_tasks.check_task(store, identifier, stop, commit=commit)
+                    store.job(library_id, "agent", state="partial" if result["pending"] else "complete", progress=100,
+                        message=f"Agent结果检查完成：可导入{result['ready']}、已存在{result['existing']}、待处理{result['pending']}；本次写入{result['imported']}项。")
+                _launch_library_job(store, library_id, "agent", process)
+                st.rerun(scope="app")
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
+        report = read_json(root / "reports/last-check.json", default={})
+        if report:
+            st.caption(tr("上次检查：") + time.strftime("%m-%d %H:%M:%S", time.localtime(report["checked_at"])))
+            labels = {"ready_to_import": "合格／可导入", "already_imported": "已存在", "pending": "待补", "conflict": "输入冲突"}
+            st.dataframe([{tr("素材"): r.get("asset_id", ""), tr("镜头"): r.get("range_id", r.get("key", "")),
+                           tr("检查结果"): tr(labels.get(r["state"], r["state"])), tr("说明"): r["reason"]} for r in report["rows"][:200]],
+                         hide_index=True, width="stretch")
+            st.download_button(tr("下载完整检查／待补报告"), json.dumps(report, ensure_ascii=False, indent=2),
+                               file_name="agent-analysis-report.json", mime="application/json", key=prefix + "_download_report")
+        if status["issues"]:
+            with remembered_expander(tr("任务待处理问题"), key=prefix + "_issues") as issues:
+                if issues.open:
+                    st.write(status["issues"])
+        if st.button(tr("允许继续取证" if status["stop_requested"] else "请求停止后续取证"), key=prefix + "_stop"):
+            agent_tasks.control_task(identifier, not status["stop_requested"])
+            st.rerun(scope="fragment")
+        st.caption(tr("停止标记只约束后续本地工具调用；已发出的模型请求请在Agent应用中停止。"))
+        with remembered_expander(tr("移除 Agent 任务目录"), key=prefix + "_delete_open") as deletion:
+            if deletion.open:
+                st.code(str(root), language=None)
+                confirmed = st.checkbox(tr("确认移除此任务的输入副本、提案、未导入结果和取证图；库内已导入证据与原媒体保留"), key=prefix + "_delete_ack_" + identifier)
+                if st.button(tr("移除此任务目录"), disabled=busy or not confirmed, key=prefix + "_delete"):
+                    try:
+                        agent_tasks.delete_task(store, identifier, identifier)
+                        st.rerun(scope="app")
+                    except (ValueError, OSError) as exc:
+                        st.error(str(exc))
+
+
+@st.fragment
 def _build_panel(store, library_id, tr):
     prefix = "library_build_" + library_id
     with remembered_expander(tr("拉片任务"), key=prefix + "_open", default=True) as panel:
@@ -675,32 +779,42 @@ def _build_panel(store, library_id, tr):
         assets = store.assets(library_id)
         if not assets:
             st.info(tr("请先登记视频。"))
+            _agent_panel(store, library_id, [], {}, tr)
             return
         busy = runner.library_busy(library_id)
         saved = next(row["settings"] for row in store.list_libraries() if row["id"] == library_id)
         draft = st.session_state.setdefault(prefix + "_draft", copy.deepcopy(saved.get("build_settings", {})))
+        analysis_mode = st.radio(tr("分析方式"), ["auto", "agent"],
+            index=1 if draft.get("analysis_mode") == "agent" else 0,
+            format_func=lambda value: tr("自动拉片" if value == "auto" else "外部 Agent"),
+            horizontal=True, key=prefix + "_analysis_mode", disabled=busy)
         model_prefix = "video_library_models_" + library_id
-        seed_model_choices(model_prefix, bindings=draft.get("model_bindings"))
-        with remembered_expander(tr("模型选择"), key=prefix + "_models") as models:
-            if models.open:
-                if busy:
-                    st.info(tr("运行中使用启动时的模型快照，任务结束后可修改选择。"))
-                else:
-                    render_model_choices(tr, model_prefix, roles=("text", "vision"))
-        remember_widget_values(model_prefix)
-        st.caption(tr("图片和字幕联合拉片。普通继续只补缺项；内容目录失败时复用已保存观察。"))
+        if analysis_mode == "auto":
+            seed_model_choices(model_prefix, bindings=draft.get("model_bindings"))
+            with remembered_expander(tr("模型选择"), key=prefix + "_models") as models:
+                if models.open:
+                    if busy:
+                        st.info(tr("运行中使用启动时的模型快照，任务结束后可修改选择。"))
+                    else:
+                        render_model_choices(tr, model_prefix, roles=("text", "vision"))
+            remember_widget_values(model_prefix)
+            st.caption(tr("图片和字幕联合拉片。普通继续只补缺项；内容目录失败时复用已保存观察。"))
         window = st.number_input(tr("长镜头分析范围目标时长（秒）"), min_value=10, max_value=120,
             value=int(draft.get("window_seconds", 15)), step=5, key=prefix + "_window", disabled=busy,
             help=tr("用于细分长镜头，可能就近采用字幕边界，不保证等长。不是抽帧间隔；每个范围按时长与字幕密度采样1–6帧。"))
-        left, right = st.columns(2)
-        with left:
-            batch_size = st.number_input(tr("每次请求最多包含的镜头范围数"), min_value=1, max_value=128,
-                value=int(draft.get("batch_size", 50)), step=1, key=prefix + "_batch", disabled=busy,
-                help=tr("每批来自同一视频。范围数不是内容事件数；超出模型预算时自动缩批。"))
-        with right:
-            concurrency = st.number_input(tr("API 请求并发上限"), min_value=1,
-                value=int(draft.get("concurrency", runner.DEFAULT_API_CONCURRENCY)), step=1, key=prefix + "_concurrency", disabled=busy,
-                help=tr("可输入任意正整数。实际在途请求另行显示，媒体槽位和接口限流会影响实际并发。"))
+        if analysis_mode == "auto":
+            left, right = st.columns(2)
+            with left:
+                batch_size = st.number_input(tr("每次请求最多包含的镜头范围数"), min_value=1, max_value=128,
+                    value=int(draft.get("batch_size", 50)), step=1, key=prefix + "_batch", disabled=busy,
+                    help=tr("每批来自同一视频。范围数不是内容事件数；超出模型预算时自动缩批。"))
+            with right:
+                concurrency = st.number_input(tr("API 请求并发上限"), min_value=1,
+                    value=int(draft.get("concurrency", runner.DEFAULT_API_CONCURRENCY)), step=1, key=prefix + "_concurrency", disabled=busy,
+                    help=tr("可输入任意正整数。实际在途请求另行显示，媒体槽位和接口限流会影响实际并发。"))
+        else:
+            batch_size = int(draft.get("batch_size", 50))
+            concurrency = int(draft.get("concurrency", runner.DEFAULT_API_CONCURRENCY))
         mode = st.radio(tr("本次分析范围"), ["全部素材", "指定素材"],
                         index=1 if draft.get("scope_mode", "指定素材" if draft.get("asset_ids") else "全部素材") == "指定素材" else 0,
                         horizontal=True, key=prefix + "_scope", disabled=busy)
@@ -711,13 +825,19 @@ def _build_panel(store, library_id, tr):
                 default=[aid for aid in draft.get("asset_ids", []) if aid in labels], key=prefix + "_assets", disabled=busy)
         targets = assets if mode == "全部素材" else [a for a in assets if a["id"] in selected]
         st.caption(f"本次处理 {len(targets)} 个素材 · 集号：" + "、".join(str(a["episode"]) for a in targets))
-        reanalyze = st.checkbox(tr("重新分析所选范围"), value=False, key=prefix + "_force", disabled=busy,
-                               help=tr("默认关闭。开启会重做本次范围内已成功的观察；只补目录无需开启。"))
-        if reanalyze:
-            st.warning(f"将重新请求上述 {len(targets)} 个素材的镜头观察。")
+        reanalyze = False
+        if analysis_mode == "auto":
+            reanalyze = st.checkbox(tr("重新分析所选范围"), value=False, key=prefix + "_force", disabled=busy,
+                                   help=tr("默认关闭。开启会重做本次范围内已成功的观察；只补目录无需开启。"))
+            if reanalyze:
+                st.warning(f"将重新请求上述 {len(targets)} 个素材的镜头观察。")
         settings = {"visual": True, "window_seconds": window, "batch_size": batch_size, "concurrency": concurrency,
-                    "model_bindings": selected_bindings(model_prefix), "asset_ids": selected, "scope_mode": mode}
+                    "model_bindings": selected_bindings(model_prefix) if analysis_mode == "auto" else draft.get("model_bindings"),
+                    "asset_ids": selected, "scope_mode": mode, "analysis_mode": analysis_mode}
         st.session_state[prefix + "_draft"] = copy.deepcopy(settings)
+        if analysis_mode == "agent":
+            _agent_panel(store, library_id, targets, settings, tr)
+            return
         if st.button(tr("建立／继续视频素材库"), key=prefix + "_start", disabled=busy or not targets):
             try:
                 check_model_choices(model_prefix, ["text", "text_backup", "vision", "vision_backup"])

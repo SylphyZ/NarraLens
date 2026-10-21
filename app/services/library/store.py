@@ -251,11 +251,25 @@ class LibraryStore:
     def save_ranges(self, library_id, asset_id, ranges):
         self.require_content_library(library_id)
         with self.database(library_id) as db:
-            for item in ranges:
-                db.execute("""INSERT INTO shot_records VALUES(?,?,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
-                           (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
+            self._write_ranges(db, asset_id, ranges)
             db.execute("UPDATE assets SET status='partial' WHERE id=?", (asset_id,))
+
+    @staticmethod
+    def _write_ranges(db, asset_id, ranges):
+        for item in ranges:
+            db.execute("""INSERT INTO shot_records VALUES(?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET data=excluded.data""",
+                       (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
+
+    @staticmethod
+    def _write_contents(db, asset_id, segments):
+        revisions = {r["id"]: json.loads(r["data"]).get("revision") for r in
+                     db.execute("SELECT id,data FROM shot_records WHERE asset_id=?", (asset_id,))}
+        for item in segments:
+            item = {**item, "range_revisions": {rid: revisions[rid] for rid in item["range_ids"]}}
+            db.execute("INSERT INTO content_segments VALUES(?,?,?,?,?)",
+                       (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
+            db.executemany("INSERT INTO content_links VALUES(?,?)", [(item["id"], rid) for rid in item["range_ids"]])
 
     def replace_contents(self, library_id, asset_id, segments, expected_ranges):
         """One transaction publishes a consistent event-to-range index."""
@@ -265,14 +279,43 @@ class LibraryStore:
                 if row[0] not in expected:
                     db.execute("DELETE FROM shot_records WHERE id=?", (row[0],))
             db.execute("DELETE FROM content_segments WHERE asset_id=?", (asset_id,))
-            revisions = {r["id"]: json.loads(r["data"]).get("revision") for r in
-                         db.execute("SELECT id,data FROM shot_records WHERE asset_id=?", (asset_id,))}
-            for item in segments:
-                item = {**item, "range_revisions": {rid: revisions[rid] for rid in item["range_ids"]}}
-                db.execute("INSERT INTO content_segments VALUES(?,?,?,?,?)",
-                           (item["id"], asset_id, item["start"], item["end"], json.dumps(item, ensure_ascii=False)))
-                db.executemany("INSERT INTO content_links VALUES(?,?)",
-                               [(item["id"], rid) for rid in item["range_ids"]])
+            self._write_contents(db, asset_id, segments)
+
+    def analysis_snapshot(self, library_id, asset_ids, *, db=None):
+        """Deterministic snapshot used by partial import and its transaction guard."""
+        if db is None:
+            with self.database(library_id) as connection:
+                return self.analysis_snapshot(library_id, asset_ids, db=connection)
+        selected = set(asset_ids)
+        assets = {r["id"]: r for r in self._asset_rows(db) if r["id"] in selected}
+        rows = {}
+        for name, table in (("ranges", "shot_records"), ("contents", "content_segments")):
+            rows[name] = {r["id"]: {**json.loads(r["data"]), "asset_id": r["asset_id"]} for r in db.execute(f"SELECT id,asset_id,data FROM {table} ORDER BY id")
+                          if r["asset_id"] in selected}
+        for item in rows["contents"].values():
+            for field in ("library_id", "path", "episode", "fingerprint", "fps", "duration", "missing_range_ids", "stale_reasons"):
+                item.pop(field, None)
+        caches = {r[0]: json.loads(r[1]) for r in db.execute("""SELECT key,value FROM analysis_cache
+            WHERE key='work' OR key LIKE 'analysis-generation:%' OR key LIKE 'agent-import:%' ORDER BY key""")}
+        return {"assets": assets, **rows, "cache": caches}
+
+    def apply_analysis_patch(self, library_id, asset_ids, expected_hash, patches, receipt_key, receipt):
+        """Commit only reviewed ranges/events, retaining all unrelated rows and derivatives."""
+        from app.services.library.runner import library_operation
+        with library_operation(library_id), self.database(library_id) as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = self.analysis_snapshot(library_id, asset_ids, db=db)
+            if stable_hash(snapshot) != expected_hash:
+                raise ValueError("检查后素材库已有新修改，请重新检查结果；本批未写入。")
+            for asset_id, patch in patches.items():
+                if asset_id not in snapshot["assets"] or patch["status"] not in {"ready", "partial"}:
+                    raise ValueError("导入范围或状态无效。")
+                self._write_ranges(db, asset_id, patch["ranges"])
+                for identifier in patch["remove_contents"]:
+                    db.execute("DELETE FROM content_segments WHERE id=? AND asset_id=?", (identifier, asset_id))
+                self._write_contents(db, asset_id, patch["contents"])
+                db.execute("UPDATE assets SET status=? WHERE id=?", (patch["status"], asset_id))
+            db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)", (receipt_key, json.dumps(receipt, ensure_ascii=False)))
 
     def records(self, identifiers, kind="ranges", *, include_stale=False):
         """Read current evidence; the browser may also request retained, outdated records."""
@@ -392,14 +435,20 @@ class LibraryStore:
         result = []
         for identifier in library_ids(library_id):
             with self.database(identifier) as db:
-                rows = db.execute("""SELECT a.*, s.source_path AS subtitle_path, s.original_path, s.processed_path, s.content_hash,
-                    s.settings AS subtitle_settings FROM assets a
-                    LEFT JOIN subtitle_sources s ON s.id=a.active_subtitle ORDER BY a.episode,a.path""").fetchall()
-            for row in rows:
-                item = {**dict(row), "library_id": identifier}
-                settings = json.loads(item.get("subtitle_settings") or "{}")
-                item["subtitle_identity"] = item["active_subtitle"] if settings.get("_processing") else item.get("content_hash")
-                result.append(item)
+                result.extend({**row, "library_id": identifier} for row in self._asset_rows(db))
+        return result
+
+    @staticmethod
+    def _asset_rows(db):
+        rows = db.execute("""SELECT a.*, s.source_path AS subtitle_path, s.original_path, s.processed_path, s.content_hash,
+            s.settings AS subtitle_settings FROM assets a
+            LEFT JOIN subtitle_sources s ON s.id=a.active_subtitle ORDER BY a.episode,a.path""").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            settings = json.loads(item.get("subtitle_settings") or "{}")
+            item["subtitle_identity"] = item["active_subtitle"] if settings.get("_processing") else item.get("content_hash")
+            result.append(item)
         return result
 
     def upsert_asset(self, library_id, media, episode):
@@ -522,7 +571,7 @@ class LibraryStore:
         with self.database(library_id) as db:
             counts = {name: db.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
                       for name in ("assets", "scenes", "analysis_cache")}
-            running_records = db.execute("SELECT COUNT(*) FROM analysis_jobs WHERE id IN ('build','import','subtitle','files') AND state='running'").fetchone()[0]
+            running_records = db.execute("SELECT COUNT(*) FROM analysis_jobs WHERE id IN ('build','import','subtitle','files','agent') AND state='running'").fetchone()[0]
             if db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
                 counts["scenes"] = db.execute("SELECT COUNT(*) FROM content_segments").fetchone()[0]
         return {"directory": str(directory), **counts, "running_records": running_records}
