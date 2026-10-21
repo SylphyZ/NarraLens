@@ -674,6 +674,71 @@ def _registered_panel(store, library_id, tr):
         _asset_actions(store, library_id, assets, selected, tr, busy)
 
 
+def _agent_batch_options(store, library_id, identifier, status, prefix, busy, tr):
+    from app.services.library import agent_tasks
+    key = prefix+"_"+identifier+"_batch"
+    preferences = {**agent_tasks.BATCH_DEFAULTS, "workset_workers": 4, "contact_sheets": False,
+                   **st.session_state.get(key+"_preferences", {})}
+    ready = [aid for aid, info in status["assets"].items() if info.get("input_hash")]
+    selected = [aid for aid in preferences.get("assets", ready) if aid in ready]
+    with remembered_expander(tr("批量提速与并行分工"), key=key+"_open") as panel:
+        if panel.open:
+            left, right = st.columns(2)
+            with left:
+                preferences["limit"] = st.number_input(tr("每批目标范围数"), min_value=1, value=preferences["limit"], key=key+"_limit")
+                preferences["prefetch_batches"] = st.number_input(tr("每个素材预取批数"), min_value=1, value=preferences["prefetch_batches"], key=key+"_prefetch")
+                preferences["workset_workers"] = st.number_input(tr("分工份数"), min_value=1, value=preferences["workset_workers"], key=key+"_worksets")
+            with right:
+                preferences["max_images"] = st.number_input(tr("每批图片预算"), min_value=1, value=preferences["max_images"], key=key+"_images")
+                preferences["media_workers"] = st.number_input(tr("本地预取并行素材数"), min_value=1, value=preferences["media_workers"], key=key+"_media")
+                preferences["max_text_chars"] = st.number_input(tr("每批正文预算（字符）"), min_value=1, value=preferences["max_text_chars"], key=key+"_text",
+                    help=tr("用于上下文、字幕、图片映射及观察模板，工具状态另计。超出时缩批，不截断原字幕。"))
+            preferences["contact_sheets"] = st.checkbox(tr("生成分页看图页（细节仍可打开原图）"), value=preferences["contact_sheets"], key=key+"_sheets")
+            selected = st.multiselect(tr("预取素材"), ready, default=selected,
+                format_func=lambda aid: f"第{status['assets'][aid]['episode']}集 · {aid[:8]}", key=key+"_assets")
+            preferences["assets"] = selected
+            st.session_state[key+"_preferences"] = copy.deepcopy(preferences)
+            options = {k: preferences[k] for k in ("limit", "max_images", "max_text_chars", "contact_sheets")}
+            st.caption(tr("超出图片或文字预算会减少本批范围，不丢采样帧。分工清单需交给外部客户端执行，份数不是实际模型并发。"))
+            if st.button(tr("预取下一批画面"), disabled=busy or not selected, key=key+"_prepare"):
+                try:
+                    agent_tasks.control_task(identifier, False)
+                    snapshot = copy.deepcopy(preferences)
+                    def prepare(stop):
+                        result = agent_tasks.prefetch(identifier, snapshot["assets"], batches=snapshot["prefetch_batches"], workers=snapshot["media_workers"],
+                            stop=stop, progress=lambda p, message: store.job(library_id, "agent", progress=100*p, message=message), **options)
+                        errors = sum("error" in a for a in result["assets"])
+                        store.job(library_id, "agent", state="partial" if errors else "complete", progress=100,
+                                  message=f"本地预取完成：{len(result['assets'])}个素材，{errors}项失败；未调用模型。")
+                    _launch_library_job(store, library_id, "agent", prepare)
+                    st.rerun(scope="app")
+                except (ValueError, OSError) as exc:
+                    st.error(str(exc))
+            if st.button(tr("生成分工清单"), disabled=busy or not ready, key=key+"_assign"):
+                try:
+                    st.session_state[key+"_assignments"] = agent_tasks.worksets(identifier, preferences["workset_workers"], **options)
+                except (ValueError, OSError) as exc:
+                    st.error(str(exc))
+            assignment = st.session_state.get(key+"_assignments", {})
+            groups = assignment.get("groups", [])
+            if groups:
+                st.caption(tr("以下为上次生成时的分工快照；工具会自动跳过后来完成的观察。"))
+                by_worker = {str(g["worker"]): g for g in groups}
+                def label(worker):
+                    group = by_worker[worker]
+                    return f"{worker}. 第{'、'.join(str(a['episode']) for a in group['assets'])}集 · {group['remaining_ranges']}个待处理范围"
+                worker = st.selectbox(tr("选择分工"), list(by_worker), key=key+"_worker", format_func=label)
+                st.code(by_worker[worker]["instructions"], language=None)
+            try:
+                metrics = read_json(agent_tasks.task_directory(identifier)/"reports/last-batch.json", default={})
+            except (OSError, ValueError):
+                metrics = {}
+            if metrics.get("input_hash") == status["input_hash"]:
+                st.caption(f"最近本地批次：{metrics['ranges']}范围／{metrics['images']}图 · 证据准备{metrics.get('evidence_seconds', 0):.2f}s · "
+                           f"已登记证据命中{metrics.get('registered_evidence_hits', 0)}帧 · 素材锁等待{metrics.get('asset_lock_wait_seconds', 0):.2f}s；外部推理耗时／Token未知。")
+    return {k: preferences[k] for k in ("limit", "max_images", "max_text_chars", "prefetch_batches", "media_workers", "contact_sheets")}
+
+
 @st.fragment
 def _agent_panel(store, library_id, targets, settings, tr):
     from app.services.library import agent_tasks
@@ -711,11 +776,13 @@ def _agent_panel(store, library_id, targets, settings, tr):
         state_labels = {"preparing": "准备尚未完成", "partial": "已准备部分素材", "ready": "本地任务已准备"}
         st.write(tr(state_labels.get(status["state"], status["state"])))
         st.caption(f"已收到观察草稿 {sum(r['kind']=='observation' for r in status['saved'])} 项 · 内容分组 {sum(r['kind']=='contents' for r in status['saved'])} 份")
-        st.caption(tr("尚无观察草稿或可复用结果的范围：") + str(status["pending_observations"]))
+        st.caption(tr("尚无合格观察的范围（含待复核）：") + str(status["pending_observations"]) +
+                   f" · {tr('其中不确定观察')} {status.get('review_observations', 0)}")
         st.caption(tr("最近收到结果：") + (time.strftime("%m-%d %H:%M:%S", time.localtime(status["last_received"])) if status["last_received"] else tr("尚未收到")))
         st.caption(tr("这里显示已落盘成果；外部Agent是否正在运行，请在其应用中查看。"))
+        batch_options = _agent_batch_options(store, library_id, identifier, status, prefix, busy, tr)
         st.caption(tr("任务指令（点击代码框右上角复制）"))
-        st.code(f"请阅读 {status['instructions']}，按其中工具和要求完成拉片；先查看已有进度，逐项提交结果，最后告知我回到NarraLens检查并导入。", language=None)
+        st.code(agent_tasks.instructions(identifier, **batch_options), language=None)
         if st.button(tr("打开任务文件夹"), key=prefix + "_folder"):
             try:
                 import os
@@ -740,7 +807,8 @@ def _agent_panel(store, library_id, targets, settings, tr):
                 def process(stop):
                     result = agent_tasks.check_task(store, identifier, stop, commit=commit)
                     store.job(library_id, "agent", state="partial" if result["pending"] else "complete", progress=100,
-                        message=f"Agent结果检查完成：可导入{result['ready']}、已存在{result['existing']}、待处理{result['pending']}；本次写入{result['imported']}项。")
+                        message=f"Agent结果检查完成：可导入{result['ready']}、已存在{result['existing']}；镜头待补{result['pending_observations']}、"
+                                f"分组待补{result['pending_content_assets']}集、输入冲突{result['input_conflicts']}项；本次写入{result['imported']}项。")
                 _launch_library_job(store, library_id, "agent", process)
                 st.rerun(scope="app")
             except (ValueError, OSError) as exc:

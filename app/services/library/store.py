@@ -79,9 +79,10 @@ def library_ids(value):
     return list(dict.fromkeys(str(UUID(str(identifier))) for identifier in value))
 
 
-def write_json(path, value, *, compact=False):
+def write_json(path, value, *, compact=False, create_parent=True):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
     serialized = json.dumps(value, ensure_ascii=False, indent=None if compact else 2,
                             separators=(",", ":") if compact else None)

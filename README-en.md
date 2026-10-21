@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.9.2**
+**Manuscript-driven video production · v2.9.3**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.9.2 provides seven workspaces:
+Version 2.9.3 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -158,15 +158,26 @@ In the video library analysis section, choose **Automatic analysis / External Ag
 
 1. Select assets, expand **External Agent tasks**, and create a local analysis task.
 2. Local preparation saves shot ranges, subtitle snapshots and sparse previews. Copy the task instruction into an agent with local file, image-viewing and command capabilities.
-3. The agent follows the generated `TASK.md`, reviews episodes, requests extra frames or crops, and submits observation and event drafts through the CLI.
+3. The agent follows the current batch instructions, reviews adjacent ranges together, and submits independent observations in batches. It requests extra frames or crops for uncertain details and completes event grouping. Existing tasks can use updated instructions without being rebuilt.
 4. Refresh the task in NarraLens, inspect the result check, then import accepted results. Existing results, input conflicts and unfinished items are reported separately.
 5. Imported observations use the existing content browser and manuscript retrieval. Partial observations may be imported before the whole directory is complete.
 
 Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain read-only path references. Each task owns its subtitle snapshot, evidence, proposals and receipts. Imported evidence is copied into library ownership and survives removal of the task directory.
 
-The CLI entry is `python -m app.services.library.agent_tasks`, with `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. Generated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
+The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.9.3
+
+External agents can now analyze batches. Defaults are 12 ranges from one video and 24 planned evidence images, reduced to fit image and text budgets. Each range retains its own observation and exact source-frame evidence. Tools bind short aliases to registered identities.
+
+- Under **Video library → Analysis tasks → External Agent tasks → Batch acceleration and work assignment**, configure a two-batch prefetch window and two local media workers. Generate four disjoint episode worksets for external workers; the client controls actual model concurrency.
+- Open the batch images together and use `submit-batch`. Successful items remain saved; retry only failures and review uncertain observations separately. Optional contact pages provide navigation while originals remain available for details.
+- Hot paths read result heads by ID. Media work uses asset locks and receipt publication uses a short task lock, allowing different episodes to proceed together. Single-item tools, existing tasks, indices, signatures and imported work remain usable.
+- Source indexing and 2.9.2 recovery remain in place. Batch tools do not launch agents, call models or rebuild libraries automatically. Event grouping and checked imports still apply.
+
+Isolated short-video, signed-task, cross-process and Streamlit AppTest checks have passed, together with indexing recovery regression checks. No model calls or production-task changes were made. Full-season model throughput and semantic quality still require a real run; no fixed speedup or completion time is promised.
 
 ## Version 2.9.2
 

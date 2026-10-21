@@ -596,7 +596,9 @@ def extract_frames(asset, index, numbers, output_dir, *, crop=None, stop=None):
             command += ["-i", asset["path"], "-map", f"0:{index.data['stream_index']}", "-an", "-sn", "-dn",
                         "-vf", ",".join(filters), "-frames:v", str(len(pending)), "-vsync", "0", "-q:v", "4",
                         str(output/"%06d.jpg")]
-            code, tail = execute_ffmpeg(command, stop, timeout=max(120, index.time(pending[-1][0])*2) if not seek else 120,
+            timeout = max(120, index.time(pending[-1][0])*2) if not seek else max(
+                120, (index.time(pending[-1][0])-index.time(pending[0][0]))*2+30)
+            code, tail = execute_ffmpeg(command, stop, timeout=timeout,
                                          line_callback=collect)
             expected = [(i, p*index.clock) for i, p in enumerate(target_pts)]
             # FFmpeg can request one additional filtered frame before closing the image muxer.
@@ -620,7 +622,7 @@ def extract_frames(asset, index, numbers, output_dir, *, crop=None, stop=None):
     return [saved[n] for n in numbers]
 
 
-def extract_evidence_frame(asset, index, output_dir, *, timestamp=None, frame_index=None, bounds=None, crop=None, stop=None):
+def evidence_frame_number(index, *, timestamp=None, frame_index=None, bounds=None):
     start, end = bounds or (0, index.count)
     if not 0 <= start < end <= index.count or (timestamp is None) == (frame_index is None):
         raise ValueError("请在当前帧范围内指定秒数或帧号，两者只能选一个。")
@@ -631,8 +633,13 @@ def extract_evidence_frame(asset, index, output_dir, *, timestamp=None, frame_in
         frame_index = index.nearest(timestamp, start, end)
     if type(frame_index) is not int or not start <= frame_index < end:
         raise ValueError("取帧序号须在当前镜头半开区间内。")
-    return {**extract_frames(asset, index, [frame_index], output_dir, crop=crop, stop=stop)[0],
-            "requested_time": timestamp}
+    return frame_index
+
+
+def extract_evidence_frame(asset, index, output_dir, *, timestamp=None, frame_index=None, bounds=None, crop=None, stop=None):
+    number = evidence_frame_number(index, timestamp=timestamp, frame_index=frame_index, bounds=bounds)
+    return {**extract_frames(asset, index, [number], output_dir, crop=crop, stop=stop)[0],
+            "requested_time": float(timestamp) if timestamp is not None else None}
 
 
 

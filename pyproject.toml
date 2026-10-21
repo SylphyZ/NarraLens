@@ -1,6 +1,6 @@
 [project]
 name = "narratoai"
-version = "2.9.2"
+version = "2.9.3"
 description = "An all-in-one AI-powered tool for film commentary and automated video editing."
 readme = "README.md"
 requires-python = ">=3.12"
