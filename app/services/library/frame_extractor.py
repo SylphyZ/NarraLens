@@ -11,7 +11,7 @@ import re
 import threading
 import time
 from bisect import bisect_left
-from collections import deque
+from collections import Counter, deque
 from functools import lru_cache
 from tempfile import TemporaryDirectory
 from uuid import uuid4
@@ -21,24 +21,25 @@ from fractions import Fraction
 from dataclasses import asdict
 from pathlib import Path
 
-from app.models.library import FRAME_PROTOCOL, SourceFrameIndex, VideoInspection, media_id
-from app.services.library.runner import check_cancel
+from app.models.library import FRAME_PROTOCOL, SourceFrameIndex, VideoInspection, media_id, validate_source_frames
+from app.services.library.runner import JobCancelled, check_cancel
 from app.services.library.store import read_json, write_json, stable_hash
 
 
-def execute_ffmpeg(command, stop=None, timeout=240, duration=0, progress=None, *, directory=None, stage="ffmpeg", line_callback=None, diagnostic_group="ffmpeg-diagnostics", process_name="FFmpeg", terminate_tree=False):
+def execute_ffmpeg(command, stop=None, timeout=240, duration=0, progress=None, *, directory=None, stage="ffmpeg", line_callback=None, diagnostic_group="ffmpeg-diagnostics", process_name="FFmpeg", terminate_tree=False, diagnostic=None):
     """Drain output while allowing cancellation and bounded execution."""
     output = queue.Queue()
     tail = deque(maxlen=40)
     process = reader = None
     record_path = None
     log = None
-    record = {"stage": stage, "process": process_name, "state": "running", "started_at": time.time(), "command": list(command), "timeout": timeout}
+    record = diagnostic if diagnostic is not None else {}
+    record.update(stage=stage, process=process_name, state="running", started_at=time.time(), command=list(command), timeout=timeout)
     if directory:
         record_id = uuid4().hex
         record_path = Path(directory) / diagnostic_group / f"{stage}-{record_id}.json"
         log_path = record_path.with_suffix(".log")
-        record.update(id=record_id, log_file=log_path.name)
+        record.update(id=record_id, log_file=log_path.name, diagnostic_file=str(record_path))
         try:
             write_json(record_path, record)
             log = Path(log_path).open("w", encoding="utf-8")
@@ -58,6 +59,7 @@ def execute_ffmpeg(command, stop=None, timeout=240, duration=0, progress=None, *
         while True:
             check_cancel(stop)
             if time.monotonic() > deadline:
+                record["reason"] = "timeout"
                 raise RuntimeError(f"{process_name}超时，阶段文件保留，可以继续生成。")
             try:
                 line = output.get(timeout=.5)
@@ -87,6 +89,8 @@ def execute_ffmpeg(command, stop=None, timeout=240, duration=0, progress=None, *
         return return_code, "\n".join(tail)
     except Exception as exc:
         record.update(state="failed", error=str(exc))
+        if isinstance(exc, JobCancelled):
+            record["reason"] = "cancelled"
         raise
     finally:
         if process is not None and process.poll() is None:
@@ -225,26 +229,134 @@ def _read_source_index(path, modified, size):
     return SourceFrameIndex(data)
 
 
-def _tail_duration(asset, pts, clock):
-    """Older showinfo omits duration: inspect only the final GOP with FFprobe."""
-    position = max(0.0, float(pts*Fraction(*clock))-30)
-    result = subprocess.run([ffprobe_binary(), "-v", "error", "-select_streams", str(asset["stream_index"]),
-        "-read_intervals", f"{position:.9f}%", "-show_frames", "-show_streams", "-show_entries",
-        "frame=pts,best_effort_timestamp,duration,pkt_duration:stream=time_base", "-of", "json", asset["path"]],
-        capture_output=True, timeout=90)
-    if result.returncode:
-        raise ValueError("尾帧结束时间无法确认：" + result.stderr.decode("utf-8", "replace")[-500:])
-    data = json.loads(result.stdout)
-    source_clock = Fraction(data["streams"][0]["time_base"])
-    target = pts*Fraction(*clock)
-    matches = [f for f in data.get("frames", []) if f.get("pts", f.get("best_effort_timestamp")) is not None
-               and int(f.get("pts", f.get("best_effort_timestamp")))*source_clock == target]
-    if len(matches) != 1:
-        raise ValueError("尾帧时间戳缺失或重复，不能可靠确定视频结束边界。")
-    duration = int(matches[0].get("duration") or matches[0].get("pkt_duration") or 0)*source_clock/Fraction(*clock)
-    if duration <= 0 or duration.denominator != 1:
-        raise ValueError("尾帧没有有效显示时长，未生成源帧索引。")
-    return int(duration)
+def _probe_tail(asset, data, root, stop, method, record=None):
+    """Consume compact metadata; retain timestamps/counts, not the packet list."""
+    packet = method == "packets"
+    kind = "packet" if packet else "frame"
+    clock = Fraction(*data["time_base"])
+    target = data["pts"][-1]*clock
+    position = max(0.0, float(target)-30)
+    record = record if record is not None else {}
+    record.update(method=method, asset_id=asset["id"], episode=asset.get("episode"),
+                  fingerprint=asset["fingerprint"], stream_index=asset["stream_index"],
+                  target_pts=data["pts"][-1], target_time_base=data["time_base"],
+                  seek_start=None if packet else position, reason="invalid_result")
+    counts, streams, largest, matches, messages = Counter(), [], None, [], deque(maxlen=10)
+    item_count = 0
+
+    def collect(line):
+        nonlocal largest, matches, item_count
+        section, _, content = line.partition("|")
+        if section not in {kind, "stream"}:
+            if line:
+                messages.append(line)
+            return False
+        row = dict(part.split("=", 1) for part in content.split("|") if "=" in part)
+        if section == "stream":
+            if len(streams) >= 2:
+                raise ValueError("探测返回多个视频流。")
+            streams.append(row)
+            return True
+        if int(row["stream_index"]) != asset["stream_index"]:
+            raise ValueError("探测视频流与扫描不一致。")
+        pts = row.get("pts")
+        if pts in (None, "N/A") and not packet:
+            pts = row.get("best_effort_timestamp")
+        pts = int(pts)
+        if packet and (int(row["size"]) <= 0 or any(flag in row["flags"] for flag in "CD")):
+            raise ValueError("包含空数据、损坏或丢弃标记，无法确认包与帧的对应关系。")
+        counts[pts] += 1
+        if item_count >= data["frame_count"]:
+            raise ValueError("探测条目多于完整扫描帧数，无法确认对应关系。")
+        item_count += 1
+        if largest is None or pts > largest:
+            largest, matches = pts, [row]
+        elif pts == largest and len(matches) < 2:
+            matches.append(row)
+        return True
+
+    fields = ("packet=stream_index,pts,dts,duration,size,pos,flags" if packet else
+              "frame=stream_index,pts,best_effort_timestamp,duration,pkt_duration")
+    command = [ffprobe_binary(), "-v", "error", "-select_streams", str(asset["stream_index"])]
+    if not packet:
+        command += ["-read_intervals", f"{position:.9f}%"]
+    command += ["-show_packets" if packet else "-show_frames", "-show_streams", "-show_entries",
+                fields+":stream=index,codec_type,codec_name,time_base", "-of", "compact=p=1:nk=0", asset["path"]]
+    try:
+        code, _ = execute_ffmpeg(command, stop, timeout=max(120, float(asset.get("duration", 0))*2) if packet else 90,
+            directory=root, stage="frame-tail-"+asset["id"]+"-"+method, line_callback=collect,
+            process_name="FFprobe", diagnostic=record)
+        if code or messages:
+            record["reason"] = "probe_error"
+        else:
+            if (len(streams) != 1 or int(streams[0]["index"]) != asset["stream_index"] or
+                    streams[0]["codec_type"] != "video"):
+                raise ValueError("尾帧探测的视频流身份无效。")
+            probe_clock = Fraction(streams[0]["time_base"])
+            if probe_clock <= 0:
+                raise ValueError("尾帧探测时间基无效。")
+            record.update(probe_time_base=str(probe_clock), codec=streams[0].get("codec_name"))
+            raw_target = target/probe_clock
+            count = counts.get(int(raw_target), 0) if raw_target.denominator == 1 else 0
+            record.update(match_count=count, matched_items=matches if largest == raw_target else [])
+            if count == 0:
+                record["reason"] = "empty_result" if not item_count else "target_not_found"
+            elif count > 1:
+                record["reason"] = "ambiguous_target"
+            elif largest != raw_target:
+                raise ValueError("探测返回的显示范围超出完整扫描。")
+            elif packet and Counter({p*probe_clock: n for p, n in counts.items()}) != Counter(p*clock for p in data["pts"]):
+                record["reason"] = "correspondence_unconfirmed"
+            else:
+                values = {int(matches[0][k]) for k in ("duration", "pkt_duration")
+                          if matches[0].get(k) not in (None, "N/A", "0")}
+                duration = next(iter(values), 0)*probe_clock/clock
+                if len(values) > 1:
+                    record["reason"] = "ambiguous_target"
+                elif duration <= 0 or duration.denominator != 1:
+                    record["reason"] = "duration_missing"
+                else:
+                    record.update(reason="confirmed", duration_ticks=int(duration),
+                                  correspondence="full_pts_bijection" if packet else "decoded_frame")
+    except JobCancelled:
+        record["reason"] = "cancelled"
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
+        record.update(error=str(exc))
+        if isinstance(exc, OSError):
+            record["reason"] = "probe_error"
+    finally:
+        record.update(item_count=item_count, messages=list(messages), validation="complete" if record.get("duration_ticks") else "failed")
+        if record.get("diagnostic_file"):
+            write_json(record["diagnostic_file"], record)
+    return record
+
+
+def _tail_duration(asset, data, root, stop, progress, record):
+    """One local attempt and one eligible sequential fallback, with exact clocks."""
+    if data["pts"].count(data["pts"][-1]) != 1:
+        record["reason"] = "ambiguous_target"
+        raise ValueError("扫描尾帧存在重复PTS，不能唯一确认尾帧时长。")
+    record["probes"] = []
+    for method in ("frames", "packets"):
+        check_cancel(stop)
+        if progress:
+            progress(1, "局部探测未取得尾帧，正在顺序读取包信息" if method == "packets" else "源帧扫描已完成，正在确认尾帧时长")
+        probe = {}
+        try:
+            _probe_tail(asset, data, root, stop, method, probe)
+        finally:
+            record["probes"].append({k: probe[k] for k in ("method", "reason", "diagnostic_file") if k in probe})
+        record["reason"] = probe["reason"]
+        if probe.get("duration_ticks"):
+            return probe["duration_ticks"]
+        if probe["reason"] not in {"empty_result", "target_not_found", "duration_missing"}:
+            break
+    reasons = {"empty_result": "探测未返回视频条目", "target_not_found": "探测未找到目标PTS",
+               "duration_missing": "目标缺少可用时长", "ambiguous_target": "目标PTS或时长存在歧义",
+               "correspondence_unconfirmed": "包PTS与完整显示帧表不能一一对应",
+               "timeout": "尾帧探测超时", "probe_error": "尾帧读取失败", "invalid_result": "尾帧探测格式或来源无效"}
+    raise ValueError(reasons.get(record["reason"], record["reason"]))
 
 
 def source_index(asset, root, stop=None, *, prepare=False, progress=None):
@@ -273,6 +385,95 @@ def source_index(asset, root, stop=None, *, prepare=False, progress=None):
     if actual.fingerprint != asset["fingerprint"]:
         raise ValueError("源视频已变化，请重新登记。")
     media = {**asset, "stream_index": actual.stream_index}
+    pending = target.with_suffix(".scan.json")
+    diagnostic = Path(root)/"ffmpeg-diagnostics"/f"source-index-{asset['id']}-{uuid4().hex}.json"
+    record = {"stage": "source-index-publish", "asset_id": asset["id"], "episode": asset.get("episode"),
+              "task_id": asset.get("agent_task_id"), "library_id": Path(root).name,
+              "fingerprint": asset["fingerprint"], "stream_index": actual.stream_index,
+              "started_at": time.time(), "state": "running", "checkpoint": str(pending)}
+    try:
+        data = None
+        try:
+            saved = read_json(pending)
+            if (saved.get("version") != 1 or saved.get("phase") != "tail_pending" or
+                    saved.get("key") != stable_hash({k: v for k, v in saved.items() if k != "key"}) or
+                    saved.get("source") != asdict(actual) or saved["scan"].get("engine") != engine or
+                    set(saved["scan"]) != {"protocol", "fingerprint", "stream_index", "time_base", "origin_pts",
+                                          "frame_count", "pts", "durations", "cuts", "engine", "complete"} or
+                    saved["scan"].get("fingerprint") != actual.fingerprint or
+                    saved["scan"].get("stream_index") != actual.stream_index or saved["scan"].get("complete") is not False or
+                    saved["completed"].get("return_code") != 0 or
+                    saved["completed"].get("score_count") != saved["scan"].get("frame_count")):
+                raise ValueError("完整扫描检查点与来源、引擎或摘要不一致。")
+            validate_source_frames(saved["scan"], require_tail=False)
+            data = saved["scan"]
+            record["scan"] = "reused"
+            if progress:
+                progress(1, "复用完整扫描，继续确认尾帧时长")
+        except FileNotFoundError:
+            record["scan"] = "checkpoint_missing"
+        except PermissionError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError) as exc:
+            record.update(scan="checkpoint_invalid", checkpoint_error=str(exc))
+        write_json(diagnostic, record)
+        if data is None:
+            check_cancel(stop)
+            if progress:
+                progress(0, "无有效完整扫描检查点，开始建立源帧索引")
+            data, scan_record = _scan_source(media, actual, engine, root, stop, progress)
+            validate_source_frames(data, require_tail=False)
+            if asdict(inspect_video(asset["path"], stop)) != asdict(actual):
+                raise ValueError("扫描期间源视频发生变化，未保存完整检查点。")
+            saved = {"version": 1, "phase": "tail_pending", "source": asdict(actual), "scan": data,
+                     "completed": {"return_code": 0, "score_count": data["frame_count"],
+                                   "diagnostic_file": scan_record.get("diagnostic_file")}}
+            saved["key"] = stable_hash(saved)
+            write_json(pending, saved, compact=True)
+            record["scan"] = "saved"
+        record.update(target_pts=data["pts"][-1], time_base=data["time_base"], frame_count=data["frame_count"])
+        check_cancel(stop)
+        if data["durations"][-1] <= 0:
+            data["durations"][-1] = _tail_duration(media, data, root, stop, progress, record)
+        data["complete"] = True
+        data["key"] = stable_hash(data)
+        index = SourceFrameIndex(data)
+        check_cancel(stop)
+        if asdict(inspect_video(asset["path"], stop)) != asdict(actual):
+            record["scan"] = "source_changed"
+            raise ValueError("尾帧确认期间源视频发生变化，未发布索引。")
+        check_cancel(stop)
+        write_json(target, data, compact=True)
+        record.update(state="complete", reason="confirmed", index_file=str(target), index_key=data["key"])
+        try:
+            pending.unlink(missing_ok=True)
+        except OSError as exc:
+            record["checkpoint_cleanup_error"] = str(exc)
+        if progress:
+            progress(1, "源帧索引已完成")
+        return index
+    except Exception as exc:
+        record.update(state="failed", error=str(exc))
+        if isinstance(exc, JobCancelled):
+            record["reason"] = "cancelled"
+        retained = pending.is_file() and record.get("scan") in {"saved", "reused"}
+        message = ("；完整扫描已保存，继续准备仅补尾帧确认" if retained else "；尚无可恢复的完整扫描")
+        if progress:
+            progress(1 if retained else 0, str(exc)+message)
+        error = JobCancelled if isinstance(exc, JobCancelled) else ValueError
+        raise error(f"{exc}{message}。诊断：{diagnostic}") from exc
+    finally:
+        record["finished_at"] = time.time()
+        try:
+            write_json(diagnostic, record)
+        except OSError as exc:
+            if record["state"] == "complete":
+                raise
+            logger.warning("源帧索引失败记录保存异常：{}；原始错误：{}", exc, record.get("error"))
+
+
+def _scan_source(asset, actual, engine, root, stop, progress):
+    """Return only a complete scan; tail confirmation and publication are separate."""
     pts, durations, scores = [], [], []
     clock, metadata_frame = None, None
 
@@ -312,33 +513,24 @@ def source_index(asset, root, stop=None, *, prepare=False, progress=None):
             return True
         return False
 
-    command = [str(engine_path), "-nostdin", "-hide_banner", "-nostats", "-xerror", "-copyts",
+    command = [ffmpeg_binary(), "-nostdin", "-hide_banner", "-nostats", "-xerror", "-copyts",
         "-progress", "pipe:1", "-i", asset["path"], "-map", f"0:{actual.stream_index}", "-an", "-sn", "-dn",
         "-vf", "showinfo@source=checksum=0,scale=320:-2,select='gte(scene,0)',metadata=mode=print:key=lavfi.scene_score",
         "-vsync", "0", "-f", "null", "-"]
+    scan_record = {}
     code, tail = execute_ffmpeg(command, stop, timeout=max(300, actual.duration*2), duration=actual.duration,
         line_callback=collect, progress=(lambda p: progress(p, "建立源帧索引")) if progress else None,
-        directory=root, stage="frame-index-"+asset["id"])
+        directory=root, stage="frame-index-"+asset["id"], diagnostic=scan_record)
     if code or not pts or len(scores) != len(pts):
         raise ValueError("完整源帧扫描失败，未发布索引：" + tail[-1000:])
-    check_cancel(stop)
-    if durations[-1] <= 0:
-        durations[-1] = _tail_duration(media, pts[-1], clock)
     cuts = [0]
     for number, score in enumerate(scores):
         if number and score > .35 and pts[number] > pts[cuts[-1]]:
             cuts.append(bisect_left(pts, pts[number]))
     data = {"protocol": FRAME_PROTOCOL, "fingerprint": asset["fingerprint"], "stream_index": actual.stream_index,
             "time_base": clock, "origin_pts": pts[0], "frame_count": len(pts), "pts": pts, "durations": durations,
-            "cuts": [*cuts, len(pts)], "engine": engine, "complete": True}
-    data["key"] = stable_hash(data)
-    index = SourceFrameIndex(data)
-    if inspect_video(asset["path"], stop).fingerprint != actual.fingerprint:
-        raise ValueError("扫描期间源视频发生变化，未发布索引。")
-    write_json(target, data, compact=True)
-    if progress:
-        progress(1, "源帧索引已完成")
-    return index
+            "cuts": [*cuts, len(pts)], "engine": engine, "complete": False}
+    return data, scan_record
 
 
 def extract_frames(asset, index, numbers, output_dir, *, crop=None, stop=None):

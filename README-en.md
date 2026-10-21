@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.9.1**
+**Manuscript-driven video production · v2.9.2**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.9.1 provides seven workspaces:
+Version 2.9.2 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,17 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. Generated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.9.2
+
+Fixes source indexing that failed after a successful full scan when a local tail probe returned no frames, causing the next attempt to scan the video again.
+
+- A missing tail or duration permits one sequential packet-metadata fallback. Duration is checked against the selected stream, the complete frame table's PTS correspondence and rational time bases. Ambiguous or changed sources remain pending with a specific error.
+- A normally completed scan is checked and atomically saved before tail confirmation. Tail-read failures, cancellation and publication failures retain this checkpoint for continuation. An incomplete decode still requires a new scan.
+- FFprobe shares cancellation, timeouts and diagnostics with existing media operations. Records include the method, match count, time base and diagnostic path.
+- Valid 2.9.1 indices, analysis and agent tasks remain usable without migration. Previously failed videos without a checkpoint may still need one new scan.
+
+Isolated short-video and failure-path checks have passed. Recovery of the remaining real-library failures, live WebUI interaction and final-video acceptance still require a run. No model calls were made for this patch.
 
 ## Version 2.9.1
 

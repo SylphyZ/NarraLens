@@ -355,7 +355,7 @@ def prepare_task(store, identifier, stop=None):
                 if not current or (current["fingerprint"], current["subtitle_identity"]) != (asset["fingerprint"], asset["subtitle_identity"]):
                     raise ValueError("登记已变化，请创建新任务。")
                 context = episode_context(manifest["work"], asset["episode"])
-                ranges = prepare_ranges(store, manifest["library_id"], current, manifest["settings"], _Stop(root, stop),
+                ranges = prepare_ranges(store, manifest["library_id"], {**current, "agent_task_id": identifier}, manifest["settings"], _Stop(root, stop),
                     progress=lambda p, message: store.job(manifest["library_id"], "agent",
                         progress=100*(index+p)/len(manifest["assets"]),
                         message=f"准备Agent任务 {identifier[:8]} · 第{asset['episode']}集：{message} {p:.0%}；不调用模型"))

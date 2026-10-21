@@ -45,39 +45,46 @@ def range_input(item):
             **{key: item[key] for key in ("analysis_baseline", "evidence_images") if key in item}}
 
 
+def validate_source_frames(data, *, require_tail=True):
+    """Shared structural checks for completed scans and publishable indices."""
+    pts, durations, cuts, clock = data["pts"], data["durations"], data["cuts"], data["time_base"]
+    if (data.get("protocol") != FRAME_PROTOCOL or not isinstance(clock, list) or len(clock) != 2 or
+            any(type(v) is not int or v <= 0 for v in clock) or
+            type(data["stream_index"]) is not int or data["stream_index"] < 0):
+        raise ValueError("源帧索引的视频流或时间基无效。")
+    clock = Fraction(*clock)
+    if (not isinstance(pts, list) or not pts or not isinstance(durations, list) or len(pts) != len(durations) or
+            any(type(v) is not int for v in pts) or any(type(v) is not int or v < 0 for v in durations) or
+            any(a > b for a, b in zip(pts, pts[1:])) or (require_tail and durations[-1] <= 0)):
+        raise ValueError("源帧PTS缺失、倒退或尾帧结束时间未确认，不能建立精确索引。")
+    if (data.get("frame_count") != len(pts) or data.get("origin_pts") != pts[0] or
+            not isinstance(cuts, list) or not cuts or cuts[0] != 0 or cuts[-1] != len(pts) or
+            any(type(v) is not int for v in cuts) or any(a >= b for a, b in zip(cuts, cuts[1:]))):
+        raise ValueError("源帧索引的数量或镜头边界无效。")
+    for a, b in zip(cuts, cuts[1:]):
+        end = pts[b] if b < len(pts) else pts[-1] + durations[-1]
+        if pts[a] >= end and (b < len(pts) or durations[-1] > 0):
+            raise ValueError("物理镜头边界没有正显示时长。")
+    for a, b, duration in zip(pts, pts[1:], durations):
+        if duration and b-a-duration > max(duration, int(1/clock)):
+            raise ValueError("源视频存在无法解释的PTS跳变，未生成可剪辑索引。")
+    return clock
+
+
 class SourceFrameIndex:
     """Presentation-order source frames; output-video FPS never enters this clock."""
 
     def __init__(self, data):
         self.data = data
-        if data.get("protocol") != FRAME_PROTOCOL or data.get("complete") is not True:
+        if data.get("complete") is not True:
             raise ValueError("需要按2.9.1重新建立完整源帧索引。")
+        self.clock = validate_source_frames(data)
         self.pts, self.durations, self.cuts = data["pts"], data["durations"], data["cuts"]
-        clock = data["time_base"]
-        if (not isinstance(clock, list) or len(clock) != 2 or any(type(v) is not int or v <= 0 for v in clock)
-                or type(data["stream_index"]) is not int or data["stream_index"] < 0):
-            raise ValueError("源帧索引的视频流或时间基无效。")
-        self.clock = Fraction(*clock)
-        if (not self.pts or len(self.pts) != len(self.durations) or
-                any(type(v) is not int for v in self.pts) or
-                any(type(v) is not int or v < 0 for v in self.durations) or
-                any(a > b for a, b in zip(self.pts, self.pts[1:])) or self.durations[-1] <= 0):
-            raise ValueError("源帧PTS缺失、倒退或尾帧结束时间未确认，不能建立精确索引。")
         self.count = len(self.pts)
-        if (data.get("frame_count") != self.count or data.get("origin_pts") != self.pts[0] or
-                not self.cuts or self.cuts[0] != 0 or self.cuts[-1] != self.count or
-                any(type(v) is not int for v in self.cuts) or
-                any(a >= b for a, b in zip(self.cuts, self.cuts[1:]))):
-            raise ValueError("源帧索引的数量或镜头边界无效。")
         self.end_pts = self.pts[-1] + self.durations[-1]
         self.duration = self.time(self.count)
         if not math.isfinite(self.duration) or self.duration <= 0:
             raise ValueError("源视频显示时长无效。")
-        if any(self.time(a) >= self.time(b) for a, b in zip(self.cuts, self.cuts[1:])):
-            raise ValueError("物理镜头边界没有正显示时长。")
-        for a, b, duration in zip(self.pts, self.pts[1:], self.durations):
-            if duration and b-a-duration > max(duration, int(1/self.clock)):
-                raise ValueError("源视频存在无法解释的PTS跳变，未生成可剪辑索引。")
 
     def time(self, number):
         if type(number) is not int or not 0 <= number <= len(self.pts):
