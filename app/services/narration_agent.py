@@ -382,11 +382,16 @@ def _index(asset, item):
 
 
 def _source_current(asset):
-    from app.services.library.frame_extractor import sampled_fingerprint
+    """Check file state; the registered full-file digest is not a sample digest."""
     path = Path(asset["path"])
-    stat = path.stat()
-    if stat.st_size != asset["size"] or stat.st_mtime_ns != asset["mtime_ns"] or sampled_fingerprint(path) != asset["fingerprint"]:
-        raise ValueError(f"第{asset['episode']}集源视频已改变，请重新登记并创建任务。")
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ValueError(f"第{asset['episode']}集源视频无法访问，请检查路径、网络或权限：{exc}") from None
+    changed = [label for label, actual, saved in (("文件大小", stat.st_size, asset["size"]),
+               ("修改时间", stat.st_mtime_ns, asset["mtime_ns"])) if actual != saved]
+    if changed:
+        raise ValueError(f"第{asset['episode']}集{'、'.join(changed)}与登记不一致，请核对原文件和素材登记。")
 
 
 def view(project_id, task_id, library, range_id, *, capture=False, frames=None):
