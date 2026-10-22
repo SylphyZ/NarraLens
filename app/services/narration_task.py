@@ -33,6 +33,7 @@ from app.services.narration_motion import (
 from app.services.narration_alignment import (
     LEGACY_MODE, LONG_MODE, align_blocks, default_alignment_options, estimate_block_words, map_timing, validate_alignment_options,
 )
+from app.services.narration_agent import visual_backend, project_lock
 from app.services.model_profiles import (
     catalog, default_bindings, get_profile, production_voice, project_bindings, project_references,
     public_values, resolve_project, validate_narration_voice,
@@ -149,13 +150,17 @@ def _resume_checkpoint(directory, settings, text, level):
         policy = timeline.get("visual_policy", {})
         if not isinstance(policy, dict) or policy.get("version") != VISUAL_POLICY_VERSION:
             raise ValueError("此时间轴尚未执行2.6镜头去重与片尾过滤，请从3. 寻找画面继续；配音与字幕可复用。")
-        if policy.get("matching", {}).get("version") != MATCH_POLICY_VERSION:
+        agent = policy.get("producer", "internal") == "agent"
+        if agent and policy.get("agent", {}).get("project_id") != directory.name:
+            raise ValueError("Agent时间轴属于其他项目，请在本项目重新创建并导入画面任务。")
+        if not agent and policy.get("matching", {}).get("version") != MATCH_POLICY_VERSION:
             raise ValueError("此时间轴尚未执行2.7句意匹配，请从3. 寻找画面继续；配音与字幕可复用。")
-        visual_plan = validate_visual_plan(saved("visual_plan.json", "句意画面计划"), segments, text, directory)
-        if visual_plan.get("requirements_pending"):
-            raise ValueError("画面事实需求尚未整理完成，请从3. 寻找画面继续；已有配音、字幕与旧成片保留。")
-        if policy["matching"] != matching_policy(visual_plan):
-            raise ValueError("句意画面计划与时间线不一致，请从3. 寻找画面继续。")
+        if not agent:
+            visual_plan = validate_visual_plan(saved("visual_plan.json", "句意画面计划"), segments, text, directory)
+            if visual_plan.get("requirements_pending"):
+                raise ValueError("画面事实需求尚未整理完成，请从3. 寻找画面继续；已有配音、字幕与旧成片保留。")
+            if policy["matching"] != matching_policy(visual_plan):
+                raise ValueError("句意画面计划与时间线不一致，请从3. 寻找画面继续。")
         expected_motion = motion_config_key(options)
         recorded_motion = timeline.get("motion", {}).get("manual_config_key")
         if (expected_motion is not None or recorded_motion is not None) and expected_motion != recorded_motion:
@@ -262,7 +267,7 @@ def delete_task(task_id, confirmed=False, interrupted_confirmed=False):
     _checked_task_directory(identifier)
     settings = read_json(task_directory(identifier) / "settings.json", default={})
     state = read_task(identifier) or {}
-    with library_operation(identifier, prefix="narration:"), library_operation(library_ids(settings) or library_ids(state) or identifier):
+    with project_lock(identifier), library_operation(identifier, prefix="narration:"), library_operation(library_ids(settings) or library_ids(state) or identifier):
         if runner.running("narration:" + identifier):
             raise ValueError("任务仍在运行，请先停止并等待结束。")
         info = task_deletion_info(identifier)
@@ -350,7 +355,7 @@ def update_project_bindings(task_id, bindings):
     """A stopped project's role IDs may change without unlocking production inputs."""
     identifier = str(UUID(str(task_id)))
     directory = task_directory(identifier)
-    with library_operation(identifier, prefix="narration:"):
+    with project_lock(identifier), library_operation(identifier, prefix="narration:"):
         if runner.running("narration:" + identifier):
             raise ValueError("项目正在运行，请停止并等待结束后保存模型绑定。")
         _checked_task_directory(identifier)
@@ -371,6 +376,7 @@ def _task_options(text, options, bindings, *, draft=False, reuse_audio=False):
     if not isinstance(options, dict):
         raise ValueError("项目设置应为对象。")
     result = motion_options(bgm_options(normalized_audio_options(options)))
+    result["visual_backend"] = visual_backend(result)
     value = result.get("visual_no_gain_rounds", 2)
     if type(value) is not int or value < 1:
         raise ValueError("连续无改善轮数需为正整数。")
@@ -402,6 +408,23 @@ def _task_options(text, options, bindings, *, draft=False, reuse_audio=False):
     return result
 
 
+def update_visual_backend(task_id, backend):
+    """A stopped project can change its visual editor without unlocking narration settings."""
+    backend = visual_backend({"visual_backend": backend})
+    identifier = str(UUID(str(task_id)))
+    directory = task_directory(identifier)
+    with project_lock(identifier), library_operation(identifier, prefix="narration:"):
+        if runner.running("narration:" + identifier):
+            raise ValueError("请停止项目并等待结束后修改画面匹配方式。")
+        _checked_task_directory(identifier)
+        saved = read_json(directory / "settings.json")
+        with library_operation(library_ids(saved)):
+            updated = {**saved, "options": {**saved["options"], "visual_backend": backend}}
+            _preserve_visual_result(directory)
+            _write_project_settings(directory, saved, updated)
+            return updated
+
+
 def project_edit_status(task_id):
     """One conservative rule for editing new projects, including old pending records."""
     identifier = str(UUID(str(task_id)))
@@ -426,7 +449,7 @@ def update_project_settings(task_id, selected_libraries, options, voice_profile,
     """Atomically replace a new project's config; never edit a generated project."""
     identifier = str(UUID(str(task_id)))
     directory = task_directory(identifier)
-    with library_operation(identifier, prefix="narration:"):
+    with project_lock(identifier), library_operation(identifier, prefix="narration:"):
         saved = read_json(directory / "settings.json")
         selected_libraries = library_ids(selected_libraries)
         with library_operation(library_ids(saved) + selected_libraries), \
@@ -505,7 +528,7 @@ def fork_task(task_id, options, voice_profile, model_profile, *, selected_librar
     source_settings = read_json(source_directory / "settings.json")
     source_libraries = library_ids(source_settings)
     target_libraries = library_ids(selected_libraries) if selected_libraries is not None else source_libraries
-    with library_operation(task_id, prefix="narration:"), library_operation(source_libraries + target_libraries), \
+    with project_lock(task_id), library_operation(task_id, prefix="narration:"), library_operation(source_libraries + target_libraries), \
             library_operation(bgm_libraries(options), prefix="audio-library:"):
         if runner.running("narration:" + str(UUID(str(task_id)))):
             raise ValueError("来源任务正在运行，请先停止并等待结束，再创建复用副本。")
@@ -600,7 +623,7 @@ def fork_task(task_id, options, voice_profile, model_profile, *, selected_librar
 
 
 def run_task(task_id, stop=None, *, start_stage="auto"):
-    with library_operation(task_id, prefix="narration:"):
+    with project_lock(task_id), library_operation(task_id, prefix="narration:"):
         directory = task_directory(task_id)
         settings = read_json(directory / "settings.json")
         with library_operation(library_ids(settings)), library_operation(bgm_libraries(settings["options"]), prefix="audio-library:"):
@@ -892,14 +915,41 @@ def _run_task(task_id, stop, *, start_stage="auto"):
     level = _resume_level(start_stage)
     options = motion_options(bgm_options(normalized_audio_options(settings["options"]) if level <= 2 else dict(settings["options"])))
     mode = audio_mode(options)
+    agent = visual_backend(options) == "agent"
+    # A completed Agent import resumes at production; its signed revision is checked here.
+    if agent and level in {0, 3}:
+        existing = read_json(directory / "timeline.json", default={})
+        if existing.get("visual_policy", {}).get("producer") == "agent":
+            try:
+                _resume_checkpoint(directory, settings, text, 4)
+                level, start_stage = 4, "bgm"
+            except (OSError, ValueError, KeyError, TypeError, EOFError, wave.Error):
+                # An explicit visual restart can replace an outdated import without deleting it.
+                if level != 3:
+                    raise
+        elif level == 0:
+            try:
+                _resume_checkpoint(directory, settings, text, 3)
+                level, start_stage = 3, "visual"
+            except (OSError, ValueError, KeyError, TypeError, EOFError, wave.Error):
+                pass
     checkpoint = _resume_checkpoint(directory, settings, text, level) if level else {}
-    required = ["text"] if level <= 3 or (level == 4 and options["bgm_mode"] == "auto" and options["bgm_volume"] > 0) else []
+    cached_motion = None
+    if agent and level == 3:
+        from app.services.narration_agent import _motion
+        try:
+            cached_motion = _motion(directory, settings, text, checkpoint["segments"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    required = ["text"] if (level == 0 or (level <= 3 and not agent) or
+        (level <= 3 and options["motion_enabled"] and cached_motion is None) or
+        (level == 4 and options["bgm_mode"] == "auto" and options["bgm_volume"] > 0)) else []
     if level == 0 or (level == 2 and mode == LONG_MODE):
         required.append("text_fast")
-    if level <= 3 and "text_fast" not in required:
+    if level <= 3 and not agent and "text_fast" not in required:
         required.append("text_fast")
     # The relevance switch does not disable the independent credits/usability check.
-    if level <= 3:
+    if level <= 3 and not agent:
         required.append("vision")  # Used only when a saved range still needs local enrichment.
     resolved = resolve_project(settings, roles=required, need_voice=level <= 1,
         need_alignment=level <= 2 and mode == LONG_MODE and options["alignment_enabled"])
@@ -958,10 +1008,11 @@ def _run_task(task_id, stop, *, start_stage="auto"):
     try:
         if level <= 3:
             _preserve_visual_result(directory)
-        if level <= 4:
+        if level <= 4 and not (agent and level <= 3):
             validate_bgm(options)
         if level <= 3:
-            validate_motion(options)
+            if cached_motion is None:
+                validate_motion(options)
             manual_motion_entries(text, options, complete=True)
         if level <= 2 and mode == LONG_MODE and options["alignment_enabled"]:
             validate_alignment_options(options)
@@ -969,7 +1020,7 @@ def _run_task(task_id, stop, *, start_stage="auto"):
             gateway.require(kind)
         store = LibraryStore()
         selected_libraries = library_ids(settings)
-        if level <= 3:
+        if level <= 3 and not agent:
             update("校验字幕资料", 0 if level == 0 else 40, "本地检查正文资料；异常资料修复前不发起模型找片")
             subtitle_issues = [row for identifier in selected_libraries for row in audit_subtitles(store, identifier, stop)
                                if row["state"] in {"recovery_needed", "error"}]
@@ -978,7 +1029,7 @@ def _run_task(task_id, stop, *, start_stage="auto"):
                 raise JobPaused("视频素材库字幕正文校验未通过：" + "；".join(
                     f"第{r['episode']}集：" + (r.get("error") or f"缺少{r.get('missing_body_events', 0)}条正文") for r in subtitle_issues) +
                     "。请到视频素材库→已登记素材→字幕资料校验与恢复，点“校验字幕”及“恢复正文与本地索引”，再从3. 寻找画面继续。配音、字幕、动画及旧成片保留。")
-        retriever = MaterialRetriever(store, selected_libraries) if level <= 3 else None
+        retriever = MaterialRetriever(store, selected_libraries) if level <= 3 and not agent else None
         if level == 0:
             update("分析文案", 0, "保留原文，分析全文结构和画面需求")
             overview, segments = plan_document(text, gateway, directory, stop,
@@ -1046,7 +1097,11 @@ def _run_task(task_id, stop, *, start_stage="auto"):
             subtitle_path = create_narration_subtitles(segments, subtitle_path)
         if level <= 3:
             motion_plan, motion_assets, reservations = None, [], []
-            if options["motion_enabled"]:
+            if cached_motion is not None:
+                from app.models.timeline import VisualShot
+                motion_plan, motion_assets = cached_motion["plan"], cached_motion["assets"]
+                reservations = [VisualShot(**row) for row in cached_motion["reservations"]]
+            elif options["motion_enabled"]:
                 update("规划解释动画", 40, "按原文绑定手动动画与自动候选，使用已保存的旁白时间" if options.get("motion_placement", "auto") != "auto" else
                        "根据原文句子选择动画位置，使用已保存的旁白时间")
                 motion_plan = plan_motion(segments, text, overview, gateway, directory, options, stop,
@@ -1058,6 +1113,13 @@ def _run_task(task_id, stop, *, start_stage="auto"):
                 state.update(motion_count=len({s.asset_id for s in reservations}), motion_seconds=round(sum(s.timeline_end-s.timeline_start for s in reservations), 2))
             else:
                 state.update(motion_count=0, motion_seconds=0)
+            if agent:
+                from app.services.narration_agent import create_task as create_agent_task
+                update("准备外部Agent画面任务", 45, "固定全文、配音、字幕和动画占位；不调用内置画面匹配API")
+                agent_task = create_agent_task(task_id, locked=True)
+                state.update(agent_visual_task=agent_task["task_id"], phase="等待外部Agent画面方案")
+                raise JobPaused("整篇画面任务已准备，请展开画面匹配设置，把TASK.md交给外部Agent。"
+                    "完成后检查并导入画面方案，再从第4/5阶段推进；配音、字幕和旧成片保留。")
             visual_start = 45 if options["motion_enabled"] else 40
             update("规划句意画面", visual_start, "保留原配音与字幕，按当前句意确定画面范围")
             try:
@@ -1113,6 +1175,11 @@ def _run_task(task_id, stop, *, start_stage="auto"):
             shots, timeline = checkpoint["shots"], checkpoint["timeline"]
             assets = store.assets(selected_libraries) + load_motion_assets(directory, shots, verify=True,
                 plan_key=timeline.get("motion", {}).get("plan_key"))
+            if timeline["visual_policy"].get("producer") == "agent":
+                for asset in assets:
+                    source = timeline["visual_policy"]["sources"].get(asset["id"])
+                    if source:
+                        asset["duration"] = source["duration"]  # Actual indexed video duration, not container padding.
             validate_timeline(segments, shots, assets, policy=timeline["visual_policy"])
         render_options = dict(options)
         render_start = 80 if level == 5 else 75
@@ -1134,7 +1201,8 @@ def _run_task(task_id, stop, *, start_stage="auto"):
             state.update(bgm_music_count=music["music_count"], bgm_intervals=len(music["cues"]))
             render_start = 80
         video = render_timeline(segments, coalesce_motion_shots(shots), assets, audio_path, subtitle_path, directory, render_options, stop,
-                                progress=lambda p, message: update("合成视频", render_start + p * (99 - render_start), message))
+                                progress=lambda p, message: update("合成视频", render_start + p * (99 - render_start), message),
+                                visual_policy=timeline["visual_policy"])
         weak_count = sum(shot.weak_match for shot in shots)
         state.update(state="complete", progress=100, phase="完成", message=f"生成完成，共 {len(shots)} 个镜头，{weak_count} 个镜头需关注匹配详情。",
                      video=video, weak_matches=weak_count, model_calls=model_calls)

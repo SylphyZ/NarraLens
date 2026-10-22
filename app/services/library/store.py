@@ -99,6 +99,49 @@ def write_json(path, value, *, compact=False, create_parent=True):
 
 
 class LibraryStore:
+    @classmethod
+    def catalogue_snapshot(cls, identifiers, root=None):
+        """Read registered metadata only: no WAL changes, media probes or index preparation."""
+        root = Path(root) if root else Path(__file__).resolve().parents[3] / "storage" / "libraries"
+
+        @contextmanager
+        def readonly(path):
+            if any(p.is_symlink() or p.is_junction() for p in (path, *path.parents)):
+                raise ValueError("素材目录包含链接，拒绝读取快照。")
+            db = sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True, timeout=30)
+            db.row_factory = sqlite3.Row
+            try:
+                db.execute("BEGIN")
+                yield db
+            finally:
+                db.close()
+
+        with readonly(root / "catalog.sqlite") as db:
+            libraries = {r["id"]: dict(r) for r in db.execute("SELECT * FROM libraries")}
+        result = {"libraries": [], "assets": [], "ranges": [], "contents": []}
+        for identifier in library_ids(identifiers):
+            if identifier not in libraries:
+                raise ValueError("选中的视频素材库已不存在。")
+            with readonly(root / identifier / "library.sqlite") as db:
+                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise ValueError("外部画面任务需要内容拉片库，请先在视频素材库准备。")
+                cache = {r["key"]: json.loads(r["value"]) for r in db.execute(
+                    "SELECT key,value FROM analysis_cache WHERE key='work' OR key LIKE 'analysis-generation:%'")}
+                assets = cls._asset_rows(db)
+                by_id = {a["id"]: a for a in assets}
+                result["assets"].extend({**a, "library_id": identifier} for a in assets)
+                for table, kind in (("shot_records", "ranges"), ("content_segments", "contents")):
+                    for row in db.execute(f"SELECT * FROM {table} ORDER BY asset_id,start,id"):
+                        data, asset = json.loads(row["data"]), by_id[row["asset_id"]]
+                        stale = (kind == "ranges" and (data.get("fingerprint") != asset["fingerprint"] or
+                            data.get("subtitle_identity") != asset["subtitle_identity"] or
+                            data.get("generation", "") != cache.get("analysis-generation:" + row["id"], "")))
+                        result[kind].append({**data, "id": row["id"], "asset_id": asset["id"],
+                            "library_id": identifier, "episode": asset["episode"], "snapshot_stale": bool(stale)})
+                result["libraries"].append({"id": identifier, "name": libraries[identifier]["name"],
+                                             "work": cache.get("work", {})})
+        return result
+
     def __init__(self, root=None):
         self.root = Path(root) if root else Path(__file__).resolve().parents[3] / "storage" / "libraries"
         self.root.mkdir(parents=True, exist_ok=True)

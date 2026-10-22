@@ -47,10 +47,10 @@ def _video_matches(info, frames, fps):
                 and _duration_matches(info, frames / fps, fps))
 
 
-def render_timeline(segments, shots, assets, audio_path, subtitle_path, directory, options, stop=None, progress=None):
+def render_timeline(segments, shots, assets, audio_path, subtitle_path, directory, options, stop=None, progress=None, *, visual_policy=None):
     from app.services import generate_video
     from app.utils import ffmpeg_utils
-    validate_timeline(segments, shots, assets)
+    validate_timeline(segments, shots, assets, policy=visual_policy)
     for asset_id in {shot.asset_id for shot in shots}:
         check_cancel(stop)
         asset = next(item for item in assets if item["id"] == asset_id)

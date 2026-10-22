@@ -314,9 +314,69 @@ def coalesce_motion_shots(shots):
     return result
 
 
-def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=None):
+def validate_timeline_structure(segments, shots, assets, *, global_track=False, tolerance=.01):
+    """Shared executable track checks, independent of who made semantic decisions."""
     if not segments or not shots:
         raise ValueError("时间线为空。")
+    asset_map = {item["id"]: item for item in assets}
+    segment_map = {item.id: item for item in segments}
+    position = 0.0
+    source_ranges = {}
+    for shot in shots:
+        asset, segment = asset_map.get(shot.asset_id), segment_map.get(shot.segment_id)
+        if any(type(number) not in (int, float) or not math.isfinite(number) for number in
+               (shot.source_start, shot.source_end, shot.timeline_start, shot.timeline_end)):
+            raise ValueError("镜头时间不是有效数字。")
+        if not asset or not segment or shot.video_path != asset["path"]:
+            raise ValueError("时间线引用了无效素材。")
+        if abs(shot.timeline_start-position) > tolerance or shot.timeline_end <= shot.timeline_start:
+            raise ValueError("画面时间线存在缺口或重叠。")
+        if not 0 <= shot.source_start < shot.source_end <= asset["duration"] + tolerance:
+            raise ValueError("裁剪时间超出来源视频范围。")
+        if abs((shot.source_end-shot.source_start)-(shot.timeline_end-shot.timeline_start)) > tolerance:
+            raise ValueError("来源片段与成片片段时长不一致。")
+        is_motion = bool(re.fullmatch(r"motion-[a-f0-9]{16}", shot.asset_id))
+        if shot.timeline_start < segment.audio_start-tolerance or shot.timeline_end > segment.audio_end+tolerance:
+            owners = ([s for s in segments if round(s.audio_end*30) > round(shot.timeline_start*30)
+                       and round(s.audio_start*30) < round(shot.timeline_end*30)] if global_track else
+                      [s for s in segments if s.audio_end > shot.timeline_start and s.audio_start < shot.timeline_end])
+            if not (global_track or is_motion) or not owners or owners[0].id != shot.segment_id:
+                raise ValueError("镜头超出对应配音段落。")
+            covered = shot.timeline_start
+            for owner in owners:
+                left, right = max(covered, owner.audio_start), min(shot.timeline_end, owner.audio_end)
+                if abs(left-covered) > tolerance or right <= left:
+                    raise ValueError("连续镜头未被配音段落完整覆盖。")
+                covered = right
+            if abs(covered-shot.timeline_end) > tolerance:
+                raise ValueError("连续镜头超出配音范围。")
+        if not is_motion:
+            if (not re.fullmatch(r"[a-f0-9]{64}", shot.source_index_key) or type(shot.source_stream_index) is not int
+                    or shot.source_stream_index < 0 or not math.isfinite(shot.source_origin_seconds)):
+                raise ValueError("镜头缺少源帧索引或实际视频流，请重新寻找画面。")
+            identity = (asset.get("fingerprint") or shot.video_path, shot.source_stream_index)
+            ranges = source_ranges.setdefault(identity, [])
+            if any(min(shot.source_end,right)-max(shot.source_start,left) > .000001 for left,right in ranges):
+                raise ValueError("重复使用同一来源画面，请重新编排。")
+            ranges.append((shot.source_start,shot.source_end))
+        position = shot.timeline_end
+    if abs(position-segments[-1].audio_end) > tolerance:
+        raise ValueError("画面未完整覆盖配音。")
+
+
+def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=None):
+    if policy is not None and not isinstance(policy, dict):
+        raise ValueError("时间轴来源策略应为对象。")
+    agent = isinstance(policy, dict) and policy.get("producer", "internal") == "agent"
+    validate_timeline_structure(segments, shots, assets, global_track=agent, tolerance=1/30+1e-7 if agent else .01)
+    if agent:
+        if policy.get("version") != VISUAL_POLICY_VERSION:
+            raise ValueError("Agent画面策略版本不匹配，请重新检查并导入。")
+        from app.services.narration_agent import validate_agent_policy
+        validate_agent_policy(segments, shots, assets, policy)
+        return
+    if policy is not None and policy.get("producer", "internal") != "internal":
+        raise ValueError("未知的时间轴来源。")
     asset_map = {item["id"]: item for item in assets}
     segment_map = {item.id: item for item in segments}
     if policy is not None:
@@ -331,45 +391,14 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
         scene_boundaries = {identifier: source["boundaries"] for identifier, source in policy["sources"].items()}
     used = []
     fact_coverage = {identifier:set() for identifier in unit_map} if policy is not None else {}
-    source_ranges = {}
     motion_groups = [group for group in coalesce_motion_shots(shots) if re.fullmatch(r"motion-[a-f0-9]{16}", group.asset_id)
                      and group.timeline_end-group.timeline_start >= 4-.01] if scene_boundaries is not None else []
-    position = 0.0
     for shot in shots:
         asset = asset_map.get(shot.asset_id)
         segment = segment_map.get(shot.segment_id)
-        if any(not math.isfinite(number) for number in (shot.source_start, shot.source_end, shot.timeline_start, shot.timeline_end)):
-            raise ValueError("镜头时间不是有效数字。")
-        if not asset or not segment or shot.video_path != asset["path"]:
-            raise ValueError("时间线引用了无效素材。")
-        if abs(shot.timeline_start - position) > .01 or shot.timeline_end <= shot.timeline_start:
-            raise ValueError("画面时间线存在缺口或重叠。")
-        if not (0 <= shot.source_start < shot.source_end <= asset["duration"] + .01):
-            raise ValueError("裁剪时间超出来源视频范围。")
-        if abs((shot.source_end - shot.source_start) - (shot.timeline_end - shot.timeline_start)) > .01:
-            raise ValueError("来源片段与成片片段时长不一致。")
-        if shot.timeline_start < segment.audio_start - .01 or shot.timeline_end > segment.audio_end + .01:
-            owners = [s for s in segments if s.audio_end > shot.timeline_start and s.audio_start < shot.timeline_end]
-            if not re.fullmatch(r"motion-[a-f0-9]{16}", shot.asset_id) or not owners or owners[0].id != shot.segment_id:
-                raise ValueError("镜头超出对应配音段落。")
-            covered = shot.timeline_start
-            for owner in owners:
-                left, right = max(covered, owner.audio_start), min(shot.timeline_end, owner.audio_end)
-                if abs(left-covered) > .01 or right <= left:
-                    raise ValueError("连续动画未被配音段落完整覆盖。")
-                covered = right
-            if abs(covered-shot.timeline_end) > .01:
-                raise ValueError("连续动画超出配音范围。")
         is_motion = bool(re.fullmatch(r"motion-[a-f0-9]{16}", shot.asset_id))
         if not is_motion:
-            if (not re.fullmatch(r"[a-f0-9]{64}", shot.source_index_key) or type(shot.source_stream_index) is not int
-                    or shot.source_stream_index < 0 or not math.isfinite(shot.source_origin_seconds)):
-                raise ValueError("镜头缺少源帧索引或实际视频流，请重新寻找画面。")
             identity = asset.get("fingerprint") or shot.video_path
-            ranges = source_ranges.setdefault(identity, [])
-            if any(min(shot.source_end, right) - max(shot.source_start, left) > .000001 for left, right in ranges):
-                raise ValueError(f"段落 {shot.segment_id} 重复使用同一来源画面，请从3. 寻找画面重新编排。")
-            ranges.append((shot.source_start, shot.source_end))
             if policy is not None:
                 unit = unit_map.get(shot.visual_unit_id)
                 if not unit or unit["segment_id"] != shot.segment_id or shot.timeline_start < unit["start"]-.001 or shot.timeline_end > unit["end"]+.001:
@@ -430,9 +459,6 @@ def validate_timeline(segments, shots, assets, scene_boundaries=None, *, policy=
             if any(shot.source_start + .001 < boundary < shot.source_end - .001
                    for boundary in scene_boundaries.get(shot.asset_id, [])):
                 raise ValueError("裁剪范围跨越原片切镜边界。")
-        position = shot.timeline_end
-    if abs(position - segments[-1].audio_end) > .01:
-        raise ValueError("画面未完整覆盖配音。")
     if policy is not None:
         for identifier, unit in unit_map.items():
             # Fully animated units have no original-footage evidence obligation.

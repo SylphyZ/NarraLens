@@ -17,10 +17,11 @@ from app.services.library.media_server import video_url
 from app.services.library.store import LibraryStore, library_ids, write_json, read_json, stable_hash
 from app.services.narration_task import (
     audio_mode, create_task, delete_task, fork_task, list_tasks, read_task,
-    project_edit_status, update_project_settings, update_project_bindings,
+    project_edit_status, update_project_settings, update_project_bindings, update_visual_backend,
     RESUME_STAGES, resume_stage_status, run_task, task_deletion_info, task_directory,
 )
 from app.services.narration_alignment import LEGACY_MODE, LONG_MODE
+from app.services import narration_agent
 from app.services.narration_bgm import bgm_libraries
 from app.services.narration_motion import (
     TEMPLATES, PLACEMENTS, MIN_SECONDS, text_anchors, manual_motion_entries, inspect_manual_motion_ranges, motion_entry_from_animation,
@@ -586,7 +587,7 @@ def _seed_project_widgets(prefix, saved=None):
     st.session_state["_narration_settings_prefix"] = prefix
     seed_model_choices(prefix, models=(saved or {}).get("models"), voice=(saved or {}).get("voice"),
                        options=(saved or {}).get("options"), bindings=project_bindings(saved) if saved else None)
-    fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "visual_review_concurrency", "visual_no_gain_rounds", "subtitle_min_seconds",
+    fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "visual_backend", "visual_review_concurrency", "visual_no_gain_rounds", "subtitle_min_seconds",
               "subtitle_allow_short", "tts_block_chars", "tts_chunking", "tts_break_after", "tts_break_text_hash",
               "alignment_enabled", "alignment_language",
               "bgm_min_seconds", "bgm_crossfade", "bgm_ducking", "bgm_volume",
@@ -703,6 +704,7 @@ def _output_values(prefix):
             "font_size": int(value("font_size_custom_v2", st.session_state.get("narration_font_size_mobile_v1", 72))),
             "mask_source_subtitles": bool(value("mask", False)), "shot_seconds": int(value("shot_seconds", 7)),
             "verify_visual": bool(value("verify_visual", True)), "subtitle_single_line": True,
+            "visual_backend": value("visual_backend", "internal"),
             "visual_review_concurrency": int(value("visual_review_concurrency", 4)),
             "visual_no_gain_rounds": int(value("visual_no_gain_rounds", 2)),
             "subtitle_width_ratio": int(value("subtitle_width", 70)) / 100,
@@ -767,19 +769,115 @@ def _render_output_options(tr, prefix):
         if remembered_widget_value(prefix + "_audio_mode", LONG_MODE) == LEGACY_MODE:
             st.caption(tr("原模式细分后对应更多配音单元，可能新增TTS调用；长段模式可复用配音和字词时间。"))
         st.checkbox(tr("遮盖原画面字幕"), value=options["mask_source_subtitles"], key=prefix + "_mask")
-        st.slider(tr("目标镜头长度（秒）"), 3, 12, options["shot_seconds"], key=prefix + "_shot_seconds")
-        st.caption(tr("2.8 使用素材库已保存的镜头观察做文案匹配；有疑问的素材到视频素材库补拉片。"))
-        st.number_input(tr("画面审核并发数"), min_value=1, value=options["visual_review_concurrency"], step=1,
-                        key=prefix + "_visual_review_concurrency",
-                        help=tr("默认4，设为1使用同一流程串行审核。建议4–8；不同文案单元独立请求，每波后统一编排，不改变已付费缓存。"))
-        st.number_input(tr("单元连续无改善暂停轮数"), min_value=1, value=options["visual_no_gain_rounds"], step=1,
-                        key=prefix+"_visual_no_gain_rounds")
-        st.caption(tr("按事件检索镜头，再用高效率模型确认已保存的观察；连续无新增匹配时暂停，继续沿游标查询。"))
-        st.caption(tr("旧窗口库请先创建2.8拉片副本；旧项目可创建复用副本选择新库，保留配音和字幕。"))
-        st.caption(tr("文案与视觉模型调用不设任务总次数上限。"))
         st.caption(tr("字幕分段由文案生成设置中的高效率模型完成，结果会校验和缓存。"))
     remember_widget_values(prefix)
     return _output_values(prefix)
+
+
+@st.fragment
+def _render_visual_options(tr, prefix, task_id, saved):
+    remember_widget_values(prefix)
+    with remembered_expander(tr("画面匹配设置"), key=prefix + "_visual_open") as panel:
+        if not panel.open:
+            return
+        options = _output_values(prefix)
+        backend = st.selectbox(tr("画面匹配方式"), ("internal", "agent"),
+            index=("internal", "agent").index(options["visual_backend"]), key=prefix + "_visual_backend",
+            format_func=lambda value: tr("内置API" if value == "internal" else "外部Agent（整篇画面）"))
+        st.slider(tr("目标镜头长度（秒）"), 3, 12, options["shot_seconds"], key=prefix + "_shot_seconds")
+        if backend == "internal":
+            st.number_input(tr("画面审核并发数"), min_value=1, value=options["visual_review_concurrency"], step=1,
+                            key=prefix + "_visual_review_concurrency")
+            st.number_input(tr("单元连续无改善暂停轮数"), min_value=1, value=options["visual_no_gain_rounds"], step=1,
+                            key=prefix + "_visual_no_gain_rounds")
+            st.caption(tr("沿用内置事件检索与审核，有缺口时保存游标和有效缓存。"))
+        else:
+            st.caption(tr("允许主题关联与氛围配图。外部Agent负责整篇理解、检索、看图、选镜头和编排；本地检查来源、时长、去重和已登记禁用范围。"))
+            st.caption(tr("创建任务只整理已有资料。只有Agent显式取图才运行媒体处理，应用不会自动启动外部客户端或调用画面匹配API。"))
+        busy = _project_busy(task_id, saved)
+        current = read_json(task_directory(task_id) / "settings.json")
+        saved_backend = narration_agent.visual_backend(current["options"])
+        if backend != saved_backend:
+            st.info(tr("画面匹配方式尚未保存。已开始项目可单独切换执行方式，保留原文、配音、字幕和旧成片。"))
+        if st.button(tr("保存画面匹配方式"), key=prefix + "_save_visual_backend", disabled=busy or backend == saved_backend):
+            try:
+                update_visual_backend(task_id, backend)
+                st.session_state["narration_project_notice"] = tr("画面匹配方式已保存。")
+                remember_widget_values(prefix)
+                st.rerun()
+            except (OSError, ValueError) as exc:
+                st.error(str(exc))
+        if backend != "agent":
+            remember_widget_values(prefix)
+            return
+        st.caption(tr("先完成配音、字幕和已启用的动画；缺少前序成果时使用通用继续，或3. 从寻找画面继续。"))
+        if st.button(tr("创建／复用整篇画面任务"), key=prefix + "_create_agent_visual", disabled=busy or saved_backend != "agent"):
+            try:
+                task = narration_agent.create_task(task_id)
+                st.session_state[prefix + "_agent_pending"] = task["task_id"]
+                st.rerun(scope="fragment")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                st.error(str(exc))
+        try:
+            tasks = narration_agent.list_tasks(task_id)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            st.error(tr("读取画面任务失败：") + str(exc))
+            return
+        if not tasks:
+            st.caption(tr("尚无外部画面任务。"))
+            remember_widget_values(prefix)
+            return
+        task_key = prefix + "_agent_task"
+        pending = st.session_state.pop(prefix + "_agent_pending", None)
+        if pending:
+            st.session_state[task_key] = pending
+        by_id = {task["task_id"]: task for task in tasks}
+        if st.session_state.get(task_key) not in by_id:
+            st.session_state.pop(task_key, None)
+        selected = st.selectbox(tr("整篇画面任务"), list(by_id), key=task_key,
+            format_func=lambda value: value[:8] + f" · r{by_id[value]['head']['revision']}")
+        task, head = by_id[selected], by_id[selected]["head"]
+        root = Path(task["directory"])
+        st.code(str(root), language=None)
+        required_frames = sum(b-a for a,b in task["original_intervals"])
+        st.caption(tr("本地已保存进度：") + f"r{head['revision']} · {head['clips']} " + tr("镜头") +
+            f" · {head['covered_frames']/30:.1f}/{required_frames/30:.1f}s · " + tr("完成版" if head["complete"] else "草稿"))
+        st.caption(tr("这里只显示已落盘结果；不能据此判断外部Agent是否仍在运行。"))
+        st.code("请读取以下TASK.md，按其中本地CLI完成整篇画面匹配；允许关联及氛围配图。可先理解全文，再用子Agent分章节工作，最后由主Agent汇总全片。\n" + str(root / "TASK.md"), language=None)
+        st.download_button(tr("下载Agent任务说明"), (root / "TASK.md").read_text(encoding="utf-8"),
+                           file_name="TASK.md", key=prefix + "_download_agent_task_" + selected)
+        workers = st.number_input(tr("章节分工数"), min_value=1, max_value=64, value=4, step=1, key=prefix + "_agent_workers")
+        if st.button(tr("生成章节分工"), key=prefix + "_agent_worksets", disabled=busy or bool(head["revision"])):
+            try:
+                groups = narration_agent.worksets(task_id, selected, int(workers))
+                st.success(tr("分工清单已保存：") + str(root / "worksets.json") + f" · {len(groups)}")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                st.error(str(exc))
+        check_col, import_col = st.columns(2)
+        check = check_col.button(tr("检查完整方案"), key=prefix + "_agent_check", disabled=busy or not head["revision"])
+        commit = import_col.button(tr("检查并导入完成版"), key=prefix + "_agent_import", disabled=busy or not head["complete"] or saved_backend != "agent")
+        if check or commit:
+            try:
+                report = narration_agent.check_task(task_id, selected, commit=commit)
+                if commit:
+                    st.session_state["narration_project_notice"] = tr("完整画面方案已导入，从第4/5阶段继续。")
+                    st.rerun()
+                st.success(tr("完整结构检查通过；匹配等级统计：") + str(report["levels"]))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                st.error(tr("结构检查未通过：") + str(exc))
+        with remembered_expander(tr("已保存镜头与编辑说明"), key=prefix + "_agent_clips_open") as details:
+            if details.open:
+                value = narration_agent.occupancy(task_id, selected)
+                rows = value["clips"]
+                pages = max(1, (len(rows)+49)//50)
+                page_key = prefix + "_agent_clips_page_" + selected
+                if page_key in st.session_state:
+                    st.session_state[page_key] = max(1, min(pages, int(st.session_state[page_key])))
+                page = st.number_input(tr("镜头列表页码"), min_value=1, max_value=pages, step=1, key=page_key)
+                st.dataframe([{ "镜头": c["clip_id"], "起点秒": c["target_start_frame"]/30,
+                    "时长秒": (c["target_end_frame"]-c["target_start_frame"])/30,
+                    "匹配": c["match_level"], "理由": c["reason"]} for c in rows[(page-1)*50:page*50]], width="stretch")
+    remember_widget_values(prefix)
 
 
 def _render_project_libraries(tr, prefix):
@@ -812,6 +910,7 @@ def _render_project_options(tr, text, prefix, task_id, saved):
     render_narration_bgm(tr, key_prefix=prefix)
     _render_models(tr, prefix, task_id, saved)
     _render_output_options(tr, prefix)
+    _render_visual_options(tr, prefix, task_id, saved)
     _render_motion_options(tr, text, prefix)
     remember_widget_values(prefix)
 
@@ -1073,12 +1172,12 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
         start = start_col.button(tr("开始生成"), type="primary", disabled=busy or not has_scenes, key="resume_narration_" + task_id)
         if save or start:
             try:
-                required = {"text", "text_fast", *(["vision"] if options["verify_visual"] else [])} if start else set()
+                required = {"text", "text_fast", *(["vision"] if narration_agent.visual_backend(options) == "internal" else [])} if start else set()
                 selected_models = models
                 if start:
                     check_model_choices(prefix, ["tts", *required,
                         *(["alignment"] if options.get("alignment_enabled", False) and audio_mode(options) == LONG_MODE else []),
-                        "text_backup", "vision_backup"])
+                        "text_backup", *(["vision_backup"] if "vision" in required else [])])
                     validate_voice(voice_profile)
                     if options["subtitles"] and not Path(options["font"]).is_file():
                         raise ValueError(tr("请选择有效字幕字体文件。"))

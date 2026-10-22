@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.9.5**
+**Manuscript-driven video production · v2.10.0**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.9.5 provides seven workspaces:
+Version 2.10.0 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,22 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.0: external-agent editing for the whole manuscript
+
+The collapsible **Visual matching settings** panel in the Production Workspace selects the internal API workflow or **External agent (whole manuscript)**. Existing projects retain the internal default. The external editor owns visual sectioning, library searches, image inspection, clip selection, source-frame ranges, ordering and pacing. NarraLens checks executability and uses the existing renderer.
+
+1. Save the external-agent mode. Reuse completed narration and subtitles; prepare enabled animations as fixed reservations. Use general resume or stage 3 when prerequisites are missing.
+2. Create or reuse the complete visual task and give its TASK.md instructions to an agent with local file, image and command access.
+3. The CLI is `python -m app.services.narration_agent --project PROJECT_ID --task TASK_ID`. Read the manuscript once with `describe --full`, then use compact status and paginated searches.
+4. Optional chapter worksets support child agents coordinated by the external client. The application does not launch clients. Drafts have revision checks and idempotent receipts; the coordinator submits a complete timeline.
+5. Check and import the complete proposal in the WebUI, then continue from stage 4 for music or stage 5 for rendering.
+
+Exact, related and atmosphere footage are accepted editing choices. Related footage does not become a gap merely because it cannot prove every old fact. No extra internal API semantic review is added. The agent must inspect images and avoid misleading selections. Manuscript, narration, subtitles and fixed animation reservations remain bound to the task.
+
+Tasks live inside `storage/narration_tasks/PROJECT_ID/agent_visual/TASK_ID/`. Original media remains a registered path reference. Creating a task runs no FFmpeg or model; image requests reuse existing evidence where possible. Validation uses actual presentation-frame ordinals and PTS, a fixed 30 fps output clock, full narration coverage, original-speed duration, no reused source frames or natural shots, and registered opening/credits/black exclusions. Unmarked credits and semantic similarity still require agent judgment.
+
+One focused project-task module reuses VisualShot and the existing renderer, without new dependencies, an MCP server or changes to the library-analysis agent protocol. Imports retain the old timeline and video. Project copies need their own bound agent task. Static checks were performed; no real agent run, model request, browser interaction or complete video acceptance was performed automatically.
 
 ## Version 2.9.5
 
