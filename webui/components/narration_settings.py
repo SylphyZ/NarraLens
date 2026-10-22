@@ -16,8 +16,8 @@ from app.services.library.gateway import ModelGateway
 from app.services.library.media_server import video_url
 from app.services.library.store import LibraryStore, library_ids, write_json, read_json, stable_hash
 from app.services.narration_task import (
-    audio_mode, create_task, delete_task, fork_task, list_tasks, read_task, restore_voice, restore_models,
-    project_edit_status, update_project_settings,
+    audio_mode, create_task, delete_task, fork_task, list_tasks, read_task,
+    project_edit_status, update_project_settings, update_project_bindings,
     RESUME_STAGES, resume_stage_status, run_task, task_deletion_info, task_directory,
 )
 from app.services.narration_alignment import LEGACY_MODE, LONG_MODE
@@ -33,13 +33,13 @@ from webui.components.narration_audio_settings import (
 from webui.components.audio_library_settings import render_bgm_plan, render_narration_bgm, bgm_values
 from webui.utils.file_utils import remembered_widget_value, remembered_expander, remember_widget_values
 from webui.components.model_settings import seed_model_choices, selected_models as workspace_models, render_model_choices, selected_bindings, check_model_choices
-from app.services.model_profiles import resolve_models
+from app.services.model_profiles import resolve_models, project_bindings, production_voice, public_values
 
 
-def _start_task(task_id, models, voice, use_current_models=False, *, start_stage="auto"):
+def _start_task(task_id, *, start_stage="auto"):
     def work(stop):
         try:
-            run_task(task_id, models, voice, stop, use_current_models, start_stage=start_stage)
+            run_task(task_id, stop, start_stage=start_stage)
         except Exception as exc:
             state = read_task(task_id) or {"id": task_id}
             state.update(state="failed", message=str(exc))
@@ -584,10 +584,11 @@ def remember_project_widgets():
 def _seed_project_widgets(prefix, saved=None):
     memory = st.session_state.setdefault("narration_widget_memory", {})
     st.session_state["_narration_settings_prefix"] = prefix
-    seed_model_choices(prefix, models=(saved or {}).get("models"), voice=(saved or {}).get("voice"), options=(saved or {}).get("options"))
+    seed_model_choices(prefix, models=(saved or {}).get("models"), voice=(saved or {}).get("voice"),
+                       options=(saved or {}).get("options"), bindings=project_bindings(saved) if saved else None)
     fields = ("aspect", "subtitles", "font", "shot_seconds", "verify_visual", "visual_review_concurrency", "visual_no_gain_rounds", "subtitle_min_seconds",
               "subtitle_allow_short", "tts_block_chars", "tts_chunking", "tts_break_after", "tts_break_text_hash",
-              "alignment_enabled", "alignment_python", "alignment_model", "alignment_language",
+              "alignment_enabled", "alignment_language",
               "bgm_min_seconds", "bgm_crossfade", "bgm_ducking", "bgm_volume",
               "motion_enabled", "motion_frequency", "motion_templates", "motion_accent", "motion_concurrency",
               "motion_placement", "motion_manual_text_hash", "motion_manual_entries")
@@ -597,7 +598,7 @@ def _seed_project_widgets(prefix, saved=None):
     values = {}
     if saved:
         options, voice = saved["options"], saved["voice"]
-        memory.setdefault(prefix + "_saved_tts_profile", saved.get("models", {}).get("_bindings", {}).get("tts")
+        memory.setdefault(prefix + "_saved_tts_profile", project_bindings(saved).get("tts")
                           or voice.get("profile_id") or remembered_widget_value(prefix + "_profile_tts", ""))
         values.update({field: options[field] for field in fields if field in options})
         values.update({name: options[field] for field, name in aliases.items() if field in options})
@@ -605,10 +606,6 @@ def _seed_project_widgets(prefix, saved=None):
                       font_size_custom_v2=options.get("font_size", 40),
                       subtitle_width=round(options.get("subtitle_width_ratio", .9) * 100),
                       bgm_source=options.get("bgm_mode", "path" if options.get("bgm_path") else "none"))
-        voice_fields = {"engine": "tts_engine", "base_url": "mimo_base", "model": "mimo_model",
-                        "rate": "edge_rate", "reference_audio": "reference_path", "instruction": "voice_instruction",
-                        "voice": "edge_voice" if voice.get("engine") == "edge_tts" else "mimo_voice"}
-        values.update({name: voice[field] for field, name in voice_fields.items() if field in voice})
         memory.setdefault(prefix + "_library_choice_multi", library_ids(saved))
     for name, value in values.items():
         memory.setdefault(prefix + "_" + name, deepcopy(value))
@@ -718,12 +715,26 @@ def _render_models(tr, prefix, task_id, saved):
     with remembered_expander(tr("模型选择"), key=prefix + "_models_open") as panel:
         if panel.open:
             render_model_choices(tr, prefix)
-            models = saved.get("models", {})
-            st.caption(tr("项目保存模型：") + " · ".join(
-                f"{label}: {models.get(kind, {}).get('model', '未保存')}" for kind, label in (("text", "文案"), ("vision", "视觉"))))
-            st.checkbox(tr("本次继续或创建副本使用所选模型"),
-                value=remembered_widget_value("resume_current_models_" + task_id, False), key="resume_current_models_" + task_id,
-                help=tr("勾选采用本项目选择区的模型、思考等级和后备配置；取消沿用保存快照。接口凭据在模型配置工作区维护。"))
+            st.caption(tr("每次开始或继续都读取中央当前定义；执行期间固定本轮配置。修改下拉后请保存模型绑定。"))
+            st.caption(tr("此按钮同时保存上方TTS服务与本地对齐选择，仅更新引用，不修改已锁定的音色、字幕和输出参数。"))
+            if st.button(tr("保存本项目模型绑定"), key=prefix + "_save_model_bindings", disabled=_project_busy(task_id, saved)):
+                try:
+                    update_project_bindings(task_id, selected_bindings(prefix))
+                    st.session_state["narration_project_notice"] = tr("模型绑定已保存，下次执行使用中央当前配置。")
+                    remember_widget_values(prefix)
+                    st.rerun()
+                except (OSError, ValueError) as exc:
+                    st.error(str(exc))
+            with remembered_expander(tr("历史模型执行记录"), key=prefix + "_model_history_open") as history_panel:
+                if history_panel.open:
+                    directory = task_directory(task_id)
+                    runs = sorted((directory / "model-runs").glob("*.json"))
+                    if runs:
+                        st.json(public_values(read_json(runs[-1])))
+                    else:
+                        old = read_json(directory / "model-history.json", default={}).get("settings", saved)
+                        st.json(public_values({"models": old.get("models", {}), "voice": old.get("voice", {})}))
+                    st.caption(tr("记录仅用于追溯，不参与下一轮接口选择。"))
     remember_widget_values(prefix)
 
 
@@ -808,7 +819,8 @@ def _render_project_options(tr, text, prefix, task_id, saved):
 def _initial_project_settings(text, inherited=None):
     """Creation uses explicit defaults or a named source project's public snapshot."""
     if inherited:
-        return deepcopy(inherited)
+        return {**deepcopy(inherited), "models": {"_bindings": project_bindings(inherited)},
+                "voice": production_voice(inherited["voice"])}
     return {"options": {
                 "aspect": "landscape", "subtitles": True, "font": _default_font(), "font_size": 72,
                 "mask_source_subtitles": False, "shot_seconds": 7, "verify_visual": True,
@@ -893,7 +905,6 @@ def render_project_create(tr):
         try:
             task_id = create_task(selected_libraries, text, initial["options"], initial["voice"], source=source,
                                   model_profile=initial.get("models"), draft=True)
-            st.session_state.setdefault("narration_widget_memory", {})["resume_current_models_" + task_id] = not bool(inherited)
             _navigate("narration_progress", task_id)
         except (OSError, ValueError) as exc:
             st.error(str(exc))
@@ -948,7 +959,6 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
     prefix = "narration_edit_" + task_id
     remember_widget_values(prefix)
     task_busy = _project_busy(task_id, saved_settings)
-    use_current_models = bool(remembered_widget_value("resume_current_models_" + task_id, False))
     settings_key = prefix + "_settings_open"
     with remembered_expander(tr("复用副本"), key=settings_key) as panel:
         if not panel.open:
@@ -966,14 +976,13 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
             st.caption(tr("仅更新字幕样式会沿用原任务视频素材库、音色、分块、配音方式和输出比例；长段模式可复用音轨及字词时间。"))
             if st.button(tr("仅更新字幕样式，创建副本合成"), disabled=task_busy or bool(missing_libraries or missing_music), key="style_fork_narration_" + task_id):
                 try:
-                    recorded_voice = restore_voice(saved_settings["voice"], voice_profile, profile_id=saved_settings.get("models", {}).get("_bindings", {}).get("tts"))
-                    validate_voice(recorded_voice)
+                    recorded_voice = production_voice(saved_settings["voice"])
                     style_options = {**saved_settings["options"], "font": options["font"], "font_size": options["font_size"],
                                      "subtitle_single_line": True, "subtitle_width_ratio": options["subtitle_width_ratio"],
                                      "subtitle_min_seconds": options["subtitle_min_seconds"], "subtitle_allow_short": options["subtitle_allow_short"]}
-                    child_id = fork_task(task_id, style_options, recorded_voice, models, use_current_models)
+                    child_id = fork_task(task_id, style_options, recorded_voice, models)
                     st.session_state["active_narration_task"] = child_id
-                    _start_task(child_id, models, recorded_voice)
+                    _start_task(child_id)
                     _navigate("narration_progress", child_id)
                 except ValueError as exc:
                     st.error(str(exc))
@@ -991,37 +1000,35 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
                         valid_ids = {row["id"] for row in plan.get("animations", [])}
                         animation_options["motion_disabled_ids"] = [identifier for identifier in disabled_ids if identifier in valid_ids]
                     manual_motion_entries(text, animation_options, complete=True)
-                    child_id = fork_task(task_id, animation_options, dict(saved_settings["voice"]), models,
-                                         use_current_models, reuse_audio=True)
+                    child_id = fork_task(task_id, animation_options, production_voice(saved_settings["voice"]), models, reuse_audio=True)
                     st.session_state["active_narration_task"] = child_id
-                    _start_task(child_id, models, dict(saved_settings["voice"]), use_current_models, start_stage="visual")
+                    _start_task(child_id, start_stage="visual")
                     _navigate("narration_progress", child_id)
                 except (OSError, ValueError) as exc:
                     st.error(str(exc))
             st.caption(tr("使用该历史任务原文、上方多选的视频素材库和输出设置创建新任务；有效的规划、配音及对齐缓存会复用。"))
             if st.button(tr("仅更新 BGM，复用配音并创建副本"), disabled=task_busy or music_busy or bool(missing_libraries), key="bgm_fork_narration_" + task_id):
                 try:
-                    recorded_voice = restore_voice(saved_settings["voice"], voice_profile, profile_id=saved_settings.get("models", {}).get("_bindings", {}).get("tts"))
-                    validate_voice(recorded_voice)
+                    recorded_voice = production_voice(saved_settings["voice"])
                     bgm_fork_options = {key: value for key, value in saved_settings["options"].items() if not key.startswith("bgm_")}
                     bgm_fork_options.update(music_options)
-                    child_id = fork_task(task_id, bgm_fork_options, recorded_voice, models, use_current_models)
+                    child_id = fork_task(task_id, bgm_fork_options, recorded_voice, models)
                     st.session_state["active_narration_task"] = child_id
-                    _start_task(child_id, models, recorded_voice)
+                    _start_task(child_id)
                     _navigate("narration_progress", child_id)
                 except ValueError as exc:
                     st.error(str(exc))
             st.caption(tr("更换视频素材库会重新匹配画面，原任务及成片保留；原视频素材库的分析无需重做。"))
             keep_audio = st.checkbox(tr("沿用历史任务配音设置"), value=remembered_widget_value("fork_keep_audio_" + task_id, True), key="fork_keep_audio_" + task_id,
                 help=tr("沿用原音色、配音方式、分块和对齐设置，减少重新配音；取消后使用上方当前配音配置。"))
-            st.caption(tr("模型配置由“模型选择”中的“本次继续或创建副本使用所选模型”决定。"))
+            st.caption(tr("副本使用当前角色选择；沿用历史配音设置只保留声音制作参数，接口仍读取中央配置。"))
             st.caption(tr("配音文字、音色、分块或原模式字幕单元改变时，需要的新音频会产生配音调用。"))
             if st.button(tr("创建复用副本并生成"), disabled=task_busy or busy or not has_scenes, key="fork_narration_" + task_id):
                 try:
-                    fork_voice = restore_voice(saved_settings["voice"], voice_profile, profile_id=saved_settings.get("models", {}).get("_bindings", {}).get("tts")) if keep_audio else voice_profile
+                    fork_voice = production_voice(saved_settings["voice"]) if keep_audio else voice_profile
                     if not keep_audio:
                         check_model_choices(prefix, ["tts"])
-                    validate_voice(fork_voice)
+                        validate_voice(fork_voice)
                     fork_options = dict(options)
                     if keep_audio:
                         for key in ("tts_block_chars", "tts_chunking", "tts_break_after", "tts_break_text_hash",
@@ -1032,9 +1039,9 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
                                 fork_options.pop(key, None)
                         fork_options["audio_mode"] = audio_mode(saved_settings["options"])
                     manual_motion_entries(text, fork_options, complete=True)
-                    child_id = fork_task(task_id, fork_options, fork_voice, models, use_current_models, selected_libraries=selected_libraries)
+                    child_id = fork_task(task_id, fork_options, fork_voice, models, selected_libraries=selected_libraries)
                     st.session_state["active_narration_task"] = child_id
-                    _start_task(child_id, models, fork_voice)
+                    _start_task(child_id)
                     _navigate("narration_progress", child_id)
                 except ValueError as exc:
                     st.error(str(exc))
@@ -1056,7 +1063,6 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
             text = source.read()
         options, voice_profile = _project_values(text, prefix, saved_settings)
         models = workspace_models(prefix)
-        use_current = bool(remembered_widget_value("resume_current_models_" + task_id, False))
         busy = (not edit_status["editable"] or runner.library_busy(selected_libraries)
                 or runner.library_busy(bgm_libraries(options), prefix="audio-library:"))
         has_scenes = bool(selected_libraries and _library_counts(tuple(selected_libraries))[3])
@@ -1068,18 +1074,11 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
         if save or start:
             try:
                 required = {"text", "text_fast", *(["vision"] if options["verify_visual"] else [])} if start else set()
-                selected_models = models if use_current or not saved_settings.get("models") else restore_models(
-                    saved_settings["models"], models, required_kinds=required)
-                selected_models = deepcopy(selected_models)
-                bindings = dict(selected_models.get("_bindings", {}))
-                current_bindings = selected_bindings(prefix)
-                for role in ("tts", "alignment"):
-                    bindings[role] = current_bindings.get(role, "")
-                selected_models["_bindings"] = bindings
+                selected_models = models
                 if start:
-                    check_model_choices(prefix, ["tts", *(required if use_current else []),
-                        *(["alignment"] if options.get("alignment_enabled", False) else []),
-                        *(["text_backup", "vision_backup"] if use_current else [])])
+                    check_model_choices(prefix, ["tts", *required,
+                        *(["alignment"] if options.get("alignment_enabled", False) and audio_mode(options) == LONG_MODE else []),
+                        "text_backup", "vision_backup"])
                     validate_voice(voice_profile)
                     if options["subtitles"] and not Path(options["font"]).is_file():
                         raise ValueError(tr("请选择有效字幕字体文件。"))
@@ -1088,7 +1087,7 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
                         gateway.require(kind)
                 update_project_settings(task_id, selected_libraries, options, voice_profile, selected_models, for_start=start)
                 if start:
-                    _start_task(task_id, selected_models, voice_profile)
+                    _start_task(task_id)
                 else:
                     st.session_state["narration_project_notice"] = tr("项目设置已保存。")
                 remember_widget_values(prefix)
@@ -1098,12 +1097,6 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
         return
     task_libraries = library_ids(saved_settings)
     task_busy = _project_busy(task_id, saved_settings)
-    voice_profile = voice_values("narration_edit_" + task_id)
-    try:
-        models = workspace_models(prefix)
-    except ValueError:
-        models = {"proxy": dict(config.proxy)}
-    use_current_models = bool(remembered_widget_value("resume_current_models_" + task_id, False))
     if not task_busy:
         st.caption(tr("推进使用项目保存的视频素材库、原文、音色和输出设置。"))
         original_has_scenes = not missing_libraries and bool(_library_counts(tuple(task_libraries))[3])
@@ -1111,12 +1104,7 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
             st.caption(tr("项目素材库尚无可用分析场景；请先在视频素材库完成分析。已有完整时间轴可使用第5步仅合成。"))
         def continue_from(stage="auto"):
             try:
-                if stage in {"auto", "tts"}:
-                    restored_voice = restore_voice(saved_settings["voice"], voice_profile, profile_id=saved_settings.get("models", {}).get("_bindings", {}).get("tts"))
-                    validate_voice(restored_voice)
-                else:
-                    restored_voice = dict(saved_settings["voice"])
-                _start_task(task_id, models, restored_voice, use_current_models, start_stage=stage)
+                _start_task(task_id, start_stage=stage)
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))

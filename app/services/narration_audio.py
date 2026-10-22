@@ -115,7 +115,7 @@ def _join_audio(paths, output, stop=None, *, gap_seconds=0):
     temporary.replace(output)
 
 
-def _cache_profile(profile):
+def _legacy_cache_profile(profile):
     result = public_profile(profile)
     reference = profile.get("reference_audio")
     if reference and Path(reference).is_file():
@@ -130,6 +130,114 @@ def _cache_profile(profile):
                     references[key] = hashlib.sha256(Path(value).read_bytes()).hexdigest()
         result["reference_hashes"] = references
     return result
+
+
+def _cache_profile(profile):
+    """Sound identity, independent of account, routing and registry wrappers."""
+    engine = profile.get("engine", "mimo_tts")
+    if engine == "mimo_tts":
+        model = profile.get("model", "mimo-v2.5-tts")
+        result = {"engine": engine, "model": model, "instruction": str(profile.get("instruction", "")).strip()}
+        if model == "mimo-v2.5-tts":
+            result["voice"] = profile.get("voice", "冰糖")
+        if model == "mimo-v2.5-tts-voiceclone":
+            result["reference_audio"] = profile.get("reference_audio", "")
+    elif engine == "edge_tts":
+        result = {"engine": engine, "voice": profile.get("voice", "zh-CN-XiaoxiaoNeural"),
+                  "rate_percent": round((float(profile.get("rate", 1.0)) - 1) * 100)}
+    else:
+        transport = {"base", "base_url", "api_url", "endpoint", "proxy", "timeout", "connect_timeout", "read_timeout",
+                     "max_retries", "retries", "request_max_chars", "request_max_bytes"}
+        settings = {name: value for name, value in public_values(profile.get("settings", {})).items() if name not in transport}
+        result = {"engine": engine, "model": profile.get("model", engine), "voice": profile.get("voice", ""),
+                  "rate": float(profile.get("rate", 1.0)), "pitch": float(profile.get("pitch", 0.0)),
+                  "settings": settings, "request_limits": list(tts_request_limits(profile))}
+    def references(values):
+        for name, value in list(values.items()):
+            if isinstance(value, dict):
+                references(value)
+            elif name in {"voice", "reference_audio", "emotion_audio", "prompt_audio", "ref_audio"} and isinstance(value, str) and value:
+                path = value.removeprefix(engine + ":")
+                try:
+                    exists = Path(path).is_file()
+                except OSError:
+                    exists = False
+                if exists:
+                    values[name] = {"sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+                elif name != "voice":
+                    raise ValueError("配音参考音频不可读取，无法证明缓存声音一致；请选择有效参考音频。")
+    references(result)
+    return result
+
+
+def _valid_audio(path):
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        samples = _samples(path)
+        with wave.open(str(path), "rb") as audio:
+            audio.setpos(samples - 1)
+            return len(audio.readframes(1)) == 2
+    except (OSError, ValueError, EOFError, wave.Error):
+        return False
+
+
+def _prepare_audio_cache(directory, profile, legacy_profiles, namespace, first_text):
+    identity = _cache_profile(profile)
+    audio_dir = directory / "audio"
+    previous = read_json(directory / "audio_plan.json", default={}).get("voice_identity")
+    if any(_valid_audio(path) for path in audio_dir.glob("*.wav")):
+        if previous is None:
+            # An unfinished old task has no final manifest: prove its first deterministic key.
+            for old in legacy_profiles:
+                key = stable_hash((namespace, first_text, _legacy_cache_profile(old), None))
+                candidates = [audio_dir / (key + ".wav")]
+                if old.get("schema") == 1:
+                    parts = tts_request_parts(first_text, old)
+                    if len(parts) > 1:
+                        candidates.append(audio_dir / (stable_hash(("service-request-v1", key, 0, parts[0])) + ".wav"))
+                if any(_valid_audio(path) for path in candidates):
+                    previous = _cache_profile(old)
+                    break
+        if previous != identity:
+            raise ValueError("当前配音服务或声音参数与已有音频不一致，已停止以避免混接。请在“复用副本”取消“沿用历史任务配音设置”，"
+                             "使用当前配音配置统一重新配音；原音频和成片保留。仅修改接口、密钥不需要重新配音。")
+    return identity
+
+
+def _reuse_audio_file(source, target):
+    if target.exists() or source.parent.is_symlink() or source.parent.is_junction() or not _valid_audio(source):
+        return
+    try:
+        os.link(source, target)
+    except OSError:
+        temporary = target.with_suffix(".reuse.tmp.wav")
+        shutil.copy2(source, temporary)
+        temporary.replace(target)
+
+
+def _audio_output(audio_dir, namespace, text, profile, identity, design_hash, legacy_profiles, cache_source):
+    key = stable_hash((namespace, text, identity, design_hash))
+    output = audio_dir / (key + ".wav")
+    roots = [audio_dir, *([Path(cache_source)] if cache_source else [])]
+    for old in legacy_profiles:
+        try:
+            compatible = _cache_profile(old) == identity
+        except ValueError:
+            compatible = False
+        if not compatible:
+            continue
+        old_key = stable_hash((namespace, text, _legacy_cache_profile(old), design_hash))
+        for root in roots:
+            _reuse_audio_file(root / (old_key + ".wav"), output)
+            if not output.exists() and profile.get("schema") == 1:
+                parts = tts_request_parts(text, profile)
+                if len(parts) > 1:
+                    for index, part in enumerate(parts):
+                        old_part = stable_hash(("service-request-v1", old_key, index, part))
+                        new_part = stable_hash(("service-request-v1", key, index, part))
+                        _reuse_audio_file(root / (old_part + ".wav"), audio_dir / (new_part + ".wav"))
+    return key, output
 
 
 def _request_raw(text, profile, raw, design_seed=None):
@@ -248,15 +356,16 @@ def _obtain_audio(text, profile, output, seed, trim, budget_check, stop, directo
     return _samples(output)
 
 
-def synthesize_narration(segments, profile, directory, stop=None, progress=None, tts_budget=DEFAULT_CALL_BUDGET, *, subtitle_units, cache_source=None):
-    """Original mode, including its existing cache keys and edge trimming."""
+def synthesize_narration(segments, profile, directory, stop=None, progress=None, tts_budget=DEFAULT_CALL_BUDGET, *, subtitle_units, cache_source=None, legacy_profiles=()):
+    """Original cue mode, with semantic keys and deterministic old-cache adoption."""
     directory = Path(directory)
     audio_dir = directory / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
-    cache_profile = _cache_profile(profile)
     units = [(segment, index, text) for segment in segments for index, text in enumerate(subtitle_units[segment.id])]
     if not units:
         raise ValueError("文案未生成有效配音单元。")
+    cache_profile = _prepare_audio_cache(directory, profile, legacy_profiles, "narration-cue-audio-v2", units[0][2])
+    write_json(directory / "audio_plan.json", {"version": 2, "mode": "cues", "voice_identity": cache_profile})
     calls, elapsed_samples = 0, 0
     cues, paths_by_segment, keys_by_segment = [], {}, {}
     design_seed = design_hash = None
@@ -270,8 +379,7 @@ def synthesize_narration(segments, profile, directory, stop=None, progress=None,
         check_cancel(stop)
         if progress:
             progress(unit_index / len(units), f"生成配音单元{unit_index+1}/{len(units)}，本次调用{calls}/{tts_budget}次")
-        key = stable_hash(("narration-cue-audio-v2", text, cache_profile, design_hash))
-        output = audio_dir / (key + ".wav")
+        key, output = _audio_output(audio_dir, "narration-cue-audio-v2", text, profile, cache_profile, design_hash, legacy_profiles, cache_source)
         samples = _obtain_audio(text, profile, output, design_seed, True, budget_check, stop, directory,
                                 f"audio-{unit_index+1:05d}", f"配音单元{segment.id}/{cue_index+1}", cache_source)
         if profile.get("engine", "mimo_tts") == "mimo_tts" and profile.get("model") == "mimo-v2.5-tts-voicedesign" and unit_index == 0:
@@ -376,13 +484,13 @@ def plan_audio_blocks(segments, manuscript, target_chars=800, *, break_after=Non
 
 
 def synthesize_long_narration(segments, manuscript, profile, directory, stop=None, progress=None,
-                              tts_budget=DEFAULT_CALL_BUDGET, target_chars=800, cache_source=None, break_after=None):
+                              tts_budget=DEFAULT_CALL_BUDGET, target_chars=800, cache_source=None, break_after=None, legacy_profiles=()):
     directory = Path(directory)
     audio_dir = directory / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     blocks = plan_audio_blocks(segments, manuscript, target_chars, break_after=break_after)
-    cache_profile = _cache_profile(profile)
-    write_json(directory / "audio_plan.json", {"version": 1, "target_chars": target_chars,
+    cache_profile = _prepare_audio_cache(directory, profile, legacy_profiles, "narration-block-audio-v3", blocks[0]["text"])
+    write_json(directory / "audio_plan.json", {"version": 2, "voice_identity": cache_profile, "target_chars": target_chars,
                "chunking": "manual" if break_after is not None else "auto", "blocks": blocks})
     calls, elapsed_samples = 0, 0
     design_seed = design_hash = None
@@ -397,8 +505,7 @@ def synthesize_long_narration(segments, manuscript, profile, directory, stop=Non
         check_cancel(stop)
         if progress:
             progress(index / len(blocks), f"生成长配音块{index+1}/{len(blocks)}，本次调用{calls}/{tts_budget}次")
-        key = stable_hash(("narration-block-audio-v3", block["text"], cache_profile, design_hash))
-        output = audio_dir / (key + ".wav")
+        key, output = _audio_output(audio_dir, "narration-block-audio-v3", block["text"], profile, cache_profile, design_hash, legacy_profiles, cache_source)
         samples = _obtain_audio(block["text"], profile, output, design_seed, False, budget_check, stop, directory,
                                 "long-audio-" + block["id"], "长配音块" + block["id"], cache_source)
         if profile.get("engine", "mimo_tts") == "mimo_tts" and profile.get("model") == "mimo-v2.5-tts-voicedesign" and index == 0:

@@ -33,32 +33,12 @@ def _parameter_summary(summary, tr):
 def seed_model_choices(prefix, *, models=None, voice=None, options=None, bindings=None):
     memory = st.session_state.setdefault("narration_widget_memory", {})
     defaults = profiles.default_bindings()
-    recorded = (models or {}).get("_bindings", {})
+    recorded = profiles.project_bindings({"models": models or {}, "voice": voice or {}, "options": options or {}}) if models is not None or voice is not None else {}
     for role in profiles.ROLE_CAPABILITIES:
         if bindings is not None and role in bindings:
             value = bindings[role]
-        elif role in recorded:
-            value = recorded[role]
         else:
-            candidates = profiles.catalog()["profiles"]
-            saved = (models or {}).get(role, {})
-            if role == "tts" and voice:
-                engine = voice.get("engine", "mimo_tts")
-                match = next((row["id"] for row in candidates if row["kind"] == "tts" and row["engine"] == engine
-                              and row["model"] == voice.get("model", engine)
-                              and row.get("base", "").rstrip("/") == voice.get("base_url", "").rstrip("/")), None)
-            elif role == "alignment" and options:
-                match = next((row["id"] for row in candidates if row["kind"] == "alignment"
-                              and all(row.get("settings", {}).get(name) == options.get(name)
-                                      for name in ("alignment_python", "alignment_model"))), None)
-            elif saved:
-                match = next((row["id"] for row in candidates if row["kind"] == "chat" and row["model"] == saved.get("model")
-                              and row.get("base", "").rstrip("/") == saved.get("base", "").rstrip("/")), None)
-                if role.endswith("_backup") and not saved.get("enabled", False):
-                    match = ""
-            else:
-                match = None
-            value = match if match is not None else defaults.get(role, "")
+            value = recorded.get(role, defaults.get(role, ""))
         memory.setdefault(prefix + "_profile_" + role, value)
     if voice:
         memory.setdefault(prefix + "_saved_voice", deepcopy(voice))
@@ -116,7 +96,7 @@ def render_model_choice(tr, prefix, role, *, engines=None, show_pending_default=
         if summary["missing"]:
             st.warning(tr("所选配置待完善：") + "、".join(tr(reason) for reason in summary["missing"]))
     if selected and selected not in {row["id"] for row in compatible}:
-        st.warning(tr("所选配置已停用、被移除或不支持此流程；历史项目普通继续仍使用保存快照。"))
+        st.warning(tr("所选配置已停用、被移除或不支持此流程；执行前请重新选择并保存项目绑定。"))
     remember_widget_values(prefix)
     return selected
 
@@ -414,7 +394,7 @@ def _render_model_editor(tr, prefix, registry, selected, creating):
     if selected and not creating:
         with remembered_expander(tr("停用或删除配置"), key=stem + "_delete_open") as panel:
             if panel.open:
-                st.caption(tr("取消“允许新任务选择”并保存即可停用。删除前检查保存引用，已有任务快照保留。"))
+                st.caption(tr("取消“允许新任务选择”并保存即可停用。删除前检查保存引用；项目按绑定读取中央配置。"))
                 if st.button(tr("检查配置引用"), key=stem + "_references"):
                     try:
                         st.session_state[stem + "_reference_info"] = profiles.profile_references(selected)

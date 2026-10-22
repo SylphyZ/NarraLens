@@ -33,6 +33,10 @@ from app.services.narration_motion import (
 from app.services.narration_alignment import (
     LEGACY_MODE, LONG_MODE, align_blocks, default_alignment_options, estimate_block_words, map_timing, validate_alignment_options,
 )
+from app.services.model_profiles import (
+    catalog, default_bindings, get_profile, production_voice, project_bindings, project_references,
+    public_values, resolve_project, validate_narration_voice,
+)
 
 
 class JobPaused(RuntimeError):
@@ -304,11 +308,6 @@ def delete_task(task_id, confirmed=False, interrupted_confirmed=False):
         return f"任务已删除，保留了{preserved}个副本可复用音频文件。"
 
 
-def public_models(profile):
-    return {name: {key: value for key, value in settings.items() if key not in {"key", "api_key"}}
-            if isinstance(settings, dict) else settings for name, settings in profile.items() if name != "proxy"}
-
-
 def audio_mode(options):
     """Tasks created before the mode field always retain the original route."""
     mode = options.get("audio_mode", LEGACY_MODE)
@@ -339,38 +338,34 @@ def normalized_audio_options(options):
     return result
 
 
-def restore_voice(recorded, current, *, profile_id=None):
-    """Refresh credentials only for the recorded provider endpoint."""
-    from app.services.model_profiles import restore_narration_voice
-    return restore_narration_voice(recorded, current, profile_id=profile_id)
+def _write_project_settings(directory, previous, updated):
+    """Archive the old public identity before the settings commit point, once."""
+    history = directory / "model-history.json"
+    if previous.get("model_reference_schema") != 1 and not history.exists():
+        write_json(history, {"schema": 1, "time": time.time(), "settings": public_values(previous)})
+    write_json(directory / "settings.json", updated)
 
 
-def restore_models(recorded, current, require_vision=True, *, required_kinds=None):
-    required = {"text", "text_fast", *(["vision"] if require_vision else [])} if required_kinds is None else set(required_kinds)
-    restored = dict(recorded)
-    from app.services.model_profiles import credentials_for
-    bindings = recorded.get("_bindings", {})
-    for kind in ("text", "text_fast", "vision"):
-        saved = dict(recorded.get(kind, recorded.get("text", {})) if kind == "text_fast" else recorded.get(kind, {}))
-        active = current.get(kind, current.get("text", {})) if kind == "text_fast" else current.get(kind, {})
-        same_endpoint = (saved.get("base") or "").rstrip("/") == (active.get("base") or "").rstrip("/")
-        saved["key"] = credentials_for(saved, kind, identifier=bindings.get(kind), current=active) if kind in required else active.get("key", "") if same_endpoint else ""
-        restored[kind] = saved
-    for kind in ("text_backup", "vision_backup"):
-        saved = dict(recorded.get(kind, {}))
-        active = current.get(kind, {})
-        same_endpoint = (saved.get("base") or "").rstrip("/") == (active.get("base") or "").rstrip("/")
-        if bindings.get(kind) and saved.get("enabled"):
-            saved["key"] = credentials_for(saved, kind, identifier=bindings[kind], current=active)
-        else:
-            saved["enabled"] = bool(saved.get("enabled") and active.get("enabled"))
-            saved["key"] = active.get("key", "") if same_endpoint else ""
-        restored[kind] = saved
-    restored["proxy"] = dict(current.get("proxy", {}))
-    return restored
+def update_project_bindings(task_id, bindings):
+    """A stopped project's role IDs may change without unlocking production inputs."""
+    identifier = str(UUID(str(task_id)))
+    directory = task_directory(identifier)
+    with library_operation(identifier, prefix="narration:"):
+        if runner.running("narration:" + identifier):
+            raise ValueError("项目正在运行，请停止并等待结束后保存模型绑定。")
+        _checked_task_directory(identifier)
+        saved = read_json(directory / "settings.json")
+        registry = catalog()
+        old = project_bindings(saved, registry=registry)
+        for role, value in bindings.items():
+            if value and value != old.get(role):
+                get_profile(value, role, registry=registry)
+        updated = project_references(saved, bindings)
+        _write_project_settings(directory, saved, updated)
+        return updated
 
 
-def _task_options(text, options, *, draft=False, reuse_audio=False):
+def _task_options(text, options, bindings, *, draft=False, reuse_audio=False):
     """Drafts check data; generation also checks bindings and local resources."""
     from app.services.narration_audio import manual_audio_ranges
     if not isinstance(options, dict):
@@ -401,6 +396,7 @@ def _task_options(text, options, *, draft=False, reuse_audio=False):
     if not draft:
         result = validate_motion(validate_bgm(result))
         if not reuse_audio and audio_mode(result) == LONG_MODE and result["alignment_enabled"]:
+            result.update(resolve_project({"model_reference_schema": 1, "model_bindings": bindings}, need_alignment=True)["alignment"])
             validate_alignment_options(result)
         manual_motion_entries(text, result)
     return result
@@ -412,7 +408,7 @@ def project_edit_status(task_id):
     directory = task_directory(identifier)
     settings = read_json(directory / "settings.json")
     state = read_task(identifier) or {}
-    inputs = {"input.txt", "settings.json", "state.json", "source.json", "original.txt", "original.md", "original.markdown"}
+    inputs = {"input.txt", "settings.json", "state.json", "source.json", "original.txt", "original.md", "original.markdown", "model-history.json"}
     unstarted = (state.get("state") == "pending" and state.get("phase", "待开始") == "待开始"
                  and state.get("progress", 0) == 0 and not state.get("video") and not state.get("model_calls")
                  and not settings.get("generation_started") and not settings.get("parent_task_id")
@@ -423,12 +419,11 @@ def project_edit_status(task_id):
     return {"unstarted": bool(unstarted), "editable": bool(unstarted and not busy),
             "reason": "项目或关联资源正在使用，结束后可应用设置。" if busy else
                       "尚未开始，可保存本项目设置后开始生成。" if unstarted else
-                      "项目已开始或已有成果，修改设置请通过复用副本应用；普通继续沿用原设置。"}
+                      "项目已有成果：可单独保存模型绑定；修改音色、字幕和输出等制作参数请创建复用副本。"}
 
 
 def update_project_settings(task_id, selected_libraries, options, voice_profile, model_profile, *, for_start=False):
     """Atomically replace a new project's config; never edit a generated project."""
-    from app.services.narration_audio import public_profile
     identifier = str(UUID(str(task_id)))
     directory = task_directory(identifier)
     with library_operation(identifier, prefix="narration:"):
@@ -450,20 +445,20 @@ def update_project_settings(task_id, selected_libraries, options, voice_profile,
                 text = source.read()
             if stable_hash(text) != saved["text_hash"]:
                 raise ValueError("项目原文发生变化，请创建新项目。")
-            options = _task_options(text, options, draft=not for_start)
+            options = _task_options(text, options, model_profile["_bindings"], draft=not for_start)
             if for_start:
                 manual_motion_entries(text, options, complete=True)
-            from app.services.model_profiles import validate_narration_voice
             validate_narration_voice(voice_profile, require_credentials=for_start)
             updated = {**saved, "library_id": selected_libraries[0], "library_ids": selected_libraries,
-                       "options": options, "voice": public_profile(voice_profile), "models": public_models(model_profile),
+                       "options": options,
                        "project_version": (TASK_ROOT.parent.parent / "project_version").read_text(encoding="utf-8").strip()}
+            updated = project_references(updated, model_profile["_bindings"], voice_profile)
             state = read_task(identifier)
             summary = {**state, "library_id": selected_libraries[0], "library_ids": selected_libraries, "audio_mode": audio_mode(options)}
             # Config is the commit point. If its atomic write fails, restore the old progress summary.
             write_json(directory / "state.json", summary)
             try:
-                write_json(directory / "settings.json", updated)
+                _write_project_settings(directory, saved, updated)
             except Exception:
                 write_json(directory / "state.json", state)
                 raise
@@ -476,11 +471,11 @@ def create_task(library_id, text, options, voice_profile, source=None, model_pro
 
 
 def _create_task(library_id, text, options, voice_profile, source, model_profile, *, reuse_audio=False, draft=False):
-    from app.services.narration_audio import public_profile
     selected_libraries = library_ids(library_id)
     if not selected_libraries:
         raise ValueError("请至少选择一个素材库。")
-    options = _task_options(text, options, draft=draft, reuse_audio=reuse_audio)
+    bindings = model_profile["_bindings"] if model_profile is not None else default_bindings()
+    options = _task_options(text, options, bindings, draft=draft, reuse_audio=reuse_audio)
     store = LibraryStore()
     for identifier in selected_libraries:
         store.directory(identifier)
@@ -494,10 +489,9 @@ def _create_task(library_id, text, options, voice_profile, source, model_profile
         (directory / ("original" + source["extension"])).write_text(source.get("text", ""), encoding="utf-8", newline="")
         write_json(directory / "source.json", {"name": source.get("name", ""), "extension": source["extension"]})
     settings = {"library_id": selected_libraries[0], "library_ids": selected_libraries, "options": options,
-                "voice": public_profile(voice_profile), "text_hash": stable_hash(text), "schema": 2, "generation_started": False,
+                "text_hash": stable_hash(text), "schema": 2, "generation_started": False,
                 "project_version": (TASK_ROOT.parent.parent / "project_version").read_text(encoding="utf-8").strip()}
-    if model_profile:
-        settings["models"] = public_models(model_profile)
+    settings = project_references(settings, bindings, voice_profile)
     write_json(directory / "settings.json", settings)
     state = {"id": task_id, "library_id": selected_libraries[0], "library_ids": selected_libraries,
              "state": "pending", "progress": 0, "phase": "待开始", "message": "任务已创建", "video": "", "audio_mode": audio_mode(options)}
@@ -505,7 +499,7 @@ def _create_task(library_id, text, options, voice_profile, source, model_profile
     return task_id
 
 
-def fork_task(task_id, options, voice_profile, model_profile, use_current_models=False, *, selected_libraries=None, reuse_audio=False):
+def fork_task(task_id, options, voice_profile, model_profile, *, selected_libraries=None, reuse_audio=False):
     """Create a new task with the same manuscript and reusable, validated caches."""
     source_directory = task_directory(task_id)
     source_settings = read_json(source_directory / "settings.json")
@@ -520,29 +514,27 @@ def fork_task(task_id, options, voice_profile, model_profile, use_current_models
         if stable_hash(text) != source_settings["text_hash"]:
             raise ValueError("来源任务原文发生变化，无法创建复用缓存的副本。")
         if reuse_audio:
-            from app.services.narration_audio import public_profile
             original_options = {key: value for key, value in source_settings["options"].items() if not key.startswith("motion_")}
             requested_options = {key: value for key, value in options.items() if not key.startswith("motion_")}
-            if original_options != requested_options or public_profile(voice_profile) != source_settings["voice"]:
+            if original_options != requested_options or production_voice(voice_profile) != production_voice(source_settings["voice"]):
                 raise ValueError("完整配音复用仅适用于保持原配音、字幕及输出设置的动画副本。")
             _resume_checkpoint(source_directory, source_settings, text, 3)
-        models = dict(model_profile if use_current_models or "models" not in source_settings else source_settings["models"])
-        from app.services.narration_audio import public_profile
-        bindings = dict(models.get("_bindings", {}))
-        for role in ("tts", "alignment"):
-            same = public_profile(voice_profile) == source_settings["voice"] if role == "tts" else all(
-                options.get(name) == source_settings["options"].get(name) for name in ("alignment_python", "alignment_model"))
-            identifier = (source_settings.get("models", {}) if same else model_profile).get("_bindings", {}).get(role)
-            if identifier:
-                bindings[role] = identifier
-            else:
-                bindings.pop(role, None)
-        if bindings:
-            models["_bindings"] = bindings
+        bindings = dict(model_profile["_bindings"])
+        if not voice_profile.get("engine"):
+            bindings["tts"] = project_bindings(source_settings)["tts"]
+        elif voice_profile.get("profile_id"):
+            bindings["tts"] = voice_profile["profile_id"]
+        models = {"_bindings": bindings}
         child_id = _create_task(target_libraries, text, options, voice_profile, None, models, reuse_audio=reuse_audio)
         child_directory = task_directory(child_id)
         settings = read_json(child_directory / "settings.json")
         settings["parent_task_id"] = str(UUID(str(task_id)))
+        # Keep the source identity only as provenance for deterministic old audio keys.
+        history = read_json(source_directory / "model-history.json", default={})
+        if source_settings.get("model_reference_schema") != 1:
+            history = {"schema": 1, "settings": public_values(source_settings)}
+        if history:
+            write_json(child_directory / "model-history.json", public_values(history))
         write_json(child_directory / "settings.json", settings)
         copied = 0
         try:
@@ -574,11 +566,13 @@ def fork_task(task_id, options, voice_profile, model_profile, use_current_models
                         os.link(source, destination)
                     except OSError:
                         shutil.copy2(source, destination)
-                for name in ("audio_manifest.json", "long_audio.json"):
+                for name in ("audio_manifest.json", "long_audio.json", "audio_plan.json"):
                     if not (source_directory / name).is_file():
                         continue
                     record = read_json(source_directory / name)
                     for row in record.get("segments", []) + record.get("blocks", []):
+                        if "path" not in row:
+                            continue
                         path = Path(row["path"])
                         if not path.resolve().is_relative_to(source_directory.resolve()):
                             raise ValueError("来源配音记录引用任务外音频，无法完整复用。")
@@ -605,7 +599,7 @@ def fork_task(task_id, options, voice_profile, model_profile, use_current_models
         return child_id
 
 
-def run_task(task_id, model_profile, voice_profile, stop=None, use_current_models=False, *, start_stage="auto"):
+def run_task(task_id, stop=None, *, start_stage="auto"):
     with library_operation(task_id, prefix="narration:"):
         directory = task_directory(task_id)
         settings = read_json(directory / "settings.json")
@@ -613,7 +607,7 @@ def run_task(task_id, model_profile, voice_profile, stop=None, use_current_model
             if not settings.get("generation_started"):
                 settings["generation_started"] = True
                 write_json(directory / "settings.json", settings)
-            return _run_task(task_id, model_profile, voice_profile, stop, use_current_models, start_stage=start_stage)
+            return _run_task(task_id, stop, start_stage=start_stage)
 
 
 def _preserve_visual_result(directory):
@@ -879,7 +873,7 @@ def _find_visual_shots(segments, text, visual_plan, assets, reservations, retrie
         save()
 
 
-def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *, start_stage="auto"):
+def _run_task(task_id, stop, *, start_stage="auto"):
     from app.models.timeline import timeline_dict
     from app.services.narration_audio import (
         create_narration_subtitles, finalize_long_narration, synthesize_long_narration, synthesize_narration,
@@ -907,29 +901,10 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
     # The relevance switch does not disable the independent credits/usability check.
     if level <= 3:
         required.append("vision")  # Used only when a saved range still needs local enrichment.
-    if required:
-        if "models" not in settings or use_current_models:
-            refreshed = public_models(model_profile)
-            previous_bindings = settings.get("models", {}).get("_bindings", {})
-            bindings = dict(refreshed.get("_bindings", {}))
-            for role in ("tts", "alignment"):
-                if previous_bindings.get(role):
-                    bindings[role] = previous_bindings[role]
-                else:
-                    bindings.pop(role, None)
-            refreshed["_bindings"] = bindings
-            settings["models"] = refreshed
-            write_json(directory / "settings.json", settings)
-        if "text_fast" not in settings["models"]:
-            settings["models"]["text_fast"] = public_models({"text_fast": model_profile.get("text_fast", model_profile.get("text", {}))})["text_fast"]
-            write_json(directory / "settings.json", settings)
-        missing_backups = [kind for kind in ("text_backup", "vision_backup") if kind not in settings["models"]]
-        if missing_backups:
-            settings["models"].update(public_models({kind: model_profile.get(kind, {}) for kind in missing_backups}))
-            write_json(directory / "settings.json", settings)
-        model_profile = restore_models(settings["models"], model_profile, required_kinds=required)
-    else:
-        model_profile = {}
+    resolved = resolve_project(settings, roles=required, need_voice=level <= 1,
+        need_alignment=level <= 2 and mode == LONG_MODE and options["alignment_enabled"])
+    model_profile, voice_profile = resolved["models"], resolved["voice"]
+    options.update(resolved["alignment"])
     if level <= 2 and mode == LONG_MODE and options["tts_chunking"] == "manual":
         from app.services.narration_audio import manual_audio_ranges
         if options.get("tts_break_text_hash") != stable_hash(text):
@@ -939,9 +914,15 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
     state["resume_stage"] = start_stage
     if stable_hash(text) != settings["text_hash"]:
         raise ValueError("任务原文发生变化，请创建新任务。")
-    # Restore the recorded voice configuration, refreshing only authentication/proxy.
-    if level <= 1:
-        voice_profile = restore_voice(settings["voice"], voice_profile, profile_id=settings.get("models", {}).get("_bindings", {}).get("tts"))
+    converted = project_references(settings, resolved["bindings"])
+    if converted != settings:
+        _write_project_settings(directory, settings, converted)
+        settings = converted
+    history = read_json(directory / "model-history.json", default={})
+    legacy_voice = history.get("settings", {}).get("voice", {})
+    legacy_profiles = [legacy_voice] if legacy_voice.get("engine") else []
+    write_json(directory / "model-runs" / (str(time.time_ns()) + ".json"),
+               {"schema": 1, "time": time.time(), "start_stage": start_stage, **public_values(resolved)})
     cache_source = task_directory(settings["parent_task_id"]) / "audio" if level <= 1 and settings.get("parent_task_id") else None
     model_calls = 0
     usage = ModelUsage(directory)
@@ -1020,7 +1001,8 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
                 blocks = synthesize_long_narration(segments, text, voice_profile, directory, stop,
                     progress=lambda p, message: update("生成长段配音", 20 + p * 13, message),
                     tts_budget=budget, target_chars=options["tts_block_chars"], cache_source=cache_source,
-                    break_after=options.get("tts_break_after") if options["tts_chunking"] == "manual" else None)
+                    break_after=options.get("tts_break_after") if options["tts_chunking"] == "manual" else None,
+                    legacy_profiles=legacy_profiles)
             else:
                 blocks = checkpoint["blocks"]
             if options["alignment_enabled"]:
@@ -1054,7 +1036,7 @@ def _run_task(task_id, model_profile, voice_profile, stop, use_current_models, *
             subtitle_units = fit_single_line_units(subtitle_units, options)
             audio_path = synthesize_narration(segments, voice_profile, directory, stop,
                 progress=lambda p, message: update("生成配音", 20 + p * 20, message),
-                tts_budget=budget, subtitle_units=subtitle_units, cache_source=cache_source)
+                tts_budget=budget, subtitle_units=subtitle_units, cache_source=cache_source, legacy_profiles=legacy_profiles)
         else:
             audio_path = checkpoint["audio_path"]
             state.update(subtitle_timing=checkpoint["audio"].get("timing_method", "tts_units"),

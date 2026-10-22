@@ -41,6 +41,12 @@ def public_values(value):
         return {k: public_values(v) for k, v in value.items() if not _private_key(k) and k != "proxy"}
     if isinstance(value, list):
         return [public_values(v) for v in value]
+    if isinstance(value, str) and value.lower().startswith(("http://", "https://")):
+        try:
+            parsed = urlsplit(value)
+            return urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
+        except ValueError:
+            return "[invalid URL]"
     return deepcopy(value)
 
 
@@ -335,7 +341,7 @@ def profile_references(identifier):
             references.append("音频库：" + item["name"])
     for path in TASK_ROOT.glob("*/settings.json"):
         saved = read_json(path, default={})
-        if identifier in saved.get("models", {}).get("_bindings", {}).values():
+        if identifier in project_bindings(saved).values():
             references.append("项目：" + path.parent.name[:8])
     return references
 
@@ -356,14 +362,15 @@ def available(role, *, engines=None):
             and (engines is None or row.get("engine") in engines)]
 
 
-def get_profile(identifier, role=None, *, historical=False):
-    row = next((row for row in catalog()["profiles"] if row["id"] == identifier), None)
+def get_profile(identifier, role=None, *, historical=False, registry=None):
+    row = next((row for row in (registry if registry is not None else catalog())["profiles"] if row["id"] == identifier), None)
+    label = ROLE_LABELS.get(role, "模型") + "（" + str(identifier or "未选择") + "）"
     if row is None:
-        raise ValueError("模型配置已不存在，请到模型配置工作区处理。")
+        raise ValueError(label + "配置不存在，请在项目中重新选择并保存绑定。")
     if not historical and not row.get("enabled", True):
-        raise ValueError("模型配置已停用，请重新选择。")
+        raise ValueError(label + "配置已停用，请重新选择。")
     if role and ROLE_CAPABILITIES[role] not in row["capabilities"]:
-        raise ValueError("所选模型不支持此用途。")
+        raise ValueError(label + "不支持此用途，请重新选择。")
     return deepcopy(row)
 
 
@@ -371,15 +378,16 @@ def default_bindings():
     return deepcopy(catalog()["defaults"])
 
 
-def resolve_models(bindings=None, *, roles=None, historical=False, allow_missing=False):
-    selected = default_bindings() if bindings is None else dict(bindings)
+def resolve_models(bindings=None, *, roles=None, historical=False, allow_missing=False, registry=None):
+    registry = registry if registry is not None else catalog()
+    selected = deepcopy(registry.get("defaults", {})) if bindings is None else dict(bindings)
     roles = roles or ("text", "text_fast", "vision", "text_backup", "vision_backup")
     result = {"proxy": deepcopy(config.proxy), "_bindings": dict(selected), "context_tokens": 64000}
     for role in roles:
         identifier = selected.get(role, "")
         if role == "asr":
             try:
-                result[role] = asr_profile(identifier, historical=historical)
+                result[role] = asr_profile(identifier, historical=historical, registry=registry)
             except ValueError:
                 if not allow_missing:
                     raise
@@ -392,7 +400,7 @@ def resolve_models(bindings=None, *, roles=None, historical=False, allow_missing
             result[role] = {}
             continue
         try:
-            row = get_profile(identifier, role, historical=historical)
+            row = get_profile(identifier, role, historical=historical, registry=registry)
         except ValueError:
             if not allow_missing:
                 raise
@@ -408,12 +416,12 @@ def resolve_models(bindings=None, *, roles=None, historical=False, allow_missing
     return result
 
 
-def tts_profile(identifier=None, *, engine=None, historical=False):
+def tts_profile(identifier=None, *, engine=None, historical=False, registry=None):
     legacy_engine = engine
     if identifier is None:
         identifier = "legacy_tts_" + engine if engine else default_bindings().get("tts")
     try:
-        row = get_profile(identifier, "tts", historical=historical)
+        row = get_profile(identifier, "tts", historical=historical, registry=registry)
     except ValueError:
         if legacy_engine is None:
             raise
@@ -425,6 +433,8 @@ def tts_profile(identifier=None, *, engine=None, historical=False):
         settings.update(model_name=row["model"], api_key=row["key"])
         if row["base"]:
             settings["api_url"] = row["base"]
+        else:
+            settings.pop("api_url", None)
     elif "api_url" in settings or row["base"]:
         settings["api_url"] = row["base"]
     if row["engine"] not in {"edge_tts", "mimo_tts", "qwen3_tts"} and row["key"]:
@@ -439,14 +449,14 @@ def validate_narration_voice(profile, *, require_credentials=True):
     """Shared, local-only checks for a manuscript project's saved speech choice."""
     if not isinstance(profile, dict) or profile.get("engine") not in TTS_GROUPS:
         raise ValueError("请选择已接入的配音服务配置。")
-    if profile.get("schema") == 1:
-        if not isinstance(profile.get("settings"), dict):
-            raise ValueError("配音服务快照不完整。")
-        for address in (profile.get("base_url"), profile["settings"].get("api_url"), profile["settings"].get("base_url")):
-            if address:
-                parsed = urlsplit(address)
-                if parsed.username or parsed.password or parsed.query or parsed.fragment:
-                    raise ValueError("配音接口地址不能内嵌凭据或查询参数，请在中央配置填写服务凭据。")
+    if profile.get("schema") == 1 and not isinstance(profile.get("settings"), dict):
+        raise ValueError("配音服务快照不完整。")
+    settings = profile.get("settings", {})
+    for address in (profile.get("base_url"), settings.get("api_url"), settings.get("base_url")):
+        if address:
+            parsed = urlsplit(address)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("配音接口地址不能内嵌凭据或查询参数，请在中央配置填写服务凭据。")
     for field in ("rate", "pitch"):
         number = profile.get(field, 1.0 if field == "rate" else 0.0)
         if isinstance(number, bool) or not isinstance(number, (int, float)) or not isfinite(number) or (field == "rate" and not .5 <= number <= 2):
@@ -497,21 +507,100 @@ def validate_narration_voice(profile, *, require_credentials=True):
             raise ValueError("所选克隆模式需要有效参考音频。")
 
 
-def restore_narration_voice(recorded, current, *, profile_id=None):
-    """Restore only credentials; recorded non-secret sound parameters stay immutable."""
-    saved = deepcopy(recorded)
-    if saved.get("schema") == 1:
-        identifier = profile_id or saved.get("profile_id")
-        service = tts_profile(identifier, historical=True)
-        if any(service.get(k) != saved.get(k) for k in ("engine", "model")) or \
-                service.get("base_url", "").rstrip("/") != saved.get("base_url", "").rstrip("/") or \
-                service["profile_id"] != saved.get("profile_id"):
-            raise ValueError("历史配音配置的引擎、模型或接口已改变，请恢复对应配置或创建副本。")
-        saved["settings"] = with_private_values(saved["settings"], service["settings"])
-    elif saved.get("engine", "mimo_tts") == "mimo_tts":
-        saved["api_key"] = credentials_for(saved, "tts", identifier=profile_id, current=current)
-    saved["proxy"] = deepcopy(current.get("proxy", config.proxy))
-    return saved
+def project_bindings(settings, *, registry=None):
+    """Read IDs, with a finite, unambiguous conversion for pre-reference projects."""
+    if settings.get("model_reference_schema") == 1:
+        return {role: str(settings.get("model_bindings", {}).get(role) or "") for role in ROLE_CAPABILITIES}
+    registry = registry if registry is not None else catalog()
+    recorded = settings.get("models", {})
+    bindings = dict(recorded.get("_bindings", {}))
+    voice, options = settings.get("voice", {}), settings.get("options", {})
+    if voice.get("profile_id"):
+        bindings.setdefault("tts", voice["profile_id"])
+    for role, capability in ROLE_CAPABILITIES.items():
+        if role in bindings:
+            continue
+        saved = voice if role == "tts" else recorded.get(role, {})
+        if role.endswith("_backup") and not saved.get("enabled", False):
+            bindings[role] = ""
+            continue
+        candidates = []
+        for row in registry["profiles"]:
+            if capability not in row.get("capabilities", []):
+                continue
+            if role == "tts":
+                matches = bool(saved) and row.get("engine") == saved.get("engine", "mimo_tts") and \
+                    row.get("model") == saved.get("model", saved.get("engine")) and \
+                    row.get("base", "").rstrip("/") == saved.get("base_url", "").rstrip("/")
+            elif role == "alignment":
+                matches = all(options.get(name) and row.get("settings", {}).get(name) == options[name]
+                              for name in ("alignment_python", "alignment_model"))
+            else:
+                matches = bool(saved) and row.get("model") == saved.get("model") and \
+                    row.get("base", "").rstrip("/") == saved.get("base", "").rstrip("/")
+            if matches:
+                candidates.append(row["id"])
+        bindings[role] = candidates[0] if len(candidates) == 1 else ""
+    return {role: str(bindings.get(role) or "") for role in ROLE_CAPABILITIES}
+
+
+def production_voice(profile):
+    """Only sound choices belong to a project; service fields belong to the registry."""
+    return public_values({name: profile[name] for name in ("voice", "rate", "pitch", "instruction", "reference_audio") if name in profile})
+
+
+def project_references(settings, bindings, voice=None):
+    result = deepcopy(settings)
+    result.pop("models", None)
+    result.update(model_reference_schema=1,
+                  model_bindings={role: str(bindings.get(role) or "") for role in ROLE_CAPABILITIES},
+                  voice=production_voice(settings.get("voice", {}) if voice is None else voice))
+    for name in ("alignment_python", "alignment_model"):
+        result.get("options", {}).pop(name, None)
+    return result
+
+
+def narration_voice(identifier, production, *, registry=None, historical=False):
+    """Combine one current service with whitelisted project sound choices."""
+    if not identifier:
+        raise ValueError("配音服务未绑定，请在TTS配音设置选择中央配置。")
+    service = tts_profile(identifier, registry=registry, historical=historical)
+    engine, settings = service["engine"], service["settings"]
+    choices = production_voice(production)
+    if engine == "mimo_tts":
+        return {"engine": engine, "profile_id": identifier, "proxy": service["proxy"],
+                "api_key": settings.get("api_key", ""), "base_url": service["base_url"], "model": service["model"],
+                "voice": settings.get("voice", "冰糖"), "instruction": settings.get("instruction", ""),
+                **({"reference_audio": settings["reference_audio"]} if settings.get("reference_audio") else {}), **choices}
+    if engine == "edge_tts":
+        return {"engine": engine, "profile_id": identifier, "proxy": service["proxy"],
+                "voice": settings.get("voice", "zh-CN-XiaoxiaoNeural"), "rate": 1.0, **choices}
+    default = settings.get("voice", settings.get("voice_name", settings.get("voice_type", ""))) or \
+        {"qwen3_tts": "Cherry", "tencent_tts": "101001", "azure_speech": "zh-CN-XiaoxiaoNeural", "doubaotts": ""}.get(engine, settings.get("reference_audio") or "default")
+    result = {**service, "schema": 1, "voice": str(default), "rate": settings.get("speed", 1.0), "pitch": 0.0, **choices}
+    if engine in {"indextts_macos", "indextts2"}:
+        result["settings"]["speed"] = result["rate"]
+    return result
+
+
+def resolve_project(settings, *, roles=(), need_voice=False, need_alignment=False, registry=None):
+    """Freeze all required roles from the same central snapshot for one run."""
+    registry = registry if registry is not None else catalog()
+    bindings = project_bindings(settings, registry=registry)
+    selected = list(dict.fromkeys(roles))
+    for primary, backup in (("text", "text_backup"), ("text_fast", "text_backup"), ("vision", "vision_backup")):
+        if primary in selected and backup not in selected:
+            selected.append(backup)
+    needed = [*selected, *(["tts"] if need_voice else []), *(["alignment"] if need_alignment else [])]
+    for role in needed:
+        if role.endswith("_backup") and not bindings.get(role):
+            continue
+        get_profile(bindings.get(role), role, registry=registry)
+    models = resolve_models(bindings, roles=selected, registry=registry) if selected else {}
+    voice = narration_voice(bindings["tts"], settings.get("voice", {}), registry=registry) if need_voice else None
+    resources = alignment_profile(bindings["alignment"], registry=registry) if need_alignment else {}
+    alignment = {name: resources.get(name, "") for name in ("alignment_python", "alignment_model")} if need_alignment else {}
+    return {"bindings": bindings, "models": models, "voice": voice, "alignment": alignment}
 
 
 def redact_tts_error(value, service=None):
@@ -540,13 +629,13 @@ def redact_tts_error(value, service=None):
     return message
 
 
-def alignment_profile(identifier=None, *, historical=False):
-    row = get_profile(identifier or default_bindings().get("alignment"), "alignment", historical=historical)
+def alignment_profile(identifier=None, *, historical=False, registry=None):
+    row = get_profile(identifier or default_bindings().get("alignment"), "alignment", historical=historical, registry=registry)
     return deepcopy(row.get("settings", {}))
 
 
-def asr_profile(identifier=None, *, historical=False):
-    row = get_profile(identifier or default_bindings().get("asr"), "asr", historical=historical)
+def asr_profile(identifier=None, *, historical=False, registry=None):
+    row = get_profile(identifier or default_bindings().get("asr"), "asr", historical=historical, registry=registry)
     settings = deepcopy(row.get("settings", {}))
     settings.update(backend=row["engine"], model=row["model"], api_key=row["key"])
     if row["engine"] in {"local", "firered"}:
@@ -557,30 +646,6 @@ def asr_profile(identifier=None, *, historical=False):
 def asr_settings():
     active = current_models()
     return active["asr"]["settings"] if active and active.get("asr", {}).get("settings") else config.fun_asr
-
-
-def credentials_for(saved, role, *, identifier=None, current=None):
-    """Preserve recorded endpoint/parameters; restore only that service's credentials."""
-    def matches(row):
-        if role == "tts":
-            engine = saved.get("engine", "mimo_tts")
-            base = saved.get("base_url", "").rstrip("/")
-            return row.get("engine") == engine and row.get("model") == saved.get("model", engine) and row.get("base", "").rstrip("/") == base
-        return row.get("kind") == "chat" and row.get("base", "").rstrip("/") == saved.get("base", "").rstrip("/") and row.get("model") == saved.get("model")
-    rows = catalog()["profiles"]
-    if identifier:
-        row = get_profile(identifier, role, historical=True)
-        if not matches(row):
-            raise ValueError("项目保存的模型接口与中央定义不同，请恢复对应配置，或明确使用新选择。")
-        return row.get("key", "")
-    if current and (current.get("base", current.get("base_url", "")).rstrip("/") == saved.get("base", saved.get("base_url", "")).rstrip("/")):
-        credential = current.get("key", current.get("api_key", ""))
-        if credential:
-            return credential
-    matches_with_key = {row.get("key", "") for row in rows if matches(row) and row.get("key")}
-    if len(matches_with_key) > 1:
-        raise ValueError("该接口存在多个账号，请明确选择项目对应模型配置。")
-    return next(iter(matches_with_key), "")
 
 
 @contextmanager

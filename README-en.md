@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.9.3**
+**Manuscript-driven video production · v2.9.4**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.9.3 provides seven workspaces:
+Version 2.9.4 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,17 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.9.4
+
+Projects store central configuration IDs by role. Start and resume resolve current endpoints, models, credentials and parameters, then freeze them for that run. Editing the endpoint or key of the same definition no longer requires a new project.
+
+- **Production Workspace → Model selection → Save this project's model bindings** saves role references, including TTS and local alignment. Stopped projects can update references directly; changes to voice, subtitle and output choices still use a reusable copy.
+- Legacy settings convert on explicit save or resume. Public snapshots remain as history. Missing IDs are inferred only from a unique match; missing, disabled or incompatible definitions require an explicit selection.
+- Projects retain sound choices while services come from the central registry. Speech cache identities exclude routing, credentials and display metadata. Deterministic legacy keys and audio checks preserve eligible existing audio; a sound change prevents automatic mixing within the original project.
+- Execution records are for traceability. Later stages can reuse a complete soundtrack without restoring its old TTS service; stage 5 remains local reuse. Media libraries and the external-agent protocol are unchanged.
+
+Static source and publication checks were completed. No real model or TTS requests, automated tests, project regeneration or final-video acceptance run were performed. This patch does not establish that HTTP 429, quota or connectivity issues are resolved.
 
 ## Version 2.9.3
 
