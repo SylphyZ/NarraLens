@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.0**
+**Manuscript-driven video production · v2.10.1**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.0 provides seven workspaces:
+Version 2.10.1 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,14 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.1: open agent task files directly
+
+The selected visual-agent task now has **Open task folder** and **Open task instructions** buttons in the Production Workspace. On Windows, these open File Explorer and the task's `TASK.md` in its default associated application on the computer running NarraLens.
+
+Copy the handoff instructions from the code block as before. The optional instruction download is collapsed. Missing paths, linked task directories and file-association errors produce a visible message. Opening these files does not launch an agent, FFmpeg or a model, or change task data.
+
+Existing 2.10 tasks can use the buttons immediately. Source checks were static; no file-manager interaction or complete business acceptance was run automatically.
 
 ## Version 2.10.0: external-agent editing for the whole manuscript
 

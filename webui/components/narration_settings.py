@@ -2,6 +2,7 @@
 
 import json
 import io
+import os
 import wave
 from copy import deepcopy
 from pathlib import Path
@@ -839,13 +840,37 @@ def _render_visual_options(tr, prefix, task_id, saved):
         task, head = by_id[selected], by_id[selected]["head"]
         root = Path(task["directory"])
         st.code(str(root), language=None)
+        folder_col, instructions_col = st.columns(2)
+        for column, label, target, kind in (
+                (folder_col, "打开任务文件夹", root, "folder"),
+                (instructions_col, "打开任务说明", root / "TASK.md", "instructions")):
+            if column.button(tr(label), key=prefix + "_agent_open_" + kind + "_" + selected):
+                try:
+                    if any(entry.is_symlink() or entry.is_junction() for entry in (target, *target.parents)):
+                        raise ValueError(tr("任务路径包含链接，请检查任务目录。"))
+                    resolved = target.resolve(strict=True)
+                    if not (resolved.is_dir() if kind == "folder" else resolved.is_file()):
+                        raise ValueError(tr("任务目录或说明文件不存在，请刷新任务列表。"))
+                    if os.name == "nt":
+                        os.startfile(str(resolved))
+                    else:
+                        st.info(tr("请在本机文件管理器打开：") + str(resolved))
+                except (OSError, ValueError) as exc:
+                    st.warning(tr("打开失败：") + str(exc))
+        st.caption(tr("文件夹在运行本应用的Windows电脑上打开；任务说明使用系统默认关联程序。"))
         required_frames = sum(b-a for a,b in task["original_intervals"])
         st.caption(tr("本地已保存进度：") + f"r{head['revision']} · {head['clips']} " + tr("镜头") +
             f" · {head['covered_frames']/30:.1f}/{required_frames/30:.1f}s · " + tr("完成版" if head["complete"] else "草稿"))
         st.caption(tr("这里只显示已落盘结果；不能据此判断外部Agent是否仍在运行。"))
+        st.caption(tr("交给Agent的指令（点击代码框右上角复制）"))
         st.code("请读取以下TASK.md，按其中本地CLI完成整篇画面匹配；允许关联及氛围配图。可先理解全文，再用子Agent分章节工作，最后由主Agent汇总全片。\n" + str(root / "TASK.md"), language=None)
-        st.download_button(tr("下载Agent任务说明"), (root / "TASK.md").read_text(encoding="utf-8"),
-                           file_name="TASK.md", key=prefix + "_download_agent_task_" + selected)
+        with remembered_expander(tr("下载任务说明（可选）"), key=prefix + "_agent_download_open") as download:
+            if download.open:
+                try:
+                    st.download_button(tr("下载Agent任务说明"), (root / "TASK.md").read_text(encoding="utf-8"),
+                                       file_name="TASK.md", key=prefix + "_download_agent_task_" + selected)
+                except OSError as exc:
+                    st.warning(tr("读取任务说明失败：") + str(exc))
         workers = st.number_input(tr("章节分工数"), min_value=1, max_value=64, value=4, step=1, key=prefix + "_agent_workers")
         if st.button(tr("生成章节分工"), key=prefix + "_agent_worksets", disabled=busy or bool(head["revision"])):
             try:
