@@ -365,7 +365,7 @@ def observe_ranges(items, asset, context, gateway, root, stop=None, media_slots=
     with media_slots or nullcontext():
         return gateway.json(instruction+"\n作品参考："+json.dumps(context,ensure_ascii=False)+
                             "\n图片顺序ID："+json.dumps([fid for fid,_ in images])+"\n本批范围："+json.dumps(catalog,ensure_ascii=False,separators=(",",":")),
-                            kind="vision", images=[path for _,path in images], max_output=max(4000, len(items)*650), attempts=1,
+                            model_kind="vision", images=[path for _,path in images], max_output=max(4000, len(items)*650), attempts=1,
                             request_metadata={"usage_stage":"library_observation", "protocol":ANALYSIS_PROTOCOL,
                                               "range_ids":[r["id"] for r in items]})
 

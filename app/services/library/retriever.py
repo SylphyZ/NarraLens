@@ -216,7 +216,7 @@ class MaterialRetriever:
             return old
         outcome = {"key":job["key"],"response":None,"error":""}
         try:
-            outcome["response"] = gateway.json(prompt,kind="text_fast",max_output=3500,attempts=1,
+            outcome["response"] = gateway.json(prompt,model_kind="text_fast",max_output=3500,attempts=1,
                 request_metadata={"usage_stage":"event_shot_match","protocol":RETRIEVAL_PROTOCOL,
                                   "unit_id":unit["id"],"range_ids":list(job["aliases"]),"search_round":job["search_round"]})
         except (ModelAPIError,ModelFormatError) as exc:

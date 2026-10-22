@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.9.4**
+**Manuscript-driven video production · v2.9.5**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.9.4 provides seven workspaces:
+Version 2.9.5 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,14 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.9.5
+
+Fixes an incorrect keyword in footage matching and shot enrichment. Both callers now use the existing `model_kind` argument for the efficient text model and vision model. Gateway signatures, prompts, fallback models, budgets, retrieval and cache protocols are unchanged.
+
+Interrupted candidates remain eligible under the existing resume rules. Restart the WebUI and select **3. Resume footage search** in the original project to reuse completed narration, subtitles and successful results.
+
+All 15 gateway JSON call sites were statically checked, and the two implementation edits were limited to the keyword names. No automated tests or real model requests were run; matching quality and final-video acceptance require an actual run.
 
 ## Version 2.9.4
 
