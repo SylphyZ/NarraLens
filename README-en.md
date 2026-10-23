@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.2**
+**Manuscript-driven video production · v2.10.3**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.2 provides seven workspaces:
+Version 2.10.3 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,16 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.3: consistent external film-analysis instructions
+
+New task `TASK.md` files, instructions copied from the UI, and worker assignments share one set of execution rules. Keep one owner per episode; workers retrieve images, inspect them, submit observations and finish the episode's event catalogue continuously. The coordinator handles assignments and targeted reviews. Use batch receipts for routine progress instead of repeatedly reading the whole task or reshuffling assignments.
+
+- Open the project root as the external agent's workspace so the CLI can access task files and shared locks. Changing the terminal directory does not expand client permissions; preserve progress and report the affected path when access fails.
+- Reuse successful observations. Check the current result before retrying a conflict; skip a valid saved observation and obtain a fresh template only for a necessary revision. An episode is complete only after its observations and `contents` have been submitted.
+- Batch settings remain configurable in the UI. Follow `next_offset` when a batch is reduced to fit its budgets. Existing tasks can use the latest instructions copied from the UI; running agents must reread them. Updating instructions does not launch an agent or change client permissions.
+
+Task protocols, saved results and the existing check/import workflow remain available. This release changes instructions and UI guidance; it adds no managed agent runtime, compact status API or permission preflight. Instruction generation and parameter forwarding were checked; no live agent run or full-season timing acceptance was performed.
 
 ## Version 2.10.2: fix false source-video change errors
 

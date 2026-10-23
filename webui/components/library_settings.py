@@ -728,7 +728,8 @@ def _agent_batch_options(store, library_id, identifier, status, prefix, busy, tr
                     group = by_worker[worker]
                     return f"{worker}. 第{'、'.join(str(a['episode']) for a in group['assets'])}集 · {group['remaining_ranges']}个待处理范围"
                 worker = st.selectbox(tr("选择分工"), list(by_worker), key=key+"_worker", format_func=label)
-                st.code(by_worker[worker]["instructions"], language=None)
+                st.code(agent_tasks.instructions(identifier,
+                    [a["asset_id"] for a in by_worker[worker]["assets"]], **options), language=None)
             try:
                 metrics = read_json(agent_tasks.task_directory(identifier)/"reports/last-batch.json", default={})
             except (OSError, ValueError):
@@ -748,6 +749,8 @@ def _agent_panel(store, library_id, targets, settings, tr):
             return
         busy = runner.library_busy(library_id)
         st.caption(tr("先创建本地任务，再将指令交给支持看图和本地命令的Agent。准备不调用模型，原视频保留原路径。"))
+        st.caption(tr("外部Agent工作区请选择项目根目录：") + str(agent_tasks.PROJECT) +
+                   tr("。仅切换终端目录不会扩大读写权限；已有任务可复制下方最新说明继续。"))
         if st.button(tr("创建 Agent 拉片任务"), disabled=busy or not targets, key=prefix + "_create"):
             try:
                 selected = [a["id"] for a in targets]
