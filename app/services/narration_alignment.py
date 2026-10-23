@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import re
 from statistics import median
+import sys
 import threading
 import time
 import unicodedata
@@ -24,7 +25,7 @@ _WORKER = Path(__file__).with_name("narration_alignment_worker.py")
 
 def default_alignment_options():
     workspace = Path(__file__).resolve().parents[3]
-    return {"alignment_python": str(workspace / ".conda" / "narratoai-align" / "python.exe"),
+    return {"alignment_python": sys.executable,
             "alignment_model": str(workspace / "models" / "Qwen3-ForcedAligner-0.6B-hf"),
             "alignment_language": "Chinese"}
 

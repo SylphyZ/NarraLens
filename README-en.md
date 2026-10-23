@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.3**
+**Manuscript-driven video production · v2.10.4**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.3 provides seven workspaces:
+Version 2.10.4 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -65,8 +65,7 @@ The current Windows setup uses this layout; adapt paths to your own installation
 workspace/
 ├─ start.bat
 ├─ .conda/
-│  ├─ narratoai/              Main application environment
-│  └─ narratoai-align/        Local alignment environment
+│  └─ narralens/              Shared application and alignment environment
 ├─ models/
 │  └─ Qwen3-ForcedAligner-0.6B-hf/
 └─ NarraLens/                Actual code directory
@@ -75,11 +74,11 @@ workspace/
    └─ storage/
 ```
 
-The actual code directory is NarraLens, and the old directory entry has been removed. Video and audio library paths now use the new directory while retaining material IDs, fingerprints, subtitle/frame caches, and existing analyses. Historical generation projects no longer receive old-path compatibility. The launcher uses NarraLens; existing environments and the internal package name are retained. See the library migration and old directory removal notes.
+The actual code directory is NarraLens, and the old directory entry has been removed. Video and audio library paths use the new directory while retaining material IDs, fingerprints, subtitle/frame caches, and existing analyses. Historical generation projects no longer receive old-path compatibility. The launcher uses NarraLens and the unified `narralens` environment; the internal package name is retained. See the library migration notes.
 
 In an already prepared workspace, run `start.bat` from the parent directory and open `http://127.0.0.1:8501`. Keep the launch window open. Press Ctrl+C to stop.
 
-A new machine requires the application dependencies, FFmpeg, and the selected model services. The existing alignment deployment notes describe the current machine and need adaptation for other hardware.
+A new machine requires application dependencies, FFmpeg, and the selected model services. The local 2.10.4 setup clones the working ROCm environment and adds application dependencies; the former application and alignment environments are retained for rollback. See the environment merge record; adapt GPU packages and paths to the actual hardware.
 
 Media, projects, and generated outputs are managed locally. Text, vision, audio analysis, and speech services may call external APIs according to the selected configuration. Analysis sends the relevant manuscript, subtitles, images, or full music track to that service.
 
@@ -99,7 +98,7 @@ Long-form narration in the manuscript workflow uses [Qwen/Qwen3-ForcedAligner-0.
 
 - An independent worker loads the model only when unfinished blocks need alignment. Successful timestamp caches are reused; exiting the worker releases GPU resources.
 - Speech blocks longer than five minutes are located and split into alignment windows while retaining the existing speech audio.
-- Prepare a separate PyTorch/Transformers environment and local model weights. The current GPU worker uses BF16 and the cuda device interface; AMD GPUs require a working ROCm environment.
+- Prepare hardware-compatible PyTorch/Transformers and local model weights. Alignment defaults to the interpreter running the application; a local alignment definition in Model Configuration can still explicitly select a separate environment. The GPU worker uses BF16 and the cuda device interface; AMD GPUs require a working ROCm build.
 - Local alignment is enabled by default. Turning it off keeps subtitles and estimates timing from audio duration and text weights, which can differ from actual speech.
 
 Explanatory animations use the configured Node, Remotion, and browser rendering environment. See the animation setup and rollback notes.
@@ -167,6 +166,16 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.4: shared application and local alignment environment
+
+Local alignment defaults to the current Python interpreter, allowing the application and Qwen3 ForcedAligner to share one environment. Explicit Python paths in existing central configurations still take precedence. Alignment remains an independent worker that loads the model on demand and exits when finished; application startup does not load the model.
+
+The local Windows setup uses `.conda/narralens`, retaining the working AMD Torch/torchaudio 2.11.0, torchvision 0.26.0 and ROCm builds, plus Transformers 5.19.0, NumPy 2.4.3, tokenizers 0.23.2 and safetensors 0.8.0. Pillow 10.4.0 supports the existing MoviePy version; setuptools is unified at 80.9.0. Other hardware needs its corresponding GPU packages. Do not replace a working ROCm build with a generic PyPI build.
+
+Models and the MIOpen cache stay at their existing locations. Media libraries, source videos and project data are retained. The old environments remain as rollback copies; ComfyUI and Node/Remotion stay separate. Local environments, model weights, the machine-specific launcher and private configuration are not published in this repository.
+
+Validation covered dependency consistency and imports, AMD BF16 operations, Streamlit startup, offline alignment of a 30.6-second audio fixture and cross-environment cache reuse. User projects were not regenerated, and a complete video regression was not run as part of this environment migration.
 
 ## Version 2.10.3: consistent external film-analysis instructions
 
