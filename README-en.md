@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.4**
+**Manuscript-driven video production · v2.10.5**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.4 provides seven workspaces:
+Version 2.10.5 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -163,9 +163,19 @@ In the video library analysis section, choose **Automatic analysis / External Ag
 
 Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain read-only path references. Each task owns its subtitle snapshot, evidence, proposals and receipts. Imported evidence is copied into library ownership and survives removal of the task directory.
 
-The CLI entry is `python -m app.services.library.agent_tasks`, with `batch`, `submit-batch`, `prefetch`, `worksets` and `instructions`, plus the existing `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume` commands. Updated instructions include the actual Python environment, working directory and commands. CLI submission saves drafts; the WebUI performs library imports.
+External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.5: task-scoped external film-analysis writes
+
+Open the individual task folder as the external agent's writable workspace and use its `task_cli.py`. Execution locks, temporary files, media caches, images and reports stay inside that task. Project code, the Python environment, source media and library registration/index files require read access; the source project does not need write access.
+
+- For an existing task, select **Update task runtime files** in the WebUI. Inputs, signing identity, observations and event catalogues are retained. The host migrates registration to a host-owned file that the CLI reads directly, avoiding SQLite WAL side effects. Old registration is retired so old and new execution locks cannot be used together.
+- Stop processes that loaded the previous tools and reread `TASK.md`. Before launching workers, the coordinator runs the task entry point's `share-evidence` command to republish readable legacy evidence without changing its bytes. New images are published through a sibling file in their destination directory, avoiding private staging-directory permissions. No manual system ACL changes are required.
+- Same-asset exclusion, cross-asset parallelism and revision checks remain. The WebUI blocks new operations and closes internal lock handles before removing a task. Failed removal preserves or restores the task; waiting commands cannot recreate a deleted directory.
+
+Validation covered synthetic-video capture, interrupted migration recovery, concurrent and duplicate submissions, catalogue import, stop/resume and deletion races, plus Streamlit interface checks. A native Windows sandbox restricted to one writable task folder completed capture, submission, grouping and prefetch while outside writes were denied; the host could read agent-generated evidence. No cloud models were called. Whole-manuscript visual-agent tasks are outside this release's migration scope.
 
 ## Version 2.10.4: shared application and local alignment environment
 
@@ -178,6 +188,8 @@ Models and the MIOpen cache stay at their existing locations. Media libraries, s
 Validation covered dependency consistency and imports, AMD BF16 operations, Streamlit startup, offline alignment of a 30.6-second audio fixture and cross-environment cache reuse. User projects were not regenerated, and a complete video regression was not run as part of this environment migration.
 
 ## Version 2.10.3: consistent external film-analysis instructions
+
+This section records that release. Version 2.10.5 supersedes its workspace and entry-point guidance; follow the current TASK.md.
 
 New task `TASK.md` files, instructions copied from the UI, and worker assignments share one set of execution rules. Keep one owner per episode; workers retrieve images, inspect them, submit observations and finish the episode's event catalogue continuously. The coordinator handles assignments and targeted reviews. Use batch receipts for routine progress instead of repeatedly reading the whole task or reshuffling assignments.
 

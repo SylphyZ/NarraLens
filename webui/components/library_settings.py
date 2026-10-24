@@ -749,8 +749,7 @@ def _agent_panel(store, library_id, targets, settings, tr):
             return
         busy = runner.library_busy(library_id)
         st.caption(tr("先创建本地任务，再将指令交给支持看图和本地命令的Agent。准备不调用模型，原视频保留原路径。"))
-        st.caption(tr("外部Agent工作区请选择项目根目录：") + str(agent_tasks.PROJECT) +
-                   tr("。仅切换终端目录不会扩大读写权限；已有任务可复制下方最新说明继续。"))
+        st.caption(tr("外部Agent只需把当前任务文件夹设为可写工作区；代码、原片和库内登记／索引保持只读。"))
         if st.button(tr("创建 Agent 拉片任务"), disabled=busy or not targets, key=prefix + "_create"):
             try:
                 selected = [a["id"] for a in targets]
@@ -770,9 +769,21 @@ def _agent_panel(store, library_id, targets, settings, tr):
             format_func=lambda tid: next(f"{time.strftime('%m-%d %H:%M', time.localtime(r['created']))} · {tid[:8]} · {len(r['assets'])}个素材" for r in tasks if r["id"] == tid))
         if st.button(tr("刷新任务进度"), key=prefix + "_refresh"):
             st.rerun(scope="fragment")
+        if st.button(tr("更新任务运行文件"), disabled=busy, key=prefix + "_upgrade_runtime",
+                     help=tr("暂停工具调用、更新任务入口并保留成果。请先停止旧工作者，更新后重新读取TASK.md再允许继续。")):
+            def upgrade(stop):
+                agent_tasks.prepare_runtime(store, identifier)
+                store.job(library_id, "agent", state="complete", progress=100,
+                          message="任务运行文件已更新；请重新读取TASK.md后允许继续，已有成果保留。")
+            _launch_library_job(store, library_id, "agent", upgrade)
+            st.rerun(scope="app")
         try:
             status = agent_tasks.describe(identifier)
             root = agent_tasks.task_directory(identifier)
+        except agent_tasks.RuntimeUpgradeRequired as exc:
+            st.info(str(exc))
+            st.caption(tr("更新会暂停旧工具调用并保留已有成果。请先停止旧工作者，更新后重新读取TASK.md再允许继续。"))
+            return
         except (ValueError, OSError) as exc:
             st.error(str(exc))
             return

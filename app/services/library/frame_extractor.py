@@ -23,7 +23,7 @@ from pathlib import Path
 
 from app.models.library import FRAME_PROTOCOL, SourceFrameIndex, VideoInspection, media_id, validate_source_frames
 from app.services.library.runner import JobCancelled, check_cancel
-from app.services.library.store import read_json, write_json, stable_hash
+from app.services.library.store import read_json, write_json, stable_hash, _retry_json_io
 
 
 def execute_ffmpeg(command, stop=None, timeout=240, duration=0, progress=None, *, directory=None, stage="ffmpeg", line_callback=None, diagnostic_group="ffmpeg-diagnostics", process_name="FFmpeg", terminate_tree=False, diagnostic=None):
@@ -151,20 +151,24 @@ def sampled_fingerprint(path):
     return digest.hexdigest()
 
 
-def inspect_video(path, stop=None):
+def inspect_video(path, stop=None, *, cache_directory=None):
     path = Path(path).expanduser().resolve(strict=True)
     if not path.is_file():
         raise ValueError("视频路径不是文件。")
     before = path.stat()
     sample = sampled_fingerprint(path)
-    cache_root = Path(__file__).resolve().parents[3] / "storage" / "libraries" / "_media_metadata"
-    cache_root.mkdir(parents=True, exist_ok=True)
+    shared_cache = Path(__file__).resolve().parents[3] / "storage" / "libraries" / "_media_metadata"
+    cache_root = Path(cache_directory) if cache_directory is not None else shared_cache
     cache_key = hashlib.sha256(json.dumps((str(path), before.st_size, before.st_mtime_ns, "source-stream-v3")).encode("utf-8")).hexdigest()
     cache_file = cache_root / (cache_key + ".json")
-    if cache_file.is_file():
-        cached = json.loads(cache_file.read_text(encoding="utf-8"))
-        if cached.get("sample") == sample:
-            return VideoInspection(**cached["media"])
+    for candidate in dict.fromkeys((cache_file, shared_cache / cache_file.name)):
+        try:
+            cached = json.loads(candidate.read_text(encoding="utf-8"))
+            media = VideoInspection(**cached["media"])
+            if cached.get("sample") == sample and (media.path, media.size, media.mtime_ns) == (str(path), before.st_size, before.st_mtime_ns):
+                return media
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     result = subprocess.run([ffprobe_binary(), "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)], capture_output=True, timeout=45)
     if result.returncode != 0:
         raise ValueError(f"无法读取视频信息：{path.name}")
@@ -533,6 +537,17 @@ def _scan_source(asset, actual, engine, root, stop, progress):
     return data, scan_record
 
 
+def publish_image(source, target):
+    """Publish through a sibling file so private staging-directory ACLs are not retained."""
+    target = Path(target)
+    temporary = target.with_name(target.name + "." + uuid4().hex + ".tmp")
+    try:
+        shutil.copyfile(source, temporary)
+        _retry_json_io(lambda: temporary.replace(target))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def extract_frames(asset, index, numbers, output_dir, *, crop=None, stop=None):
     """Batch exact source frames; seek is an optimization, never their identity."""
     from bisect import bisect_left, bisect_right
@@ -614,7 +629,7 @@ def extract_frames(asset, index, numbers, output_dir, *, crop=None, stop=None):
             if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                 raise ValueError("相同图片编号存在不同内容，未覆盖已有证据。")
             if not target.exists():
-                path.replace(target)
+                publish_image(path, target)
             value = {**frame, **index.binding(), "image_id": iid, "crop": list(crop) if crop is not None else None,
                      "file": target.name, "sha256": digest, "fingerprint": asset["fingerprint"]}
             write_json(cache, value)
