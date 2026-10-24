@@ -683,9 +683,9 @@ def _render_task_manager(tr, selected, state):
 
 @st.cache_data(ttl=15, show_spinner=False, max_entries=64)
 def _library_counts(identifiers):
-    """UI totals from current linked observations, not the coarse asset status."""
+    """Saved candidate totals for selection; browsing does not run a full check."""
     store = LibraryStore()
-    rows = list(store.content_status(identifiers).values())
+    rows = list(store.saved_status(identifiers).values())
     return len(rows), sum(r["usable"] > 0 for r in rows), sum(r["incomplete"] for r in rows), sum(r["searchable_contents"] for r in rows)
 
 
@@ -915,10 +915,10 @@ def _render_project_libraries(tr, prefix):
     if st.button(tr("刷新素材统计"), key="refresh_narration_library_counts_" + prefix):
         _library_counts.clear()
     assets, ready, partial, scenes = _library_counts(tuple(selected))
-    st.caption(tr("含可用剧情镜头的素材／已登记素材 · 可检索内容段：") + f"{ready}/{assets} · {scenes}")
+    st.caption(tr("含已保存剧情候选的素材／已登记素材 · 已保存候选内容段：") + f"{ready}/{assets} · {scenes}")
     st.caption(tr("多个视频素材库联合检索，使用各库已有分析与原视频路径。"))
     if ready < assets or partial:
-        st.info(tr("只统计与当前来源一致、目录关联有效的剧情观察；待更新资料和片尾画面不计入可用数。资料有缺项时可回视频素材库继续拉片。"))
+        st.info(tr("此处只读取已保存统计，未执行完整校验。可到视频素材库手动检查或继续拉片；正式检索仍核对所用资料。"))
     remember_widget_values(prefix)
     return selected, bool(scenes)
 

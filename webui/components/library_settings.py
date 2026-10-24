@@ -106,7 +106,7 @@ def _launch_library_job(store, library_id, kind, callback):
 def _job_status(library_id, tr):
     store = LibraryStore()
     key = "library:" + library_id
-    jobs = [job for job in (store.job(library_id, kind) for kind in ("import", "build", "subtitle", "files", "agent")) if job]
+    jobs = [job for job in (store.job(library_id, kind) for kind in ("import", "build", "subtitle", "files", "agent", "check")) if job]
     if not jobs:
         return
     job = max(jobs, key=lambda item: item["updated"])
@@ -245,7 +245,7 @@ def _work_panel(store, library_id, tr):
         fields = {"title": "", "adaptation": "动画", "season": "", "notes": "", "characters": [], "episode_map": {}}
         draft = st.session_state.setdefault(prefix + "_draft", {k: work.get(k, v) for k, v in fields.items()})
         epoch = str(st.session_state.get(prefix + "_epoch", 0))
-        ranges = {r["id"]: r for r in store.records(library_id, include_stale=True)}
+        ranges = {r["id"]: r for r in store.records(library_id, include_stale=True, validate=False)}
         with st.form(prefix + "_form_" + epoch):
             title = st.text_input(tr("作品名称"), value=draft["title"], disabled=busy)
             adaptation = st.text_input(tr("改编版本"), value=draft["adaptation"], disabled=busy,
@@ -424,8 +424,9 @@ def _content_panel(store, library_id, tr):
     with remembered_expander(tr("内容与镜头浏览"), key=prefix + "_open") as panel:
         if not panel.open:
             return
-        ranges = {r["id"]: r for r in store.records(library_id, include_stale=True)}
-        events = store.records(library_id, "contents", include_stale=True)
+        ranges = {r["id"]: r for r in store.records(library_id, include_stale=True, validate=False)}
+        events = store.records(library_id, "contents", include_stale=True, validate=False)
+        st.caption(tr("浏览已保存记录，不自动校验；需要核对来源与目录关系时，请在“维护与高级选项”手动检查。"))
         if not ranges and not events:
             st.info(tr("目前只有素材登记，请打开“拉片任务”建立观察和内容目录。"))
             return
@@ -435,14 +436,12 @@ def _content_panel(store, library_id, tr):
             st.info(tr("观察已保存，内容目录尚未完成；可先查看或更正观察，再在拉片任务中继续。"))
         episodes = sorted({r["episode"] for r in [*ranges.values(), *events]})
         episode = st.selectbox(tr("按集筛选"), [None, *episodes], format_func=lambda v: tr("全部") if v is None else f"第{v}集", key=prefix + "_episode")
-        status = st.selectbox(tr("按状态筛选"), ["全部", "待更新", "待确认", *_KINDS.values()], key=prefix + "_status")
+        status = st.selectbox(tr("按状态筛选"), ["全部", "待确认", *_KINDS.values()], key=prefix + "_status")
         query = st.text_input(tr("搜索事件、人物、时期或地点"), key=prefix + "_search").strip().casefold()
         visible = []
         for row in list(ranges.values()) if view == "ranges" else events:
             related = [row] if view == "ranges" else [ranges[rid] for rid in row["range_ids"] if rid in ranges]
             if episode is not None and row["episode"] != episode:
-                continue
-            if status == "待更新" and not row.get("stale_reasons"):
                 continue
             if status == "待确认" and not any(r.get("analysis_state") != "ready" and not r.get("stale_reasons") for r in related):
                 continue
@@ -630,7 +629,7 @@ def _check_files(store, library_id, assets, stop):
 
 
 @st.fragment
-def _registered_panel(store, library_id, tr):
+def _registered_panel(store, library_id, tr, status=None):
     with remembered_expander(tr("已登记素材"), key="library_assets_" + library_id, default=True) as panel:
         if not panel.open:
             return
@@ -639,7 +638,7 @@ def _registered_panel(store, library_id, tr):
             st.info(tr("尚未登记素材，请打开下方导入本地目录。"))
             return
         busy = runner.library_busy(library_id)
-        status = store.content_status(library_id)
+        status = status if status is not None else store.saved_status(library_id)
         with store.database(library_id) as db:
             checks = {row[0][11:]: json.loads(row[1]) for row in db.execute(
                 "SELECT key,value FROM analysis_cache WHERE key LIKE 'file-check:%'")}
@@ -648,7 +647,7 @@ def _registered_panel(store, library_id, tr):
             check = checks.get(asset["id"], {})
             if check.get("identity") != [asset["path"], asset["fingerprint"], asset["size"], asset["mtime_ns"]]:
                 check = {}
-            state = status[(library_id, asset["id"])]
+            state = status.get((library_id, asset["id"]), {"label": "统计待刷新", "observations": 0, "contents": 0, "usable": 0})
             rows.append({"selected": False, "id": asset["id"], "episode": asset["episode"], "video": Path(asset["path"]).name,
                 "duration": round(asset["duration"], 1), "subtitle": Path(asset["subtitle_path"]).name if asset.get("subtitle_path") else "",
                 "status": tr(state["label"]), "observations": state["observations"], "contents": state["contents"], "usable": state["usable"],
@@ -660,10 +659,10 @@ def _registered_panel(store, library_id, tr):
             key="registered_assets_" + library_id + "_" + stable_hash([(a["id"], a["active_subtitle"]) for a in assets])[:12],
             column_config={"id": None, "selected": st.column_config.CheckboxColumn(tr("选择"), required=True), "episode": tr("集数"),
                 "video": tr("视频"), "duration": tr("时长（秒）"), "subtitle": tr("字幕"), "status": tr("分析状态"),
-                "observations": tr("当前观察"), "contents": tr("有效内容段"), "usable": tr("可用剧情范围"),
+                "observations": tr("已保存观察"), "contents": tr("已保存内容段"), "usable": tr("已登记剧情候选"),
                 "available": tr("文件状态"), "checked": tr("检查时间"), "reason": tr("文件检查说明")})
         selected = [row["id"] for row in table.to_dict("records") if row["selected"]]
-        st.caption(tr("页面刷新不会访问原视频。文件状态来自上次显式检查，和分析状态分别显示；更换路径后需重新检查。"))
+        st.caption(tr("页面只读已保存统计，不访问原视频或执行完整校验。文件状态来自上次显式检查；更换路径后需重新检查。"))
         if st.button(tr("检查所选原视频" if selected else "检查全部原视频"), disabled=busy, key="check_files_" + library_id):
             try:
                 snapshot = copy.deepcopy([a for a in assets if not selected or a["id"] in selected])
@@ -767,8 +766,15 @@ def _agent_panel(store, library_id, targets, settings, tr):
             st.session_state.pop(prefix + "_task", None)
         identifier = st.selectbox(tr("选择 Agent 任务"), identifiers, key=prefix + "_task",
             format_func=lambda tid: next(f"{time.strftime('%m-%d %H:%M', time.localtime(r['created']))} · {tid[:8]} · {len(r['assets'])}个素材" for r in tasks if r["id"] == tid))
-        if st.button(tr("刷新任务进度"), key=prefix + "_refresh"):
-            st.rerun(scope="fragment")
+        if st.button(tr("刷新任务进度"), disabled=busy, key=prefix + "_refresh", help=tr("后台重建已保存数量，不核验图片或原视频。")):
+            try:
+                def refresh(stop):
+                    agent_tasks.refresh_progress(identifier, stop)
+                    store.job(library_id, "agent", state="complete", progress=100, message="进度统计已刷新；未执行完整检查。")
+                _launch_library_job(store, library_id, "agent", refresh)
+                st.rerun(scope="app")
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
         if st.button(tr("更新任务运行文件"), disabled=busy, key=prefix + "_upgrade_runtime",
                      help=tr("暂停工具调用、更新任务入口并保留成果。请先停止旧工作者，更新后重新读取TASK.md再允许继续。")):
             def upgrade(stop):
@@ -789,11 +795,14 @@ def _agent_panel(store, library_id, targets, settings, tr):
             return
         state_labels = {"preparing": "准备尚未完成", "partial": "已准备部分素材", "ready": "本地任务已准备"}
         st.write(tr(state_labels.get(status["state"], status["state"])))
-        st.caption(f"已收到观察草稿 {sum(r['kind']=='observation' for r in status['saved'])} 项 · 内容分组 {sum(r['kind']=='contents' for r in status['saved'])} 份")
-        st.caption(tr("尚无合格观察的范围（含待复核）：") + str(status["pending_observations"]) +
-                   f" · {tr('其中不确定观察')} {status.get('review_observations', 0)}")
+        if status["progress_ready"]:
+            st.caption(f"已收到观察草稿 {status['saved_observations']} 项 · 内容分组 {status['saved_contents']} 份")
+            st.caption(tr("据已保存统计待补的观察（含待复核）：") + str(status["pending_observations"]) +
+                       f" · {tr('其中不确定观察')} {status['review_observations']}")
+        if not status["progress_current"]:
+            st.info(tr("进度摘要缺失或已过期，请点击“刷新任务进度”；已有结果保留，当前数量不代表最新进度。"))
         st.caption(tr("最近收到结果：") + (time.strftime("%m-%d %H:%M:%S", time.localtime(status["last_received"])) if status["last_received"] else tr("尚未收到")))
-        st.caption(tr("这里显示已落盘成果；外部Agent是否正在运行，请在其应用中查看。"))
+        st.caption(tr("这里显示已保存统计，未执行完整校验；外部Agent是否正在运行，请在其应用中查看。"))
         batch_options = _agent_batch_options(store, library_id, identifier, status, prefix, busy, tr)
         st.caption(tr("任务指令（点击代码框右上角复制）"))
         st.code(agent_tasks.instructions(identifier, **batch_options), language=None)
@@ -813,13 +822,15 @@ def _agent_panel(store, library_id, targets, settings, tr):
                 st.rerun(scope="app")
             except (ValueError, OSError) as exc:
                 st.error(str(exc))
+        scope = st.multiselect(tr("检查／导入范围（留空为本任务全部素材）"), list(status["assets"]),
+            format_func=lambda aid: f"第{status['assets'][aid]['episode']}集 · {aid[:8]}", key=prefix + "_scope_" + identifier, disabled=busy)
         left, right = st.columns(2)
-        check = left.button(tr("检查结果"), disabled=busy or status["state"] == "preparing", key=prefix + "_check")
-        commit = right.button(tr("导入合格结果"), disabled=busy or not status["saved"] or status["state"] == "preparing", key=prefix + "_import")
+        check = left.button(tr("完整检查"), disabled=busy or status["state"] == "preparing", key=prefix + "_check")
+        commit = right.button(tr("检查并导入合格结果"), disabled=busy or status["state"] == "preparing", key=prefix + "_import")
         if check or commit:
             try:
                 def process(stop):
-                    result = agent_tasks.check_task(store, identifier, stop, commit=commit)
+                    result = agent_tasks.check_task(store, identifier, stop, commit=commit, asset_ids=scope or None)
                     store.job(library_id, "agent", state="partial" if result["pending"] else "complete", progress=100,
                         message=f"Agent结果检查完成：可导入{result['ready']}、已存在{result['existing']}；镜头待补{result['pending_observations']}、"
                                 f"分组待补{result['pending_content_assets']}集、输入冲突{result['input_conflicts']}项；本次写入{result['imported']}项。")
@@ -827,15 +838,24 @@ def _agent_panel(store, library_id, targets, settings, tr):
                 st.rerun(scope="app")
             except (ValueError, OSError) as exc:
                 st.error(str(exc))
-        report = read_json(root / "reports/last-check.json", default={})
+        report = read_json(root / "reports/check-summary.json", default={})
         if report:
             st.caption(tr("上次检查：") + time.strftime("%m-%d %H:%M:%S", time.localtime(report["checked_at"])))
-            labels = {"ready_to_import": "合格／可导入", "already_imported": "已存在", "pending": "待补", "conflict": "输入冲突"}
-            st.dataframe([{tr("素材"): r.get("asset_id", ""), tr("镜头"): r.get("range_id", r.get("key", "")),
-                           tr("检查结果"): tr(labels.get(r["state"], r["state"])), tr("说明"): r["reason"]} for r in report["rows"][:200]],
-                         hide_index=True, width="stretch")
-            st.download_button(tr("下载完整检查／待补报告"), json.dumps(report, ensure_ascii=False, indent=2),
-                               file_name="agent-analysis-report.json", mime="application/json", key=prefix + "_download_report")
+            st.caption(f"检查范围 {len(report.get('asset_ids', []))} 个素材 · 可导入 {report['ready']} · 已存在 {report['existing']} · 待处理 {report['pending']}")
+            if any(report.get(k) != status[k] for k in ("results_stamp", "manifest_hash")):
+                st.info(tr("检查后任务有更新，上次报告仅供参考，可按需重新检查。"))
+        with remembered_expander(tr("上次完整检查报告"), key=prefix + "_report_open") as detail:
+            if detail.open:
+                report = read_json(root / "reports/last-check.json", default={})
+                if report:
+                    labels = {"ready_to_import": "合格／可导入", "already_imported": "已存在", "pending": "待补", "conflict": "输入冲突"}
+                    st.dataframe([{tr("素材"): r.get("asset_id", ""), tr("镜头"): r.get("range_id", r.get("key", "")),
+                                   tr("检查结果"): tr(labels.get(r["state"], r["state"])), tr("说明"): r["reason"]} for r in report["rows"][:200]],
+                                 hide_index=True, width="stretch")
+                    st.download_button(tr("下载完整检查／待补报告"), json.dumps(report, ensure_ascii=False, indent=2),
+                                       file_name="agent-analysis-report.json", mime="application/json", key=prefix + "_download_report")
+                else:
+                    st.caption(tr("尚未运行完整检查。"))
         if status["issues"]:
             with remembered_expander(tr("任务待处理问题"), key=prefix + "_issues") as issues:
                 if issues.open:
@@ -942,6 +962,33 @@ def _maintenance_panel(store, library_id, tr):
         if not panel.open:
             return
         busy = runner.library_busy(library_id)
+        st.subheader(tr("手动检查库内资料"))
+        assets = {a["id"]: a for a in store.assets(library_id)}
+        selected = st.multiselect(tr("检查素材（留空为全库）"), list(assets), key="library_check_assets_" + library_id,
+            format_func=lambda aid: f"第{assets[aid]['episode']}集 · {Path(assets[aid]['path']).name}", disabled=busy)
+        st.caption(tr("核对源帧索引、观察与内容目录的关联；页面浏览不执行此检查，直接修改外部文件后请主动检查。"))
+        if st.button(tr("完整检查库内资料"), disabled=busy or not assets, key="library_check_" + library_id):
+            def check(stop):
+                result = store.check_contents(library_id, selected or list(assets), stop)
+                store.job(library_id, "check", state="complete", progress=100,
+                    message=f"库内资料检查完成：{len(result['asset_ids'])}个素材，{result['incomplete']}个待处理；见维护与高级选项。")
+            try:
+                _launch_library_job(store, library_id, "check", check)
+                st.rerun(scope="app")
+            except (OSError, ValueError) as exc:
+                st.error(str(exc))
+        summary = store.cache_get(library_id, "manual-content-check-summary") or {}
+        if summary.get("checked_at"):
+            st.caption(tr("上次检查：") + time.strftime("%m-%d %H:%M:%S", time.localtime(summary["checked_at"])) +
+                       f" · {len(summary['asset_ids'])}个素材 · {summary['incomplete']}个待处理")
+            if summary.get("stale"):
+                st.info(tr("检查后资料有更新，上次报告仅供参考。"))
+            with remembered_expander(tr("库内资料检查详情"), key="library_check_details_" + library_id) as details:
+                if details.open:
+                    report = store.cache_get(library_id, "manual-content-check") or {}
+                    st.dataframe(report.get("rows", []), hide_index=True, width="stretch")
+                    st.download_button(tr("下载库内资料检查报告"), json.dumps(report, ensure_ascii=False, indent=2),
+                                       file_name="library-check.json", mime="application/json", key="library_check_download_" + library_id)
         st.subheader(tr("字幕资料校验与恢复"))
         st.caption(tr("本地校验 ASS 中文正文与来源身份；恢复后只更新当前字幕登记，受影响观察和内容段需要重新拉片。原字幕与旧结果保留，不调用模型。"))
         report_path = store.directory(library_id) / "subtitle-audit.json"
@@ -1018,16 +1065,16 @@ def render_library_panel(tr):
         return
     if notice := st.session_state.pop("library_notice_" + library_id, None):
         st.success(notice)
-    counts = store.content_status(library_id)
+    counts = store.saved_status(library_id)
     columns = st.columns(4)
-    for column, label, number in zip(columns, ["已登记素材", "当前镜头观察", "有效内容段", "待处理素材"],
+    for column, label, number in zip(columns, ["已登记素材", "已保存观察", "已保存内容段", "待处理素材"],
                                     [len(counts), sum(s["observations"] for s in counts.values()),
                                      sum(s["contents"] for s in counts.values()), sum(s["incomplete"] for s in counts.values())]):
         column.metric(tr(label), number)
     if busy:
         st.info(tr("当前库或关联生成任务正在运行，可查看已保存资料；修改操作在任务结束后恢复。"))
     _work_panel(store, library_id, tr)
-    _registered_panel(store, library_id, tr)
+    _registered_panel(store, library_id, tr, counts)
     _import_panel(store, library_id, tr)
     _build_panel(store, library_id, tr)
     _job_status(library_id, tr)

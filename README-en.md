@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.5**
+**Manuscript-driven video production · v2.10.6**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.5 provides seven workspaces:
+Version 2.10.6 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -163,9 +163,19 @@ In the video library analysis section, choose **Automatic analysis / External Ag
 
 Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain read-only path references. Each task owns its subtitle snapshot, evidence, proposals and receipts. Imported evidence is copied into library ownership and survives removal of the task directory.
 
-External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
+External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `refresh-progress`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.6: lightweight browsing and manual checks
+
+Workspace switches, library browsing and page reruns read saved counts and task progress summaries instead of inspecting every receipt, image and source-frame index. These numbers describe saved records, not verified validity. Project library selection uses the same lightweight statistics.
+
+- **Refresh task progress** rebuilds counts in the background without verifying images or source videos. New tasks and submissions maintain the summary; missing or outdated summaries request a refresh while retaining results. The CLI adds `refresh-progress`; `describe --full` explicitly includes the saved-entry list.
+- External tasks offer **Full check** and **Check and import accepted results**, optionally scoped to selected assets. **Maintenance and advanced options** provides a manual library-data check. Checks run in the background; reports retain their time and scope, with details loaded on demand.
+- New task results or library edits mark historical reports outdated. Direct changes to external files require a manual check. Submission, import, deletion and production retain their required boundary, revision and concurrency safeguards.
+
+On the local first-season dataset of 6,722 observations, task status reads fell from about 29.9 seconds to 0.027 seconds; saved library counts took about 0.28 seconds. A Streamlit interface test rendered the library after switching back in about 0.40 seconds (backend rendering, excluding browser painting). Hardware and datasets affect timings. No re-analysis or model calls are required.
 
 ## Version 2.10.5: task-scoped external film-analysis writes
 

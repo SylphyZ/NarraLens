@@ -259,6 +259,7 @@ def prepare_runtime(store, identifier):
         if not isinstance(registry, dict) or registry.get("manifest_hash") != stable_hash(manifest) or not re.fullmatch(r"[0-9a-f]{64}", registry.get("secret", "")):
             raise ValueError("原任务登记不完整，不能自动迁移；请保留已有成果。")
         _write_runtime(root, manifest)
+        _rebuild_progress(root, manifest)
         if current:
             pending = read_json(_owned(root, ".runtime/evidence-sharing.json"), default={}).get("pending", [])
             if pending:
@@ -480,7 +481,7 @@ def _batch_instructions(manifest, root, asset_ids=None, **options):
             "只有首次缺少分工时才调用worksets或使用WebUI分工清单；不支持子Agent时明确说明并顺序处理，不声称已经并行。")
     return f'''# 批量拉片指令 · {manifest['id']}
 
-说明修订：2.10.5。任务协议：{PROTOCOL}。沿用本任务已有成果，不重建任务或重新登记素材。
+说明修订：2.10.6。任务协议：{PROTOCOL}。沿用本任务已有成果，不重建任务或重新登记素材。
 任务目录：{root}。只处理本清单素材ID：{', '.join(selected) if selected else '先在WebUI完成本地准备'}。
 
 ## 工作区与权限
@@ -503,6 +504,7 @@ def _batch_instructions(manifest, root, asset_ids=None, **options):
 
 开始或恢复时由主Agent调用一次describe，确认已准备素材、已有成果及待复核项，再分发本集必要资料；只领取已准备素材，工作者复用交接状态，不各自反复读取全任务。
 日常依据本批回执、next_offset和局部查询推进；每集结束、异常无法局部判断或最终汇总时再核对describe，不每批全量查询或反复轮询工作者。
+describe只读已保存的进度摘要，不是完整检查；progress_current为false时调用refresh-progress重建统计一次。详细已保存条目可用describe --full。正式入库检查由WebUI手动触发。
 以下是PowerShell命令参考；batch示例中的素材ID和offset须替换为当前负责的素材及已保存游标，不能每批重置为0。
 
 ```powershell
@@ -665,6 +667,7 @@ def prepare_task(store, identifier, stop=None):
         manifest["preparation_issues"] = failures
         write_json(_owned(root, "manifest.json"), manifest)
         _register(manifest, registry)
+        _rebuild_progress(root, manifest, stop)
         store.job(manifest["library_id"], "agent", state=manifest["state"] if failures else "complete", progress=100,
                   message=f"Agent任务 {identifier[:8]} 准备完成；{len(failures)}项待处理。打开外部Agent任务面板复制指令。")
 
@@ -764,10 +767,14 @@ def submit(identifier, filename):
         path = _owned(root, filename)
         if not path.resolve().is_relative_to(_owned(root, "proposals").resolve()):
             raise ValueError("请把待提交JSON放入本任务proposals目录。")
-        return _submit_proposal(root, manifest, registry, read_json(path))
+        progress = _read_progress(root, manifest)
+        result = _submit_proposal(root, manifest, registry, read_json(path), progress=progress)
+        if warning := _save_progress(root, manifest, progress):
+            result["progress_warning"] = warning
+        return result
 
 
-def _submit_proposal(root, manifest, registry, proposal, packet=None):
+def _submit_proposal(root, manifest, registry, proposal, packet=None, progress=None):
     """The only observation/content commit path; caller holds the task lock."""
     check_cancel(_Stop(root))
     if not isinstance(proposal, dict) or proposal.get("input_hash") != manifest["input_hash"]:
@@ -799,6 +806,7 @@ def _submit_proposal(root, manifest, registry, proposal, packet=None):
     proposal_hash = stable_hash(proposal)
     write_json(_owned(root, "proposals/submitted-" + proposal_hash + ".json"), proposal)
     if previous and previous.get("proposal_hash") == proposal_hash:
+        _record_progress(progress, head_key, heads[head_key], previous)
         return {"state": "already_saved", "receipt_id": heads[head_key],
                 "needs_review": previous["kind"] == "observation" and previous["value"].get("content_kind") == "unknown"}
     if proposal.get("supersedes", "") != heads.get(head_key, ""):
@@ -825,32 +833,109 @@ def _submit_proposal(root, manifest, registry, proposal, packet=None):
     receipt_id = _save_receipt(root, registry, value)
     _write_signed(_owned(root, "results/" + head_key.replace(":", "-", 1) + ".json"),
                   {"key": head_key, "receipt_id": receipt_id}, registry)
+    _record_progress(progress, head_key, receipt_id, value)
     return {"state": "saved_draft", "receipt_id": receipt_id, "needs_review": needs_review,
             "message": "结构校验通过，尚未导入素材库；语义准确性仍需核对。"}
 
 
-def describe(identifier):
-    root, manifest, registry = _load(identifier, ready=False)
-    heads = _heads(root, registry)
-    saved, errors, latest = [], [], 0
-    for key, head in heads.items():
+def _read_progress(root, manifest):
+    try:
+        data = read_json(_owned(root, ".runtime/progress.json"), default=None)
+        if not isinstance(data, dict) or data.get("schema") != 1 or data.get("input_hash") != manifest["input_hash"]:
+            return None
+        if not isinstance(data.get("saved"), dict) or not isinstance(data.get("existing"), dict):
+            return None
+        if any(not isinstance(r, dict) or r.get("kind") not in {"observation", "contents"} or
+               r.get("asset_id") not in manifest["assets"] or r.get("key") != key or ":" not in key or
+               not isinstance(r.get("needs_review"), bool) or not isinstance(r.get("receipt_id"), str)
+               for key, r in data["saved"].items()):
+            return None
+        if any(not isinstance(r, dict) or any(not isinstance(r.get(k), list) or
+               any(not isinstance(v, str) for v in r[k]) for k in ("ready", "review"))
+               for r in data["existing"].values()) or not isinstance(data.get("issues"), list):
+            return None
+        if any(not isinstance(data.get(k, 0), (int, float)) or not 0 <= data.get(k, 0) < float("inf")
+               for k in ("last_received", "updated_at", "results_stamp")):
+            return None
+        data["_current"] = (data.get("results_stamp") == (root / "results").stat().st_mtime_ns and
+                            data.get("manifest_hash") == stable_hash(manifest))
+        return data
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _save_progress(root, manifest, data):
+    if data is None:
+        return "结果已保存，进度摘要尚未建立；刷新进度可重建统计。"
+    try:
+        if data.get("_current"):
+            data.update(results_stamp=(root / "results").stat().st_mtime_ns, manifest_hash=stable_hash(manifest))
+        data["updated_at"] = time.time()
+        write_json(_owned(root, ".runtime/progress.json"), {k:v for k,v in data.items() if k != "_current"}, compact=True)
+    except (OSError, ValueError, TypeError):
+        return "结果已保存，进度摘要更新失败；刷新进度可重建统计。"
+    return "" if data.get("_current") else "结果已保存，摘要落后于结果目录；请刷新进度。"
+
+
+def _record_progress(data, key, receipt_id, value, received=None):
+    if data is None or data["saved"].get(key, {}).get("receipt_id") == receipt_id:
+        return
+    data["saved"][key] = {"key": key, "receipt_id": receipt_id, "kind": value["kind"], "asset_id": value["asset_id"],
+                          "needs_review": value["kind"] == "observation" and value["value"].get("content_kind") == "unknown"}
+    data["last_received"] = max(data.get("last_received", 0), received if received is not None else time.time())
+
+
+def _rebuild_progress(root, manifest, stop=None):
+    """Read saved fields for statistics only; never certify evidence or source freshness."""
+    data = {"schema": 1, "input_hash": manifest["input_hash"], "saved": {}, "existing": {}, "issues": [], "_current": True}
+    for aid, info in manifest["assets"].items():
+        current = {"ready": [], "review": []}
+        if info.get("existing_ids"):
+            packet = read_json(_owned(root, "inputs/" + aid + ".json"))
+            for rid in info["existing_ids"]:
+                current["ready" if packet.get("existing", {}).get(rid, {}).get("analysis_state") == "ready" else "review"].append(rid)
+        data["existing"][aid] = current
+    heads, receipts = _owned(root, "results"), _owned(root, "receipts")
+    for path in heads.glob("*.json"):
+        check_cancel(stop)
         try:
-            value = _receipt(root, registry, head)
-            expected = "range:"+value["range_id"] if value["kind"] == "observation" else "contents:"+value["asset_id"]
-            if key != expected:
-                raise ValueError("草稿头与回执归属不符。")
-            saved.append({"key": key, "receipt_id": head, "kind": value["kind"], "asset_id": value["asset_id"],
-                          "needs_review": value["kind"] == "observation" and value["value"].get("content_kind") == "unknown"})
-            latest = max(latest, _owned(root, "receipts/" + head + ".json").stat().st_mtime)
-        except (ValueError, OSError, KeyError) as exc:
-            errors.append({"key": key, "reason": str(exc)})
+            if path.is_symlink() or path.is_junction():
+                raise ValueError("统计跳过链接文件")
+            head = read_json(path)["value"]
+            rid, key = head["receipt_id"], head["key"]
+            if not re.fullmatch(r"[0-9a-f]{64}", rid) or path.stem != key.replace(":", "-", 1):
+                raise ValueError("统计记录编号无效")
+            receipt = receipts / (rid + ".json")
+            if receipt.is_symlink() or receipt.is_junction():
+                raise ValueError("统计跳过链接回执")
+            value = read_json(receipt)["value"]
+            expected = "range:" + value["range_id"] if value["kind"] == "observation" else "contents:" + value["asset_id"]
+            if key != expected or value["asset_id"] not in manifest["assets"] or value["kind"] not in {"observation", "contents"}:
+                raise ValueError("统计记录归属无效")
+            _record_progress(data, key, rid, value, receipt.stat().st_mtime)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            if len(data["issues"]) < 20:
+                data["issues"].append({"key": path.stem, "reason": str(exc)})
+    if warning := _save_progress(root, manifest, data):
+        raise ValueError(warning)
+    return data
+
+
+def refresh_progress(identifier, stop=None):
+    with _task_lock(identifier, stop=stop):
+        root, manifest, _ = _load(identifier, ready=False)
+        _rebuild_progress(root, manifest, stop)
+    return describe(identifier)
+
+
+def describe(identifier, *, full=False):
+    root, manifest, _ = _load(identifier, ready=False)
+    progress = _read_progress(root, manifest)
+    saved = list(progress["saved"].values()) if progress else []
     available, review = {}, {}
     for aid, info in manifest["assets"].items():
-        available[aid], review[aid] = set(), set()
-        if info.get("existing_ids"):
-            packet = _packet(root, manifest, aid)
-            for rid in info["existing_ids"]:
-                (available[aid] if packet["existing"].get(rid, {}).get("analysis_state") == "ready" else review[aid]).add(rid)
+        initial = progress["existing"].get(aid, {}) if progress else {}
+        available[aid], review[aid] = set(initial.get("ready", [])), set(initial.get("review", []))
     for row in saved:
         if row["kind"] == "observation":
             aid, rid = row["asset_id"], row["key"].split(":", 1)[1]
@@ -862,16 +947,22 @@ def describe(identifier):
             "directory": str(root), "instructions": str(root / "TASK.md"),
             "assets": {aid: {k: v for k, v in info.items() if k not in {"range_ids", "existing_ids"}} for aid, info in manifest["assets"].items()},
             "work": {k: manifest["work"].get(k) for k in ("title", "adaptation", "season", "characters")},
-            "saved": saved, "issues": errors + [{"reason": e} for e in manifest.get("preparation_issues", [])],
-            "last_received": latest, "stop_requested": _Stop(root).is_set(),
-            "pending_observations": sum(max(0, a.get("ranges", 0)-len(available[aid])) for aid, a in manifest["assets"].items()),
-            "review_observations": sum(len(rows) for rows in review.values()),
+            **({"saved": saved} if full else {}),
+            "saved_observations": sum(r["kind"] == "observation" for r in saved) if progress else None,
+            "saved_contents": sum(r["kind"] == "contents" for r in saved) if progress else None,
+            "progress_ready": progress is not None, "progress_current": bool(progress and progress["_current"]),
+            "progress_updated": progress.get("updated_at", 0) if progress else 0,
+            "results_stamp": (root / "results").stat().st_mtime_ns, "manifest_hash": stable_hash(manifest),
+            "issues": (progress.get("issues", []) if progress else []) + [{"reason": e} for e in manifest.get("preparation_issues", [])],
+            "last_received": progress.get("last_received", 0) if progress else 0, "stop_requested": _Stop(root).is_set(),
+            "pending_observations": sum(max(0, a.get("ranges", 0)-len(available[aid])) for aid, a in manifest["assets"].items()) if progress else None,
+            "review_observations": sum(len(rows) for rows in review.values()) if progress else None,
             "capabilities": {"batch": True, "submit_batch": True, "prefetch": True, "worksets": True, "defaults": BATCH_DEFAULTS},
             "instructions_update": _batch_instructions(manifest, root),
             "contents_template": {"kind": "contents", "input_hash": manifest["input_hash"], "asset_id": "选择素材ID",
                 "range_ids": [], "supersedes": "首次为空，之后填该素材contents的回执ID", "producer": "",
                 "value": {"segments": [{"title": "事件名称", "summary": "基于已保存观察的概括", "range_ids": [], "continues_from": ""}]}},
-            "message": "仅表示已收到草稿，不能据此判断外部Agent是否仍在运行。"}
+            "message": "仅为已保存记录的进度统计，未执行完整校验；不能据此判断外部Agent是否仍在运行。"}
 
 
 def references(identifier, person=""):
@@ -1150,6 +1241,7 @@ def submit_batch(identifier, filename):
         if current != manifest or current_registry != registry or _sha(_owned(root, "inputs/"+work["asset_id"]+".json")) != work["packet_hash"]:
             raise ValueError("提交期间输入改变，请重新领取批次。")
         write_json(_owned(root, "proposals/submitted-batch-"+stable_hash(proposal)+".json"), proposal)
+        progress = _read_progress(root, manifest)
         for row in rows:
             if _Stop(root).is_set():
                 results.append({"state": "stopped", "reason": "后续条目尚未提交，成功项已保留。"})
@@ -1160,13 +1252,15 @@ def submit_batch(identifier, filename):
                     raise ValueError("entry_id未知或在本次提交中重复。")
                 entry = work["entries"][eid]
                 value = _expand_batch_value(row.get("value"), eid, entry)
-                result = _submit_proposal(root, manifest, registry, {**entry["template"], "producer": producer, "value": value}, packet)
+                result = _submit_proposal(root, manifest, registry, {**entry["template"], "producer": producer, "value": value}, packet, progress)
                 state = "needs_review" if result.get("needs_review") else ("saved" if result["state"] == "saved_draft" else result["state"])
                 results.append({"entry_id": eid, "range_id": entry["template"]["range_id"], **result, "state": state})
             except (ValueError, OSError, TypeError, KeyError) as exc:
                 results.append({"entry_id": eid, "state": "conflict" if isinstance(exc, DraftConflict) else "invalid", "reason": str(exc)})
         result = {"batch_id": bid, "items": results, "counts": dict(Counter(r["state"] for r in results)),
                   "seconds": round(time.monotonic()-started, 3), "checked_at": time.time()}
+        if warning := _save_progress(root, manifest, progress):
+            result["progress_warning"] = warning
         write_json(_owned(root, "reports/last-submit-batch.json"), result)
     return result
 
@@ -1242,21 +1336,26 @@ def prefetch(identifier, asset_ids=None, offset=0, batches=2, workers=2, stop=No
     return {"task_id": identifier, "assets": results, "workers": min(workers, len(selected)), "model_calls": 0}
 
 
-def _import_plan(store, root, manifest, registry, stop=None):
+def _import_plan(store, root, manifest, registry, stop=None, asset_ids=None):
     from app.services.library.indexer import observation_key
     from app.services.library.frame_extractor import source_index
     from app.services.library.knowledge import episode_context
-    selected = list(manifest["assets"])
+    selected = list(dict.fromkeys(asset_ids if asset_ids is not None else manifest["assets"]))
+    if not selected or any(aid not in manifest["assets"] for aid in selected):
+        raise ValueError("请选择本任务内的素材检查。")
     snapshot = store.analysis_snapshot(manifest["library_id"], selected)
     baseline = _read_signed(_owned(root, "inputs/baseline.json"), registry)
-    heads = _heads(root, registry)
+    keys = [key for aid in selected for key in
+            ["contents:" + aid, *("range:" + rid for rid in manifest["assets"][aid].get("range_ids", []))]]
+    heads = _heads(root, registry, keys)
     receipt_key = "agent-import:" + manifest["id"]
     receipt = copy.deepcopy(snapshot["cache"].get(receipt_key, {"ranges": {}, "contents": {}, "heads": {}}))
     patches, artifacts, report = {}, [], []
     report.extend({"key": key, "state": "pending", "reason": "此项草稿头记录损坏，保留回执，其他项可继续。"}
                   for key, head in heads.items() if head is None)
     current_work = snapshot["cache"].get("work", {})
-    for aid, info in manifest["assets"].items():
+    for aid in selected:
+        info = manifest["assets"][aid]
         check_cancel(stop)
         try:
             packet = _packet(root, manifest, aid)
@@ -1361,7 +1460,8 @@ def _import_plan(store, root, manifest, registry, stop=None):
             report.append({"asset_id": aid, "state": "pending", "reason": f"内容目录尚缺{len(set(prepared)-linked)}个范围；观察可先导入，再累计补充分组。"})
         if patch["ranges"] or patch["contents"]:
             patches[aid] = patch
-    result = {"task_id": manifest["id"], "checked_at": time.time(), "rows": report,
+    result = {"task_id": manifest["id"], "checked_at": time.time(), "asset_ids": selected, "rows": report,
+              "results_stamp": (root / "results").stat().st_mtime_ns, "manifest_hash": stable_hash(manifest),
               "ready": sum(r["state"] == "ready_to_import" for r in report),
               "existing": sum(r["state"] == "already_imported" for r in report),
               "pending": sum(r["state"] in {"pending", "conflict"} for r in report)}
@@ -1371,11 +1471,11 @@ def _import_plan(store, root, manifest, registry, stop=None):
     return result, snapshot, patches, artifacts, receipt
 
 
-def check_task(store, identifier, stop=None, *, commit=False):
+def check_task(store, identifier, stop=None, *, commit=False, asset_ids=None):
     root, manifest, registry = _load(identifier)
     with library_operation(manifest["library_id"]), _maintenance(identifier, manifest):
         root, manifest, registry = _load(identifier)
-        result, snapshot, patches, artifacts, receipt = _import_plan(store, root, manifest, registry, stop)
+        result, snapshot, patches, artifacts, receipt = _import_plan(store, root, manifest, registry, stop, asset_ids)
         if commit and patches:
             library_root = store.directory(manifest["library_id"])
             # Copy evidence first to deterministic owned paths; a DB failure leaves only reusable files.
@@ -1397,12 +1497,13 @@ def check_task(store, identifier, stop=None, *, commit=False):
                         temporary.replace(destination)
                     finally:
                         temporary.unlink(missing_ok=True)
-            store.apply_analysis_patch(manifest["library_id"], list(manifest["assets"]), stable_hash(snapshot), patches,
+            store.apply_analysis_patch(manifest["library_id"], result["asset_ids"], stable_hash(snapshot), patches,
                                        "agent-import:" + identifier, receipt)
             result.update(imported=sum(len(p["ranges"])+len(p["contents"]) for p in patches.values()), committed=True)
         else:
             result.update(imported=0, committed=False)
         write_json(_owned(root, "reports/last-check.json"), result)
+        write_json(_owned(root, "reports/check-summary.json"), {k:v for k,v in result.items() if k != "rows"})
         if commit:
             write_json(_owned(root, "reports/import-" + uuid4().hex + ".json"), result)
         return result
@@ -1448,7 +1549,7 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="NarraLens external-agent evidence and draft tools; library import is performed in the WebUI.")
     parser.add_argument("command", choices=["describe", "overview", "ranges", "view", "capture", "references", "submit", "stop", "resume",
-                                           "batch", "submit-batch", "prefetch", "worksets", "instructions", "share-evidence"])
+                                           "batch", "submit-batch", "prefetch", "worksets", "instructions", "share-evidence", "refresh-progress"])
     parser.add_argument("--task", required=True)
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--asset")
@@ -1467,6 +1568,7 @@ def main():
     parser.add_argument("--crop", nargs=4, type=float)
     parser.add_argument("--file")
     parser.add_argument("--person", default="")
+    parser.add_argument("--full", action="store_true", help="describe附带已保存结果列表；不执行完整检查")
     args = parser.parse_args()
     try:
         if not (PROJECT / "config.toml").is_file():
@@ -1474,7 +1576,9 @@ def main():
         if args.command in {"batch", "view", "capture", "prefetch"}:
             from app.config import config  # Use the host's configured FFmpeg; existing config is read-only here.
         if args.command == "describe":
-            result = describe(args.task)
+            result = describe(args.task, full=args.full)
+        elif args.command == "refresh-progress":
+            result = refresh_progress(args.task)
         elif args.command == "share-evidence":
             result = share_evidence(args.task)
         elif args.command == "ranges":

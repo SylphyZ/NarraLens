@@ -289,8 +289,14 @@ class LibraryStore:
             db.execute("UPDATE assets SET status='partial' WHERE id=?", (asset_id,))
 
     @staticmethod
+    def _mark_check_stale(db):
+        db.execute("""UPDATE analysis_cache SET value=json_set(value,'$.stale',json('true'),'$.changed_at',?)
+            WHERE key='manual-content-check-summary' AND json_valid(value)""", (time.time_ns(),))
+
+    @staticmethod
     def _write_ranges(db, asset_id, ranges):
         from app.services.library.validation import validate_source_range
+        LibraryStore._mark_check_stale(db)
         for item in ranges:
             validate_source_range(item)
             db.execute("""INSERT INTO shot_records VALUES(?,?,?,?,?)
@@ -299,6 +305,7 @@ class LibraryStore:
 
     @staticmethod
     def _write_contents(db, asset_id, segments):
+        LibraryStore._mark_check_stale(db)
         revisions = {r["id"]: json.loads(r["data"]).get("revision") for r in
                      db.execute("SELECT id,data FROM shot_records WHERE asset_id=?", (asset_id,))}
         for item in segments:
@@ -353,26 +360,31 @@ class LibraryStore:
                 db.execute("UPDATE assets SET status=? WHERE id=?", (patch["status"], asset_id))
             db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)", (receipt_key, json.dumps(receipt, ensure_ascii=False)))
 
-    def records(self, identifiers, kind="ranges", *, include_stale=False):
-        """Read current evidence; the browser may also request retained, outdated records."""
+    def records(self, identifiers, kind="ranges", *, include_stale=False, validate=True, asset_ids=None, _ranges=None):
+        """Business reads validate by default; browsing may explicitly read unverified saved data."""
         table = {"ranges": "shot_records", "contents": "content_segments"}[kind]
         result = []
         indices = {}
         assets = {(a["library_id"],a["id"]):a for a in self.assets(identifiers)}
-        ranges = {(r["library_id"], r["id"]): r for r in self.records(identifiers, include_stale=True)} if kind == "contents" else {}
+        ranges = ({(r["library_id"], r["id"]): r for r in (_ranges if _ranges is not None else
+                  self.records(identifiers, include_stale=True, asset_ids=asset_ids))}
+                  if kind == "contents" and validate else {})
         for identifier in library_ids(identifiers):
             if self.schema(identifier) != SCHEMA_VERSION:
                 continue
             with self.database(identifier) as db:
+                scope = " WHERE a.id IN (" + ",".join("?" for _ in asset_ids) + ")" if asset_ids is not None else ""
                 rows = db.execute(f"""SELECT r.data,a.id AS asset_id,a.path,a.episode,a.fingerprint,a.fps,a.duration
-                    FROM {table} r JOIN assets a ON a.id=r.asset_id ORDER BY a.episode,r.start""").fetchall()
+                    FROM {table} r JOIN assets a ON a.id=r.asset_id{scope} ORDER BY a.episode,r.start""", asset_ids or []).fetchall()
                 generations = {r[0].split(":",1)[1]:json.loads(r[1]) for r in db.execute(
-                    "SELECT key,value FROM analysis_cache WHERE key LIKE 'analysis-generation:%'")}
+                    "SELECT key,value FROM analysis_cache WHERE key LIKE 'analysis-generation:%'")} if validate else {}
             for row in rows:
                 data = json.loads(row["data"])
                 asset = assets[(identifier,row["asset_id"])]
                 reasons = []
-                if kind == "ranges":
+                if not validate:
+                    data["checked"] = False
+                elif kind == "ranges":
                     if data.get("index_protocol") != FRAME_PROTOCOL:
                         reasons.append("旧解析需要按2.9.1重新建立源帧索引与拉片")
                     else:
@@ -422,13 +434,42 @@ class LibraryStore:
                                "library_id": identifier})
         return result
 
-    def content_status(self, identifiers):
-        """Derive UI availability from the same current evidence used by retrieval."""
-        assets = self.assets(identifiers)
-        ranges = self.records(identifiers, include_stale=True)
-        contents = self.records(identifiers, "contents", include_stale=True)
+    def saved_status(self, identifiers):
+        """Database counts only. Saved candidates are not certified usable evidence."""
+        result = {}
+        for identifier in library_ids(identifiers):
+            if self.schema(identifier) != SCHEMA_VERSION:
+                continue
+            with self.database(identifier) as db:
+                rows = db.execute("""WITH observations AS (
+                    SELECT asset_id,COUNT(*) AS observations,
+                        SUM(CASE WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.analysis_state'),'')!='ready' ELSE 1 END) AS uncertain
+                    FROM shot_records GROUP BY asset_id), candidates AS (
+                    SELECT DISTINCT r.id,r.asset_id FROM shot_records r JOIN content_links l ON l.range_id=r.id WHERE json_valid(r.data) AND
+                        json_extract(r.data,'$.analysis_state')='ready' AND json_extract(r.data,'$.content_kind')='story'
+                        AND r.end-r.start>=1.24),
+                    events AS (SELECT asset_id,COUNT(*) AS contents FROM content_segments GROUP BY asset_id)
+                    SELECT a.id,a.status,COALESCE(o.observations,0) AS observations,COALESCE(o.uncertain,0) AS uncertain,
+                        COALESCE(e.contents,0) AS contents,(SELECT COUNT(*) FROM candidates c WHERE c.asset_id=a.id) AS usable,
+                        (SELECT COUNT(DISTINCT l.segment_id) FROM content_links l JOIN candidates c ON c.id=l.range_id
+                            WHERE c.asset_id=a.id) AS searchable_contents
+                    FROM assets a LEFT JOIN observations o ON o.asset_id=a.id LEFT JOIN events e ON e.asset_id=a.id""").fetchall()
+            for row in rows:
+                result[(identifier, row["id"])] = {**dict(row), "checked": False,
+                    "label": "已保存，未检查" if row["observations"] else "待分析",
+                    "incomplete": row["status"] != "ready" or not row["observations"] or not row["contents"] or bool(row["uncertain"])}
+        return result
+
+    def content_status(self, identifiers, *, asset_ids=None, stop=None):
+        """Explicit full check, also used by operations that require current evidence."""
+        from app.services.library.runner import check_cancel
+        assets = [a for a in self.assets(identifiers) if asset_ids is None or a["id"] in asset_ids]
+        ranges = self.records(identifiers, include_stale=True, asset_ids=asset_ids)
+        check_cancel(stop)
+        contents = self.records(identifiers, "contents", include_stale=True, asset_ids=asset_ids, _ranges=ranges)
         result = {}
         for asset in assets:
+            check_cancel(stop)
             own = [r for r in ranges if (r["library_id"], r["asset_id"]) == (asset["library_id"], asset["id"])]
             events = [e for e in contents if (e["library_id"], e["asset_id"]) == (asset["library_id"], asset["id"])]
             current = [r for r in own if not r["stale_reasons"]]
@@ -460,6 +501,28 @@ class LibraryStore:
             }
         return result
 
+    def check_contents(self, library_id, asset_ids, stop=None):
+        from app.services.library.runner import library_operation, check_cancel
+        selected = list(dict.fromkeys(asset_ids))
+        with library_operation(library_id):
+            if not selected or not set(selected).issubset(a["id"] for a in self.assets(library_id)):
+                raise ValueError("请选择本库已登记素材。")
+            key = "manual-content-check-summary"
+            previous = self.cache_get(library_id, key) or {}
+            self.cache_put(library_id, key, previous)
+            rows = self.content_status(library_id, asset_ids=selected, stop=stop)
+            check_cancel(stop)
+            report = {"checked_at": time.time(), "asset_ids": selected,
+                      "rows": [{"asset_id": aid, **row} for (_, aid), row in rows.items()],
+                      "incomplete": sum(row["incomplete"] for row in rows.values())}
+            with self.database(library_id) as db:
+                db.execute("BEGIN IMMEDIATE")
+                latest = json.loads(db.execute("SELECT value FROM analysis_cache WHERE key=?", (key,)).fetchone()[0])
+                report.update(changed_at=latest.get("changed_at"), stale=latest.get("changed_at") != previous.get("changed_at"))
+                for name, value in (("manual-content-check", report), (key, {k:v for k,v in report.items() if k != "rows"})):
+                    db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)", (name, json.dumps(value, ensure_ascii=False)))
+            return report
+
     def correct_range(self, library_id, range_id, changes, reason, *, expected_revision=None):
         """Corrections are local evidence revisions; unrelated observations stay valid."""
         from app.services.library.runner import library_operation
@@ -485,6 +548,7 @@ class LibraryStore:
             db.execute("INSERT INTO analysis_cache VALUES(?,?)",
                        ("correction:"+uuid4().hex, json.dumps(correction, ensure_ascii=False)))
             db.execute("UPDATE shot_records SET data=? WHERE id=?", (json.dumps(item, ensure_ascii=False), range_id))
+            self._mark_check_stale(db)
         return item
 
     def assets(self, library_id):
@@ -510,6 +574,7 @@ class LibraryStore:
     def upsert_asset(self, library_id, media, episode):
         with self.database(library_id) as db:
             row = db.execute("SELECT * FROM assets WHERE path=?", (media.path,)).fetchone()
+            self._mark_check_stale(db)
             identifier = row["id"] if row else str(uuid4())
             status = row["status"] if row and row["fingerprint"] == media.fingerprint else "pending"
             db.execute("""INSERT INTO assets(id,path,episode,size,mtime_ns,fingerprint,duration,width,height,fps,status)
@@ -524,6 +589,7 @@ class LibraryStore:
         identifier = stable_hash((asset_id, content_hash, settings))
         with self.database(library_id) as db:
             previous = db.execute("SELECT active_subtitle FROM assets WHERE id=?", (asset_id,)).fetchone()[0]
+            self._mark_check_stale(db)
             db.execute("""INSERT INTO subtitle_sources VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source_path=excluded.source_path""",
                        (identifier, asset_id, source_path, str(original_path), str(processed_path), content_hash, json.dumps(settings, ensure_ascii=False)))
             db.execute("UPDATE assets SET active_subtitle=?,status=CASE WHEN active_subtitle=? THEN status ELSE 'pending' END WHERE id=?",
@@ -542,6 +608,7 @@ class LibraryStore:
                 subtitle["id"], asset["id"], subtitle["source_path"], subtitle["original_path"],
                 subtitle["processed_path"], subtitle["content_hash"], json.dumps(subtitle["settings"], ensure_ascii=False)))
             db.execute("UPDATE assets SET active_subtitle=?,status='pending' WHERE id=?", (subtitle["id"], asset["id"]))
+            self._mark_check_stale(db)
             committed = {**manifest, "state": "committed", "schema": SCHEMA_VERSION,
                          "old_status": asset["status"], "new_subtitle": subtitle}
             db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)",
@@ -562,10 +629,12 @@ class LibraryStore:
             if existing:
                 raise ValueError("这个路径已登记为另一条素材，请先确认素材对应关系。")
             db.execute("UPDATE assets SET path=?,mtime_ns=? WHERE id=?", (media.path, media.mtime_ns, asset_id))
+            self._mark_check_stale(db)
 
     def set_asset_status(self, library_id, asset_id, status):
         with self.database(library_id) as db:
             db.execute("UPDATE assets SET status=? WHERE id=?", (status, asset_id))
+            self._mark_check_stale(db)
 
     def cache_get(self, library_id, key):
         with self.database(library_id) as db:
@@ -577,10 +646,14 @@ class LibraryStore:
 
     def cache_put(self, library_id, key, value):
         with self.database(library_id) as db:
+            if key == "work" or key.startswith("analysis-generation:"):
+                self._mark_check_stale(db)
             db.execute("INSERT OR REPLACE INTO analysis_cache VALUES(?,?)", (key, json.dumps(value, ensure_ascii=False)))
 
     def cache_delete(self, library_id, key):
         with self.database(library_id) as db:
+            if key == "work" or key.startswith("analysis-generation:"):
+                self._mark_check_stale(db)
             db.execute("DELETE FROM analysis_cache WHERE key=?", (key,))
 
     def job(self, library_id, identifier="build", **updates):
@@ -748,6 +821,7 @@ class LibraryStore:
                     target.rename(tombstone)
                     moved.append((target, tombstone))
             with self.database(library_id) as db:
+                self._mark_check_stale(db)
                 for identifier in identifiers:
                     if db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
                         db.execute("DELETE FROM content_segments WHERE asset_id=?",(identifier,))
