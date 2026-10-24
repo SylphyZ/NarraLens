@@ -231,10 +231,15 @@ def _share_images(root, manifest, paths=None):
 
 def share_evidence(identifier):
     root, manifest, _ = _load(identifier, ready=False)
+    path = _owned(root, ".runtime/evidence-sharing.json")
+    if not read_json(path, default={}).get("pending", []):
+        return {"published": 0, "pending": []}
     with _task_lock(identifier), ExitStack() as locks:
+        pending = read_json(path, default={}).get("pending", [])
+        if not pending:
+            return {"published": 0, "pending": []}
         for aid in sorted(manifest["assets"]):
             locks.enter_context(_task_lock(identifier, aid, wait=0))
-        pending = read_json(_owned(root, ".runtime/evidence-sharing.json"), default={}).get("pending", [])
         return _share_images(root, manifest, pending)
 
 
@@ -481,7 +486,7 @@ def _batch_instructions(manifest, root, asset_ids=None, **options):
             "只有首次缺少分工时才调用worksets或使用WebUI分工清单；不支持子Agent时明确说明并顺序处理，不声称已经并行。")
     return f'''# 批量拉片指令 · {manifest['id']}
 
-说明修订：2.10.6。任务协议：{PROTOCOL}。沿用本任务已有成果，不重建任务或重新登记素材。
+说明修订：2.10.7。任务协议：{PROTOCOL}。沿用本任务已有成果，不重建任务或重新登记素材。
 任务目录：{root}。只处理本清单素材ID：{', '.join(selected) if selected else '先在WebUI完成本地准备'}。
 
 ## 工作区与权限
@@ -510,13 +515,13 @@ describe只读已保存的进度摘要，不是完整检查；progress_current�
 ```powershell
 Set-Location -LiteralPath {quote(root)}
 {command} describe
-{command} share-evidence
 {command} batch --asset {aid} --offset 0 --limit {settings['limit']} --max-images {settings['max_images']} --max-text-chars {settings['max_text_chars']}{preview_flag}
 {command} submit-batch --file proposals/你的批量提案.json
 ```
 
 沿用本说明／WebUI给定的批量参数。超出图片或文字预算会缩批，始终按返回next_offset继续，不用目标条数推算游标；疑点才view/capture。
-升级旧任务后，主Agent在启动工作者前执行一次share-evidence；它只将自己可读取的旧证据图按原字节重新落盘，继承任务目录权限，不修改系统ACL。pending为空即可继续；若仍有条目，让宿主更新工具或原生成会话完成整理，不删图、不改原片、不重做模型分析。
+share-evidence仅用于宿主明确提示的待整理旧证据，不是开工或恢复时的必做步骤。已确认pending为空时直接领取batch；若旧断点仅因空整理状态文件重写失败而暂停，按本版说明继续。实际取图或提交失败仍须报告具体路径和动作。
+确有待整理旧证据时，按需执行下方share-evidence；它按原字节重新发布可读取图片，不修改系统ACL。若仍有pending条目，让宿主或原生成会话处理对应证据，保留任务、图片和已有观察。
 batch会跳过合格观察；issues中的needs_review需单独复核，可用--include-review领取。游标到末尾仍须核对漏项与待复核，不能仅凭游标宣布完成。
 必须实际打开本批所有计划图片；--contact-sheets可生成带rXX/fXX标记的分页看图页，需查看全部页面，细节不清再看原图。读取路径不等于看过画面。
 按submission_template填写语义value，batch_id、entry_id保持；fXX/cXX只在本entry有效，不手抄hash或猜测ID。提案用UTF-8 JSON保存到 {root / 'proposals'}。
@@ -547,6 +552,8 @@ content_kind只允许story、credits、opening、black、unknown；仅内容类�
 {command} ranges --asset <素材ID> --offset 0 --limit 20
 {command} view --range <镜头ID>
 {command} references
+# 仅在已确认存在待整理旧证据时执行：
+{command} share-evidence
 {command} capture --range <镜头ID> --frame <源帧序号>
 {command} capture --range <镜头ID> --time <原片秒数> --crop 0.1 0.1 0.7 0.8
 {command} submit --file proposals/你的分组或修订提案.json

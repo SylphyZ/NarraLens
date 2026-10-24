@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.6**
+**Manuscript-driven video production · v2.10.7**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.6 provides seven workspaces:
+Version 2.10.7 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -167,6 +167,14 @@ External agents use the generated `task_cli.py` inside their task folder. It is 
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
 
+## Version 2.10.7: empty evidence maintenance no longer blocks analysis
+
+Fixes external agents being blocked by a permission error while rewriting an old evidence-maintenance status file when no images need maintenance. `share-evidence` now returns immediately for empty pending work, taking no task/asset locks and writing no files. Real pending work retains its publication and error handling, with the pending list reread after acquiring the task lock.
+
+New tasks, UI instructions and worker assignments no longer require `share-evidence` before starting. Existing tasks can reread the updated `TASK.md` and resume their saved assignments when pending work is confirmed empty. Actual image-access and submission failures still report the affected path.
+
+Validation covers empty/missing status, pending work, completion while waiting for a lock, error preservation and consistent instructions. The reported real task completed the command in a sandbox with read access only; related file contents and timestamps were unchanged. No source video was opened and no model was called.
+
 ## Version 2.10.6: lightweight browsing and manual checks
 
 Workspace switches, library browsing and page reruns read saved counts and task progress summaries instead of inspecting every receipt, image and source-frame index. These numbers describe saved records, not verified validity. Project library selection uses the same lightweight statistics.
@@ -182,7 +190,7 @@ On the local first-season dataset of 6,722 observations, task status reads fell 
 Open the individual task folder as the external agent's writable workspace and use its `task_cli.py`. Execution locks, temporary files, media caches, images and reports stay inside that task. Project code, the Python environment, source media and library registration/index files require read access; the source project does not need write access.
 
 - For an existing task, select **Update task runtime files** in the WebUI. Inputs, signing identity, observations and event catalogues are retained. The host migrates registration to a host-owned file that the CLI reads directly, avoiding SQLite WAL side effects. Old registration is retired so old and new execution locks cannot be used together.
-- Stop processes that loaded the previous tools and reread `TASK.md`. Before launching workers, the coordinator runs the task entry point's `share-evidence` command to republish readable legacy evidence without changing its bytes. New images are published through a sibling file in their destination directory, avoiding private staging-directory permissions. No manual system ACL changes are required.
+- Stop processes that loaded the previous tools and reread `TASK.md`. Run the task entry point's `share-evidence` only when legacy evidence is explicitly pending; from 2.10.7, empty pending work can proceed directly to batches. New images are published through a sibling file in their destination directory, avoiding private staging-directory permissions. No manual system ACL changes are required.
 - Same-asset exclusion, cross-asset parallelism and revision checks remain. The WebUI blocks new operations and closes internal lock handles before removing a task. Failed removal preserves or restores the task; waiting commands cannot recreate a deleted directory.
 
 Validation covered synthetic-video capture, interrupted migration recovery, concurrent and duplicate submissions, catalogue import, stop/resume and deletion races, plus Streamlit interface checks. A native Windows sandbox restricted to one writable task folder completed capture, submission, grouping and prefetch while outside writes were denied; the host could read agent-generated evidence. No cloud models were called. Whole-manuscript visual-agent tasks are outside this release's migration scope.
