@@ -21,6 +21,27 @@ LEGACY_MODE = "legacy"
 LONG_MODE = "long_align"
 _GPU_LOCK = threading.Lock()
 _WORKER = Path(__file__).with_name("narration_alignment_worker.py")
+_QUALITY_POLICY = "alignment-quality-v1"
+
+
+class AlignmentQualityError(RuntimeError):
+    """Final word times need attention; retained audio remains reusable."""
+
+
+def _collapsed_spans(words):
+    spans, first = [], 0
+    while first < len(words):
+        after, word = first + 1, words[first]
+        if word["end_time"] - word["start_time"] <= .001:
+            while (after < len(words) and words[after]["end_time"] - words[after]["start_time"] <= .001
+                   and abs(words[after]["start_time"] - word["start_time"]) <= .001):
+                after += 1
+            # Chinese characters are individual spoken units; Latin letters within a word are not.
+            units = sum(max(1, len(re.findall(r"[\u3400-\u9fff]", w["text"]))) for w in words[first:after])
+            if units >= 4:
+                spans.append((first, after))
+        first = after
+    return spans
 
 
 def default_alignment_options():
@@ -149,6 +170,28 @@ def _coarse_block(block, digest, target_seconds, directory, stop):
     return {"id": block["id"] + ".seed", "text": block["text"], "path": str(path), "samples": frames, "target": target_seconds}
 
 
+def _window_audio(block, digest, start, end, directory, stop):
+    path = directory / "alignment" / "windows" / (stable_hash(("alignment-window-v1", digest, start, end)) + ".wav")
+    if _pcm_frames(path) != end - start:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp.wav")
+        with wave.open(block["path"], "rb") as source, wave.open(str(temporary), "wb") as target:
+            target.setparams(source.getparams())
+            source.setpos(start)
+            remaining = end - start
+            while remaining:
+                check_cancel(stop)
+                count = min(remaining, 24000)
+                data = source.readframes(count)
+                if len(data) != count * 2:
+                    raise ValueError("原配音数据不完整，无法截取对齐窗口。")
+                target.writeframesraw(data)
+                remaining -= count
+        check_cancel(stop)
+        temporary.replace(path)
+    return path
+
+
 def _refinement_windows(block, digest, coarse, seed, directory, stop):
     scale = block["samples"] / seed["samples"]
     anchors = [{**word, "start_time": word["start_time"] * scale, "end_time": word["end_time"] * scale} for word in coarse["words"]]
@@ -175,24 +218,7 @@ def _refinement_windows(block, digest, coarse, seed, directory, stop):
         if not 0 < end - start <= 24000 * 300:
             raise ValueError("长配音粗定位边界异常，无法生成安全对齐窗口；原配音与定位结果已保留。")
         text_start, text_end = anchors[left]["text_start"], anchors[right-1]["text_end"]
-        path = directory / "alignment" / "windows" / (stable_hash(("alignment-window-v1", digest, start, end)) + ".wav")
-        if _pcm_frames(path) != end - start:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(".tmp.wav")
-            with wave.open(block["path"], "rb") as source, wave.open(str(temporary), "wb") as target:
-                target.setparams(source.getparams())
-                source.setpos(start)
-                remaining = end - start
-                while remaining:
-                    check_cancel(stop)
-                    count = min(remaining, 24000)
-                    data = source.readframes(count)
-                    if len(data) != count * 2:
-                        raise ValueError("原配音数据不完整，无法截取对齐窗口。")
-                    target.writeframesraw(data)
-                    remaining -= count
-            check_cancel(stop)
-            temporary.replace(path)
+        path = _window_audio(block, digest, start, end, directory, stop)
         windows.append({"id": f"{block['id']}.W{len(windows)+1:04d}", "path": str(path), "samples": end - start,
                         "text": block["text"][text_start:text_end], "text_offset": text_start, "audio_offset": start / 24000,
                         "core_start": anchors[first]["text_start"], "core_end": anchors[last-1]["text_end"]})
@@ -248,7 +274,8 @@ def align_blocks(blocks, options, directory, stop=None, progress=None):
     """Keep TTS blocks intact, refining long ones in original-speed audio windows."""
     long = [block for block in blocks if block["samples"] / 24000 > 300]
     if not long:
-        return _align_units(blocks, options, directory, stop, progress)
+        results = _align_units(blocks, options, directory, stop, progress)
+        return _repair_alignment(blocks, results, options, Path(directory), stop, progress)
     _, signature = validate_alignment_options(options)
     directory = Path(directory)
     results, pending = {}, {}
@@ -312,6 +339,118 @@ def align_blocks(blocks, options, directory, stop=None, progress=None):
             results[identifier] = record
     if progress:
         progress(1, "全部原速字词时间已对齐或从缓存恢复")
+    return _repair_alignment(blocks, results, options, directory, stop, progress)
+
+
+def _quality_windows(block, record, spans, directory, stop):
+    words, regions = record["words"], []
+    def sentence_end(before, after):
+        return re.search(r"[。！？!?；;\n]", block["text"][words[before]["text_end"]:words[after]["text_start"]])
+    for first, after in spans:
+        while first and not sentence_end(first - 1, first):
+            first -= 1
+        while after < len(words) and not sentence_end(after - 1, after):
+            after += 1
+        desired = max(0, words[first]["start_time"] - 15)
+        if after == len(words):
+            desired = min(desired, max(0, block["samples"] / 24000 - 30))
+        left = next((i for i in range(first + 1) if words[i]["start_time"] >= desired
+                     and words[i]["end_time"] > words[i]["start_time"]), None)
+        if left is None:
+            raise ValueError("异常句之前没有可靠的窗口定位字词。")
+        right = after
+        while right < len(words) and words[right]["end_time"] <= words[after - 1]["end_time"] + 15:
+            right += 1
+        if regions and left <= regions[-1][3]:
+            old = regions[-1]
+            regions[-1] = (old[0], max(after, old[1]), old[2], max(right, old[3]))
+        else:
+            regions.append((first, after, left, right))
+    windows = []
+    for first, after, left, right in regions:
+        start = max(0, math.floor((words[left]["start_time"] - .75) * 24000))
+        end = block["samples"] if right == len(words) else min(block["samples"], math.ceil((words[right-1]["end_time"] + .75) * 24000))
+        if not 0 < end - start <= 60 * 24000:
+            raise ValueError("异常区域无法可靠限定在60秒原速窗口内，请核对该段语音。")
+        text_start = 0 if left == 0 else words[left]["text_start"]
+        text_end = len(block["text"]) if right == len(words) else words[right-1]["text_end"]
+        path = _window_audio(block, record["audio_hash"], start, end, directory, stop)
+        windows.append({"id": f"{block['id']}.Q{len(windows)+1:04d}", "path": str(path), "samples": end-start,
+                        "text": block["text"][text_start:text_end], "text_offset": text_start,
+                        "audio_offset": start/24000, "first": first, "after": after})
+    return windows
+
+
+def _repair_alignment(blocks, results, options, directory, stop, progress):
+    """A single bounded refinement of final-speed results, after the worker releases its lock."""
+    for block in blocks:
+        check_cancel(stop)
+        record = results[block["id"]]
+        spans = _collapsed_spans(record["words"])
+        if not spans:
+            continue
+        issues = [{"text": "".join(w["text"] for w in record["words"][first:after]),
+                   "text_start": record["words"][first]["text_start"], "text_end": record["words"][after-1]["text_end"],
+                   "time": record["words"][first]["start_time"]} for first, after in spans]
+        label = f"配音块{block['id']}，原文“{issues[0]['text'][:60]}”出现连续多字零时长"
+        identity = stable_hash((_QUALITY_POLICY, record["key"], record["words"]))
+        report_path = directory / "alignment-diagnostics" / ("quality-" + identity + ".json")
+        report = read_json(report_path, default={})
+        if report.get("state") == "failed":
+            raise AlignmentQualityError(label + "；已尝试局部重对齐，仍需核对该段语音：" + report["reason"] + "。原配音和缓存保留，详见本地对齐详情。")
+        report = {"process": "本地对齐质量复核", "policy": _QUALITY_POLICY, "block_id": block["id"],
+                  "issues": issues, "original_result": record, "state": "running", "updated": time.time()}
+        write_json(report_path, report)
+        try:
+            windows = _quality_windows(block, record, spans, directory, stop)
+            report["windows"] = windows
+            write_json(report_path, report)
+            if progress:
+                progress(.95, f"配音块{block['id']}有连续零时长字词，仅重对齐{len(windows)}个局部窗口")
+            aligned = _align_units(windows, options, directory, stop)
+            words = [dict(w) for w in record["words"]]
+            for window in reversed(windows):
+                mapped = [{**w, "text_start": w["text_start"] + window["text_offset"], "text_end": w["text_end"] + window["text_offset"],
+                           "start_time": w["start_time"] + window["audio_offset"], "end_time": w["end_time"] + window["audio_offset"]}
+                          for w in aligned[window["id"]]["words"]]
+                first, after = window["first"], window["after"]
+                lookup = {(w["text_start"], w["text_end"]): w for w in mapped}
+                for anchors in ([w for w in words[:first] if w["end_time"] > w["start_time"]][-4:],
+                                [w for w in words[after:] if w["end_time"] > w["start_time"]][:4]):
+                    errors = [abs(w[k] - lookup[(w["text_start"],w["text_end"])][k]) for w in anchors
+                              if (w["text_start"],w["text_end"]) in lookup for k in ("start_time", "end_time")]
+                    if anchors and (len(errors) < 2 * min(2, len(anchors)) or median(errors) > .321):
+                        raise ValueError("局部结果与相邻原音字词的定位不一致。")
+                core = [w for w in mapped if words[first]["text_start"] <= w["text_start"] < w["text_end"] <= words[after-1]["text_end"]]
+                if not core or _collapsed_spans(core):
+                    raise ValueError("局部窗口仍有连续零时长或正文缺失。")
+                if first and core[0]["start_time"] < words[first-1]["end_time"]:
+                    boundary = words[first-1]["end_time"]
+                    if boundary-core[0]["start_time"] > .161 or core[0]["end_time"] <= boundary:
+                        raise ValueError("局部窗口起点与保留字词重叠。")
+                    core[0]["start_time"] = boundary
+                if after < len(words) and core[-1]["end_time"] > words[after]["start_time"]:
+                    boundary = words[after]["start_time"]
+                    if core[-1]["end_time"]-boundary > .161 or core[-1]["start_time"] >= boundary:
+                        raise ValueError("局部窗口终点与保留字词重叠。")
+                    core[-1]["end_time"] = boundary
+                words[first:after] = core
+            _validate_words(words, block["text"], block["samples"]/24000)
+            if _collapsed_spans(words):
+                raise ValueError("最终原速时间仍有连续零时长。")
+        except ValueError as exc:
+            report.update(state="failed", reason=str(exc), updated=time.time())
+            write_json(report_path, report)
+            raise AlignmentQualityError(label + "；局部重对齐未通过：" + str(exc) + "。请核对该段语音，原配音和缓存保留。") from exc
+        check_cancel(stop)
+        repaired = {**record, "words": words, "stats": {**record.get("stats", {}),
+                    "zero_duration_words": sum(w["end_time"] <= w["start_time"] for w in words),
+                    "quality_repair": {"policy": _QUALITY_POLICY, "windows": len(windows),
+                                       "window_keys": [aligned[w["id"]]["key"] for w in windows]}}}
+        write_json(directory / "alignment" / "cache" / (record["key"] + ".json"), repaired)
+        results[block["id"]] = repaired
+        report.update(state="complete", updated=time.time())
+        write_json(report_path, report)
     return results
 
 

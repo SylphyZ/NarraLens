@@ -31,7 +31,7 @@ from app.services.narration_motion import (
     manual_motion_entries, motion_config_key,
 )
 from app.services.narration_alignment import (
-    LEGACY_MODE, LONG_MODE, align_blocks, default_alignment_options, estimate_block_words, map_timing, validate_alignment_options,
+    LEGACY_MODE, LONG_MODE, AlignmentQualityError, align_blocks, default_alignment_options, estimate_block_words, map_timing, validate_alignment_options,
 )
 from app.services.narration_agent import visual_backend, project_lock
 from app.services.model_profiles import (
@@ -1206,7 +1206,7 @@ def _run_task(task_id, stop, *, start_stage="auto"):
         weak_count = sum(shot.weak_match for shot in shots)
         state.update(state="complete", progress=100, phase="完成", message=f"生成完成，共 {len(shots)} 个镜头，{weak_count} 个镜头需关注匹配详情。",
                      video=video, weak_matches=weak_count, model_calls=model_calls)
-    except (JobCancelled, JobPaused) as exc:
+    except (JobCancelled, JobPaused, AlignmentQualityError) as exc:
         state.update(state="paused", message=str(exc), model_calls=model_calls)
     except Exception as exc:
         # Gateway errors omit credentials and reference payloads.

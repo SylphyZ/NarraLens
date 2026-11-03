@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.7**
+**Manuscript-driven video production · v2.10.8**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.7 provides seven workspaces:
+Version 2.10.8 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -166,6 +166,16 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `refresh-progress`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.8: local refinement for collapsed word timestamps
+
+Final original-speed alignment now detects runs of spoken units collapsed onto one zero-duration timestamp, for both new results and saved caches. Isolated zero-duration units and normal quantization remain permitted. Accelerated coarse anchors and explicitly selected text-based timing estimates are excluded.
+
+Affected sentences receive one bounded refinement using the original audio and surrounding context. Tail windows reach the actual end of the WAV. Text coverage, audio bounds and neighboring anchors must pass before the affected block cache is updated. Healthy blocks and unaffected word times are retained, with the original anomalous result in local alignment diagnostics. Confirmed failures for unchanged inputs do not trigger repeated automatic inference.
+
+An unsuccessful refinement pauses at subtitle alignment with the block, text excerpt and reason. Genuine short cues still follow the reading target; allowing short subtitles does not bypass an alignment anomaly. Missing speech must be checked in the TTS block rather than filled with invented timestamps.
+
+The existing Qwen model, environment, worker and healthy-cache signatures remain in use. Validation covered real local inference and full-manuscript subtitle layout, long/short block branches, cache reuse, neighboring conflicts, bounded failure, cancellation and write failure. No cloud models or new TTS synthesis were used.
 
 ## Version 2.10.7: empty evidence maintenance no longer blocks analysis
 
