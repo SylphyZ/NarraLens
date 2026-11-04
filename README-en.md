@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.8**
+**Manuscript-driven video production · v2.10.9**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.8 provides seven workspaces:
+Version 2.10.9 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -166,6 +166,19 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `refresh-progress`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.9: viewpoint-led editing and source statistics
+
+External visual tasks and worksets share editing guidance: define the visual purpose of each argument, compare relevant sources and inspect images. Abstract discussion can contrast periods and relationships; specific events may retain continuity. Before completing an edit, the coordinator reviews its opening, long single-source stretches and forward source-time chains.
+
+- `search --order auto` diversifies libraries and assets within equal scores while preserving higher-score priority. An empty query restricted to one library and episode uses source order. Explicit `diverse` and `source` modes are available. Pagination is deterministic; restart at offset zero after changing/upgrading order, reusing images and choices already inspected.
+- `composition` refreshes a concise report of the current submitted revision; `composition --full` includes source shares, opening windows of 60/120/300 seconds and consecutive runs. Durations use output frames, with fixed animation and uncovered intervals reported separately. Statistics perform no frame extraction, model calls or source validation.
+- The production workspace adds a collapsible source-and-rhythm report. Browsing reads its saved summary; details and downloads load on demand. Missing or outdated reports require an explicit refresh. Report-write failure does not roll back accepted edits.
+- Concentration and forward-chain notices are advisory. They impose no source quotas and do not block import/rendering or replace visual and semantic judgment.
+
+Existing tasks can use **Update task instructions** or `update-instructions`, retaining inputs, worksets, signatures and submitted clips. Updated guidance does not rearrange an existing video. To revise a completed edit, the coordinator first submits the retained complete timeline as a new draft, then hands off current workset revision numbers.
+
+Validation covered ranking/pagination, frame-based accounting, workset merges and idempotent submissions, report failure, instruction updates, real historical reports and Streamlit UI. No existing video was re-edited or rendered; no cloud models or FFmpeg were used.
 
 ## Version 2.10.8: local refinement for collapsed word timestamps
 

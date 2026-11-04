@@ -863,7 +863,18 @@ def _render_visual_options(tr, prefix, task_id, saved):
             f" · {head['covered_frames']/30:.1f}/{required_frames/30:.1f}s · " + tr("完成版" if head["complete"] else "草稿"))
         st.caption(tr("这里只显示已落盘结果；不能据此判断外部Agent是否仍在运行。"))
         st.caption(tr("交给Agent的指令（点击代码框右上角复制）"))
-        st.code("请读取以下TASK.md，按其中本地CLI完成整篇画面匹配；允许关联及氛围配图。可先理解全文，再用子Agent分章节工作，最后由主Agent汇总全片。\n" + str(root / "TASK.md"), language=None)
+        st.code("请读取以下TASK.md，按文案观点检索、比较不同来源并实际看图；允许关联及氛围配图。分工交接全文摘要与共同编排规则，主Agent汇总后读取composition复核开篇和节奏，再提交完成版。\n" + str(root / "TASK.md"), language=None)
+        if task.get("instructions_version") != narration_agent.INSTRUCTIONS_VERSION:
+            st.info(tr("此任务说明需要更新，原分工与镜头方案会保留。"))
+        else:
+            st.caption(tr("任务说明版本：") + task["instructions_version"])
+        if st.button(tr("更新任务说明"), disabled=busy, key=prefix + "_agent_instructions_" + selected):
+            try:
+                result = narration_agent.update_instructions(task_id, selected)
+                st.session_state["narration_project_notice"] = result["message"]
+                st.rerun()
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                st.error(str(exc))
         with remembered_expander(tr("下载任务说明（可选）"), key=prefix + "_agent_download_open") as download:
             if download.open:
                 try:
@@ -888,8 +899,11 @@ def _render_visual_options(tr, prefix, task_id, saved):
                     st.session_state["narration_project_notice"] = tr("完整画面方案已导入，从第4/5阶段继续。")
                     st.rerun()
                 st.success(tr("完整结构检查通过；匹配等级统计：") + str(report["levels"]))
+                if report.get("composition", {}).get("warning"):
+                    st.warning(report["composition"]["warning"])
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 st.error(tr("结构检查未通过：") + str(exc))
+        _render_composition(tr, prefix, task_id, task, busy)
         with remembered_expander(tr("已保存镜头与编辑说明"), key=prefix + "_agent_clips_open") as details:
             if details.open:
                 value = narration_agent.occupancy(task_id, selected)
@@ -903,6 +917,71 @@ def _render_visual_options(tr, prefix, task_id, saved):
                     "时长秒": (c["target_end_frame"]-c["target_start_frame"])/30,
                     "匹配": c["match_level"], "理由": c["reason"]} for c in rows[(page-1)*50:page*50]], width="stretch")
     remember_widget_values(prefix)
+
+
+@st.fragment
+def _render_composition(tr, prefix, project_id, task, busy):
+    key = prefix + "_composition_" + task["task_id"]
+    with remembered_expander(tr("画面来源与节奏"), key=key + "_open") as panel:
+        if not panel.open:
+            return
+        st.caption(tr("集中与顺向取片仅为编排建议，不阻止导入；占比分母为已覆盖的原片画面时长。"))
+        try:
+            current = next((row for row in narration_agent.list_tasks(project_id) if row["task_id"] == task["task_id"]), None)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            st.warning(str(exc))
+            return
+        if current is None:
+            st.info(tr("当前画面任务已不存在，请重新选择。"))
+            return
+        task = current
+        if st.button(tr("刷新编排统计"), key=key + "_refresh", disabled=busy):
+            try:
+                result = narration_agent.composition(project_id, task["task_id"])
+                if result.get("warning"):
+                    st.warning(result["warning"])
+                else:
+                    st.rerun(scope="app")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                st.warning(str(exc))
+        summary = task.get("composition", {})
+        if not summary.get("available"):
+            st.info(tr("暂无编排统计，请点击刷新；页面不会自动扫描方案。"))
+            return
+        st.caption(f"r{summary['revision']} · " + tr("完成版" if summary['complete'] else "草稿") +
+                   f" · {summary['clips']} " + tr("镜头") + f" · {summary['source_count']} " + tr("个来源素材"))
+        from datetime import datetime
+        st.caption(tr("统计时间：") + datetime.fromtimestamp(summary["updated"]).strftime("%m-%d %H:%M:%S") +
+                   f" · {tr('已覆盖')} {summary['covered_seconds']:.2f}s · {tr('固定动画')} {summary['animation_seconds']:.2f}s · {tr('未覆盖')} {summary['uncovered_seconds']:.2f}s")
+        if not summary.get("current"):
+            st.info(tr("统计对应旧修订，当前方案有更新，请刷新统计。"))
+        st.dataframe([{tr("素材库"): r["label"], tr("输出秒数"): r["seconds"], tr("占比（%）"): r["percent"], tr("镜头数"): r["clips"]}
+                      for r in summary["libraries"]], hide_index=True, width="stretch")
+        kinds = {"same_source": tr("同集连续"), "forward_source": tr("原片顺向链")}
+        def advisory_rows(rows):
+            return [{tr("来源"): r["label"], tr("成片起点（秒）"): r["start"], tr("终点（秒）"): r["end"],
+                     tr("持续秒数"): r["seconds"], tr("镜头数"): r["clips"], tr("提示"): "／".join(kinds[k] for k in r["kinds"])} for r in rows]
+        st.caption(f"{summary['advisory_count']} " + tr("处建议复核，摘要显示前12处；合理的事件连贯性可以保留。"))
+        if summary["advisories"]:
+            st.dataframe(advisory_rows(summary["advisories"]), hide_index=True, width="stretch")
+        with remembered_expander(tr("来源明细与开篇分布"), key=key + "_details") as details:
+            if details.open:
+                report = narration_agent.composition_report(Path(task["directory"]), task, task["head"], full=True)
+                if not report.get("available"):
+                    st.info(tr("详细统计缺失或已更新，请刷新统计。"))
+                    return
+                def sources(rows):
+                    return [{tr("来源"): r["label"], tr("输出秒数"): r["seconds"], tr("占比（%）"): r["percent"], tr("镜头数"): r["clips"]} for r in rows]
+                st.dataframe(sources(report["sources"]), hide_index=True, width="stretch")
+                for opening in report["opening"]:
+                    st.caption(tr("开篇统计至：") + f"{opening['end_seconds']:.2f}s · {tr('已覆盖原片')} {opening['covered_seconds']:.2f}s")
+                    st.dataframe(sources(opening["sources"]), hide_index=True, width="stretch")
+                kind = st.selectbox(tr("连续片段明细"), list(kinds), format_func=kinds.get, key=key + "_runs")
+                st.dataframe([{tr("来源"): r["label"], tr("成片起点（秒）"): r["start"], tr("终点（秒）"): r["end"],
+                               tr("持续秒数"): r["seconds"], tr("镜头数"): r["clips"]}
+                              for r in report["runs"][kind] if r["clips"] > 1], hide_index=True, width="stretch")
+                st.download_button(tr("下载完整编排统计"), json.dumps(report, ensure_ascii=False, indent=2),
+                                   file_name="composition-report.json", mime="application/json", key=key + "_download")
 
 
 def _render_project_libraries(tr, prefix):

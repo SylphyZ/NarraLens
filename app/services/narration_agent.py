@@ -10,6 +10,7 @@ import sys
 import time
 import wave
 from bisect import bisect_right
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import asdict
 from functools import lru_cache
@@ -19,11 +20,21 @@ from uuid import UUID, uuid4
 from app.models.library import SOURCE_INDEX_FIELDS
 from app.models.timeline import NarrationSegment, VisualShot, timeline_dict
 from app.services.library import runner
-from app.services.library.store import LibraryStore, library_ids, read_json, stable_hash, write_json
+from app.services.library.store import LibraryStore, library_ids, read_json, stable_hash, write_json, _retry_json_io
 
 PROJECT = Path(__file__).resolve().parents[2]
 TASK_ROOT = PROJECT / "storage" / "narration_tasks"
 PROTOCOL = "agent-project-visual-v1"
+INSTRUCTIONS_VERSION = "2.10.9"
+SEARCH_ORDER_VERSION = "score-diverse-v1"
+COMPOSITION_VERSION = 1
+COMPOSITION_LIMITS = {"same_source": (30, 3), "forward_source": (20, 4)}
+EDITING_RULES = """先按文案观点明确sections.goal，再比较不同来源候选，实际看图后用clips.reason说明画面作用。
+具体事件保持人物、时期和因果准确；抽象论述可用跨时期、跨关系画面对照，不把整段论述默认分配给某一集。
+开篇尽早建立全文讨论范围；不能把检索第一页或原片时间顺序当作剪辑脚本，也不为换集而破坏对应关系。
+同集长段集中或连续顺向取片时复核表达目的。必要的事件连贯性可保留并说明理由，不机械均分集数，不制造短切。
+主Agent给每个工作者交接简短全文观点和这些规则，保留稳定分工；汇总后读取composition统计，复核开篇和跨分工节奏，再提交完成版。
+统计仅为编排建议，不代替看图；related和atmosphere仍可正常使用，不因建议存在而把完整方案当作结构错误。"""
 FPS = 30
 LEVELS = {"exact", "related", "atmosphere"}
 ASSET_FIELDS = ("id", "library_id", "path", "episode", "size", "mtime_ns", "fingerprint",
@@ -200,7 +211,9 @@ def list_tasks(project_id):
     for path in _owned(directory, "agent_visual").glob("*/manifest.json"):
         manifest = _signed(_owned(path.parent, "manifest.json"), key)
         head = _signed(_owned(path.parent, "head.json"), key)
-        result.append({**manifest, "head": head, "directory": str(path.parent)})
+        result.append({**manifest, "head": head, "directory": str(path.parent),
+                       "instructions_version": _instructions_version(path.parent, manifest),
+                       "composition": composition_report(path.parent, manifest, head)})
     return sorted(result, key=lambda row: row["created"], reverse=True)
 
 
@@ -245,7 +258,7 @@ def create_task(project_id, *, locked=False):
     _save(_owned(root, "manifest.json"), manifest, key)
     _save(_owned(root, "head.json"), {"revision": 0, "complete": False, "clips": 0, "covered_frames": 0,
                                     "levels": {}, "workset_revisions": {}, "updated": manifest["created"]}, key)
-    _owned(root, "TASK.md").write_text(instructions(manifest, root), encoding="utf-8")
+    _write_instructions(root, manifest)
     previous = _owned(directory, "timeline.json")
     if previous.is_file():
         value = read_json(previous)
@@ -259,6 +272,8 @@ def instructions(manifest, root):
     command = f'& "{executable}" -X utf8 -m app.services.narration_agent --project {manifest["project_id"]} --task {manifest["task_id"]}'
     return f'''# 整篇文案的画面编辑任务
 
+说明修订：{INSTRUCTIONS_VERSION}。
+
 在代码目录 `{PROJECT}` 中用 PowerShell 运行下列命令。使用当前客户端模型，不读取私有config.toml或API Key。
 
 任务：{manifest["task_id"]}；协议：{PROTOCOL}；input_hash：{manifest["input_hash"]}。
@@ -269,13 +284,17 @@ def instructions(manifest, root):
 不要重复源帧或重复自然镜头，避开OP/ED名单/黑场、几帧短切，通常按参考镜头长度编排；不循环、不改语速、不长时间定格补时。
 实际查看镜头图片，身份不确定时如实说明，不以自报信心代替看图。工具只检查执行结构，不替你判断语义。
 
+## 共同编排规则
+
+{EDITING_RULES}
+
 ## 查询与按需取证
 
 ```powershell
 Set-Location -LiteralPath "{PROJECT}"
 {command} describe --full
-{command} search --query "家庭 交谈" --kind ranges --offset 0 --limit 20
-{command} search --query "" --kind contents --episode 1 --offset 0 --limit 20
+{command} search --query "关系 责任" --kind contents --offset 0 --limit 20
+{command} search --query "家庭 交谈" --kind ranges --order diverse --offset 0 --limit 20
 {command} view --library <library_id> --range <range_id>
 {command} view --library <library_id> --range <range_id> --capture
 {command} fit --library <library_id> --range <range_id> --start-frame 0 --target-frames 210
@@ -283,6 +302,8 @@ Set-Location -LiteralPath "{PROJECT}"
 ```
 
 search是本地分页工具，可换查询、按集浏览所有已选库，没有固定候选上限。view默认仅返回观察、字幕、目录和已有图路径。
+默认auto在跨来源查询中分散同分候选，高分仍优先；空查询明确指定--library和--episode时按源顺序浏览。--order可选auto/diverse/source。
+同分分散不代表最终集数配额。返回search_order_version标记排序策略；升级或切换排序后从offset=0重启该本地查询，复用已看图片和已有选择，不沿用旧顺序的游标。
 只有显式--capture才会提取该范围的3张图片；也可加--frames指定实际呈现帧序号（逗号分隔，最多12）。取证后打开返回的图片。
 fit的start-frame必须使用view返回的源帧范围，按真实PTS计算可用终点；若不够长，换范围或调整目标。源/输出帧均为半开区间。
 多个连续range_ids只允许同一素材、同一自然镜头内连续范围。相邻不同自然镜头应作为不同clip，不能隐藏切点。
@@ -295,6 +316,7 @@ fit的start-frame必须使用view返回的源帧范围，按真实PTS计算可�
 ```powershell
 {command} worksets --workers 4
 {command} submit --file proposals/part.json
+{command} composition
 {command} check
 ```
 
@@ -313,29 +335,66 @@ fit的start-frame必须使用view返回的源帧范围，按真实PTS计算可�
 主Agent提交用describe中最新全局expected_revision（对应head.revision），提交替换整条草稿；重复内容可幂等返回。complete=true须覆盖所有原片区间且保留动画。
 全文只需首次describe --full，后续describe不带--full仅查询简要状态，避免每次重发长文案。
 子Agent在提案增加workset_id，用对应workset的expected_revision，只替换本分工；其他分工会合并保留。分工提交只能是草稿。
+返工已有完成版时，主Agent先保留当前完整sections/clips提交complete=false的新修订，再读取更新后的分工修订号交接工作者；不要清空方案或重新划分已提交分工。
 冲突时先describe与occupancy读取已保存进度，再合并修订；不要重新跑已完成的付费分析。
 主Agent必须汇总所有分工，核对跨章节重复与节奏，然后提交完整sections/clips并complete=true，check通过后交回WebUI导入。
+提交草稿后先调用composition读取来源和节奏建议；需要全部来源／开篇表时使用composition --full。合理的集中可以保留并说明原因，其余关注段先修订再提交完成版。
+旧分工没有全局摘要时，主Agent使用首次describe --full的overview补充交接这些共同规则，不必重新划分分工或重复读取整篇全文。
 check失败按具体clip/范围修正；related/atmosphere不会因不够精确而被当成缺口。
 工具提交不等于正式导入。用户在WebUI点击“检查并导入完成版”，随后从第4/5阶段推进。旧成片保留。
 '''
 
 
+def _instructions_version(root, manifest):
+    try:
+        value = read_json(_owned(root, "reports/instructions.json"), default={})
+        return value.get("version") if value.get("input_hash") == manifest["input_hash"] else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _write_instructions(root, manifest):
+    path = _owned(root, "TASK.md")
+    temporary = path.with_name(path.name + "." + uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(instructions(manifest, root), encoding="utf-8")
+        _retry_json_io(lambda: temporary.replace(path))
+    finally:
+        temporary.unlink(missing_ok=True)
+    write_json(_owned(root, "reports/instructions.json"), {"version": INSTRUCTIONS_VERSION,
+               "input_hash": manifest["input_hash"], "task_id": manifest["task_id"], "updated": time.time()})
+
+
+def update_instructions(project_id, task_id):
+    with project_lock(project_id):
+        _, root, _, manifest, _, _ = _load(project_id, task_id)
+        _write_instructions(root, manifest)
+        return {"version": INSTRUCTIONS_VERSION, "instructions": str(root / "TASK.md"),
+                "message": "说明已更新；请重读TASK.md，重启受排序变化影响的本地查询，原分工与成果保留。"}
+
+
 def describe(project_id, task_id, *, full=False):
     _, root, key, manifest, snapshot, catalogue = _load(project_id, task_id)
-    return {**manifest, "directory": str(root), "head": _signed(_owned(root, "head.json"), key),
+    head = _signed(_owned(root, "head.json"), key)
+    return {**manifest, "directory": str(root), "head": head,
+            "instructions_version": _instructions_version(root, manifest), "current_instructions_version": INSTRUCTIONS_VERSION,
+            "composition": composition_report(root, manifest, head),
             **({"text": snapshot["text"], "overview": snapshot["overview"], "segments": snapshot["segments"],
                 "cues": snapshot["audio_manifest"]["cues"], "audio": snapshot["audio"],
-                "motion": snapshot["motion"], "assets": catalogue["assets"]} if full else {}),
+                "motion": snapshot["motion"], "assets": catalogue["assets"], "editing_rules": EDITING_RULES} if full else {}),
             "target_shot_seconds": snapshot["target_shot_seconds"], "libraries": catalogue["libraries"],
             "range_count": len(catalogue["ranges"]),
             "content_count": len(catalogue["contents"]), "worksets": (
                 _signed(_owned(root, "worksets-record.json"), key) if _owned(root, "worksets-record.json").is_file() else [])}
 
 
-def search(project_id, task_id, query="", *, kind="ranges", episode=None, library=None, offset=0, limit=20):
+def search(project_id, task_id, query="", *, kind="ranges", episode=None, library=None, offset=0, limit=20, order="auto"):
     _, _, _, _, _, catalogue = _load(project_id, task_id)
     if kind not in {"ranges", "contents"} or type(offset) is not int or offset < 0 or not 1 <= limit <= 100:
         raise ValueError("查询类型或分页无效，limit应为1至100。")
+    if order not in {"auto", "diverse", "source"}:
+        raise ValueError("排序方式应为auto/diverse/source。")
+    order = ("source" if not query.strip() and library is not None and episode is not None else "diverse") if order == "auto" else order
     import jieba
     terms = set(t.lower() for t in jieba.lcut(query) if t.strip())
     for entry in catalogue["libraries"]:
@@ -354,13 +413,36 @@ def search(project_id, task_id, query="", *, kind="ranges", episode=None, librar
         if terms and not score:
             continue
         rows.append((score, row))
-    rows.sort(key=lambda value: (-value[0], value[1]["episode"], value[1].get("start", 0), value[1]["id"]))
+    if order == "source":
+        rows.sort(key=lambda value: (value[1]["library_id"], value[1]["episode"], value[1].get("start", 0), value[1]["id"]))
+    else:
+        rows = _diverse_candidates(rows)
     fields = ("id", "library_id", "asset_id", "episode", "start", "end", "start_frame", "end_frame", "index_key",
               "summary", "title", "visible_people", "mentioned_people", "tags", "period", "location", "uncertainties",
               "content_kind", "analysis_state", "range_ids", "duplicate_group")
     return {"items": [{k: row[k] for k in fields if k in row} for _, row in rows[offset:offset+limit]], "offset": offset,
+            "order": order, "search_order_version": SEARCH_ORDER_VERSION,
             "next_offset": offset + min(limit, max(0, len(rows)-offset)), "total": len(rows),
             "exhausted": offset+limit >= len(rows)}
+
+
+def _diverse_candidates(rows):
+    """Round-robin libraries and assets only within equal-score groups, before pagination."""
+    scores = defaultdict(lambda: defaultdict(lambda: defaultdict(deque)))
+    for score, row in sorted(rows, key=lambda value: (value[1]["episode"], value[1].get("start", 0), value[1]["id"])):
+        scores[score][row["library_id"]][row["asset_id"]].append((score, row))
+    result = []
+    for score in sorted(scores, reverse=True):
+        libraries = deque(deque(scores[score][library].values()) for library in sorted(scores[score]))
+        while libraries:
+            assets = libraries.popleft()
+            bucket = assets.popleft()
+            result.append(bucket.popleft())
+            if bucket:
+                assets.append(bucket)
+            if assets:
+                libraries.append(assets)
+    return result
 
 
 def _range(catalogue, library, identifier):
@@ -633,9 +715,10 @@ def submit(project_id, task_id, filename):
         if submitted_receipt.is_file():
             saved = _signed(submitted_receipt, key)
             if saved["revision"] <= head["revision"]:
-                return {**saved, "current_revision": head["revision"], "duplicate": True}
+                return {**saved, "current_revision": head["revision"], "duplicate": True,
+                        "composition": composition_report(root, manifest, head)}
         if head.get("submission_hash") == submission_hash:
-            return head
+            return {**head, "composition": composition_report(root, manifest, head)}
         workset_id = incoming.get("workset_id")
         if workset_id is not None and (not isinstance(workset_id, str) or not workset_id):
             raise ValueError("workset_id应为非空分工编号，主方案应省略此字段。")
@@ -676,7 +759,7 @@ def submit(project_id, task_id, filename):
                 "workset_revisions": revisions, "submission_hash": submission_hash, "updated": value["submitted"]}
         _save(_owned(root, "head.json"), head, key)
         _save(submitted_receipt, head, key)
-        return head
+        return {**head, "composition": _save_composition(root, manifest, catalogue, value, head)}
 
 
 def occupancy(project_id, task_id):
@@ -686,11 +769,112 @@ def occupancy(project_id, task_id):
             "sections": value["sections"], "clips": value["clips"]}
 
 
+def _composition_data(manifest, catalogue, value, head):
+    """Describe an accepted edit using target/source frame numbers; no source or model access."""
+    fps, total = manifest["fps"], manifest["total_frames"]
+    libraries = {row["id"]: row["name"] for row in catalogue["libraries"]}
+    assets = {(row["library_id"], row["id"]): row for row in catalogue["assets"]}
+    ranges = {(row["library_id"], row["id"]): row["asset_id"] for row in catalogue["ranges"]}
+    rows = []
+    for clip in sorted(value["clips"], key=lambda c: (c["target_start_frame"], c["clip_id"])):
+        library = clip["library_id"]
+        aid = ranges[(library, clip["range_ids"][0])]
+        asset = assets[(library, aid)]
+        rows.append({"library_id": library, "asset_id": aid, "episode": asset["episode"],
+                     "label": f"{libraries[library]} · 第{asset['episode']}集", "clip_id": clip["clip_id"],
+                     "start_frame": clip["target_start_frame"], "end_frame": clip["target_end_frame"],
+                     "source_start": clip["source_start_frame"], "source_end": clip["source_end_frame"]})
+    def distribution(end):
+        sources, by_library = {}, {}
+        for row in rows:
+            frames = max(0, min(end, row["end_frame"]) - row["start_frame"])
+            if not frames:
+                continue
+            identity = (row["library_id"], row["asset_id"])
+            source = sources.setdefault(identity, {k:row[k] for k in ("library_id", "asset_id", "episode", "label")})
+            library = by_library.setdefault(row["library_id"], {"library_id": row["library_id"], "label": libraries[row["library_id"]]})
+            for target in (source, library):
+                target["frames"] = target.get("frames", 0) + frames
+                target["clips"] = target.get("clips", 0) + 1
+        covered = sum(row["frames"] for row in sources.values())
+        expected = sum(max(0, min(end, b) - a) for a,b in manifest["original_intervals"])
+        def totals(items):
+            return [{**row, "seconds": round(row["frames"]/fps, 3),
+                     "percent": round(100*row["frames"]/covered, 2) if covered else 0}
+                    for row in sorted(items.values(), key=lambda r: (-r["frames"], r["label"], r.get("asset_id", "")))]
+        return {"end_seconds": round(end/fps, 3), "covered_seconds": round(covered/fps, 3),
+                "animation_seconds": round((end-expected)/fps, 3), "uncovered_seconds": round(max(0, expected-covered)/fps, 3),
+                "libraries": totals(by_library), "sources": totals(sources)}
+    runs = {"same_source": [], "forward_source": []}
+    for row in rows:
+        for kind, chain in runs.items():
+            previous = chain[-1] if chain else None
+            if (previous and (previous["library_id"], previous["asset_id"]) == (row["library_id"], row["asset_id"])
+                    and previous["end_frame"] == row["start_frame"]
+                    and (kind == "same_source" or previous["source_end"] <= row["source_start"])):
+                previous.update(end_frame=row["end_frame"], source_end=row["source_end"], clips=previous["clips"]+1, last_clip=row["clip_id"])
+            else:
+                chain.append({**{k: row[k] for k in ("library_id", "asset_id", "episode", "label", "start_frame", "end_frame", "source_end")},
+                              "clips": 1, "first_clip": row["clip_id"], "last_clip": row["clip_id"]})
+    advisories = {}
+    for kind, chain in runs.items():
+        minimum_seconds, minimum_clips = COMPOSITION_LIMITS[kind]
+        for row in chain:
+            row.pop("source_end")
+            row.update(start=round(row["start_frame"]/fps, 3), end=round(row["end_frame"]/fps, 3),
+                       seconds=round((row["end_frame"]-row["start_frame"])/fps, 3))
+            if row["end_frame"]-row["start_frame"] >= minimum_seconds*fps and row["clips"] >= minimum_clips:
+                key = (row["library_id"], row["asset_id"], row["start_frame"], row["end_frame"])
+                advisories.setdefault(key, {**row, "kinds": []})["kinds"].append(kind)
+    totals = distribution(total)
+    return {"schema": COMPOSITION_VERSION, "task_id": manifest["task_id"], "input_hash": manifest["input_hash"],
+            "revision": head["revision"], "complete": head["complete"], "updated": time.time(), "fps": fps,
+            "timeline_seconds": round(total/fps, 3), "clips": len(rows), "source_count": len(totals["sources"]),
+            **totals, "opening": [distribution(end) for end in dict.fromkeys(min(total, n*fps) for n in (60,120,300))],
+            "runs": runs, "advisories": sorted(advisories.values(), key=lambda r: (r["start_frame"], -r["end_frame"])),
+            "note": "占比分母为已覆盖原片画面时长；集中与顺向链仅为编排建议，不是导入错误，不代替实际看图。"}
+
+
+def composition_report(root, manifest, head, *, full=False):
+    """Read derived reports only. Missing/stale reports never trigger an implicit scan."""
+    try:
+        summary = read_json(_owned(root, "reports/composition-summary.json"), default={})
+        if (summary.get("schema") != COMPOSITION_VERSION or summary.get("task_id") != manifest["task_id"]
+                or summary.get("input_hash") != manifest["input_hash"] or type(summary.get("revision")) is not int):
+            return {"available": False, "current": False}
+        data = read_json(_owned(root, f"reports/composition-r{summary['revision']}.json")) if full else summary
+        if any(data.get(k) != summary[k] for k in ("schema", "task_id", "input_hash", "revision")):
+            return {"available": False, "current": False}
+        return {**data, "available": True, "current": summary["revision"] == head["revision"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {"available": False, "current": False}
+
+
+def _save_composition(root, manifest, catalogue, value, head):
+    try:
+        report = _composition_data(manifest, catalogue, value, head)
+        write_json(_owned(root, f"reports/composition-r{head['revision']}.json"), report)
+        summary = {k:v for k,v in report.items() if k not in {"sources", "opening", "runs", "advisories"}}
+        summary.update(advisory_count=len(report["advisories"]), advisories=report["advisories"][:12])
+        write_json(_owned(root, "reports/composition-summary.json"), summary)
+        return {**summary, "available": True, "current": True}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {"available": False, "current": False, "warning": "方案已保存，编排统计待刷新：" + str(exc)}
+
+
+def composition(project_id, task_id, *, full=False):
+    with project_lock(project_id):
+        _, root, key, manifest, _, catalogue = _load(project_id, task_id)
+        value, head = _revision(root, key)
+        summary = _save_composition(root, manifest, catalogue, value, head)
+        return composition_report(root, manifest, head, full=True) if full and summary["current"] else summary
+
+
 def worksets(project_id, task_id, workers=4):
     if type(workers) is not int or not 1 <= workers <= 64:
         raise ValueError("分工数需为1至64。")
     with project_lock(project_id), runner.library_operation(project_id, prefix="narration:"):
-        _, root, key, manifest, snapshot, _ = _load(project_id, task_id)
+        _, root, key, manifest, snapshot, catalogue = _load(project_id, task_id)
         if _signed(_owned(root, "head.json"), key)["revision"]:
             raise ValueError("已提交草稿，不能重新划分分工；复用现有worksets或由主Agent汇总。")
         boundaries = sorted({0, snapshot["total_frames"], *[round(s["audio_end"]*FPS) for s in snapshot["segments"]]})
@@ -701,6 +885,9 @@ def worksets(project_id, task_id, workers=4):
                    "original_intervals": [[max(a,l), min(b,r)] for l,r in manifest["original_intervals"] if min(b,r)>max(a,l)]}
                   for i,(a,b) in enumerate(zip(cuts,cuts[1:]))]
         for group in result:
+            group["editing_brief"] = {"overview": snapshot["overview"][:1200], "rules": EDITING_RULES,
+                                      "libraries": [{"id": r["id"], "name": r["name"]} for r in catalogue["libraries"]],
+                                      "instructions_version": INSTRUCTIONS_VERSION}
             ids = {s["id"] for s in group["segments"]}
             positions = [i for i,s in enumerate(snapshot["segments"]) if s["id"] in ids]
             group["context_segments"] = (snapshot["segments"][max(0,positions[0]-1):positions[0]] +
@@ -746,6 +933,7 @@ def check_task(project_id, task_id, *, commit=False):
                 state.update(state="paused", phase="画面方案已导入", progress=74,
                     message="外部Agent完整画面方案已导入，可从4. 从配乐继续或5. 仅合成视频推进。", agent_visual_task=root.name)
                 write_json(_owned(directory, "state.json"), state)
+            report["composition"] = _save_composition(root, manifest, catalogue, value, head)
             return report
 
 
@@ -781,6 +969,8 @@ def main():
     commands.add_parser("describe").add_argument("--full", action="store_true")
     commands.add_parser("occupancy")
     commands.add_parser("check")
+    commands.add_parser("composition").add_argument("--full", action="store_true")
+    commands.add_parser("update-instructions")
     p = commands.add_parser("search")
     p.add_argument("--query", default="")
     p.add_argument("--kind", choices=("ranges", "contents"), default="ranges")
@@ -788,6 +978,7 @@ def main():
     p.add_argument("--library")
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--order", choices=("auto", "diverse", "source"), default="auto")
     for name in ("view", "fit"):
         p = commands.add_parser(name)
         p.add_argument("--library", required=True)
@@ -811,7 +1002,8 @@ def main():
             args["frames"] = [int(n) for n in args["frames"].split(",")]
             args["capture"] = True
         result = {"describe": describe, "search": search, "view": view, "fit": fit, "submit": submit,
-                  "occupancy": occupancy, "worksets": worksets, "check": check_task}[command](project_id, task_id, **args)
+                  "occupancy": occupancy, "worksets": worksets, "check": check_task,
+                  "composition": composition, "update-instructions": update_instructions}[command](project_id, task_id, **args)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except (ValueError, OSError, KeyError, TypeError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
