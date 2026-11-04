@@ -17,6 +17,8 @@ from app.services.subtitle_segmentation import _tokenizer
 
 RATE = 48000
 _RECIPE = "narration-bgm-v1"
+BGM_FIELDS = {"bgm_mode", "bgm_path", "bgm_volume", "bgm_library_ids", "bgm_only_instrumental",
+              "bgm_auto_strategy", "bgm_min_seconds", "bgm_crossfade", "bgm_ducking"}
 _PROMPT = """为固定文案的影视深度解析选择背景音乐，不改写文案、不新增情节。
 给定论述大段和已听完整首音乐后保存的特征。只依据特征选曲，不根据文件名猜作品。
 按主题与情绪匹配，优先不干扰旁白的音乐。论述仍延续时优先沿用上一首；
@@ -34,13 +36,21 @@ def bgm_options(options):
     if mode not in {"none", "path", "library", "auto"}:
         raise ValueError("不支持的配乐方式。")
     result["bgm_mode"] = mode
+    volume = result.get("bgm_volume", .15)
+    if isinstance(volume, bool) or not isinstance(volume, (int, float)) or not math.isfinite(volume) or not 0 <= volume <= 1:
+        raise ValueError("背景音乐音量应为0至1之间的有效数字。")
+    result["bgm_volume"] = float(volume)
+    if mode in {"library", "path"}:
+        path = result.get("bgm_path", "")
+        if not isinstance(path, str):
+            raise ValueError("背景音乐路径应为字符串。")
+        result["bgm_path"] = path.strip().strip('"')
     if mode == "none":
         result["bgm_path"] = ""
     if mode != "auto":
         return result
     result["bgm_library_ids"] = library_ids(result.get("bgm_library_ids", []))
-    for name, default, lower, upper in (("bgm_min_seconds", 60, 30, 600), ("bgm_crossfade", 2, 0, 8),
-                                        ("bgm_volume", .15, 0, 1)):
+    for name, default, lower, upper in (("bgm_min_seconds", 60, 30, 600), ("bgm_crossfade", 2, 0, 8)):
         value = result.get(name, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not lower <= value <= upper:
             raise ValueError(f"{name} 应在 {lower} 至 {upper} 之间。")
@@ -54,6 +64,38 @@ def bgm_options(options):
     result["bgm_auto_strategy"] = result.get("bgm_auto_strategy", "sections")
     result["bgm_path"] = ""
     return result
+
+
+def with_bgm_selection(options, selection=None):
+    """Apply only explicit BGM controls; production inputs remain from the saved project."""
+    if selection is None:
+        return bgm_options(options)
+    if not isinstance(selection, dict) or set(selection) - BGM_FIELDS:
+        raise ValueError("本轮配乐设置包含不支持的字段。")
+    return bgm_options({**options, **selection})
+
+
+def bgm_settings_key(options):
+    options = bgm_options(options)
+    fields = {k:options.get(k) for k in BGM_FIELDS - {"bgm_volume"}}
+    fields["bgm_library_ids"] = sorted(options.get("bgm_library_ids", []))
+    fields["voice_volume"] = float(options.get("voice_volume", 1.0))
+    return stable_hash(fields)
+
+
+def completed_bgm(directory, options, seconds):
+    """Stage five reuses a rendered track without consulting models or music libraries."""
+    directory = Path(directory)
+    plan = read_json(directory / "bgm_plan.json", default={})
+    if not isinstance(plan, dict) or not plan.get("render_ready") or not plan.get("cues"):
+        raise ValueError("自动配乐尚未完成，请从4. 从配乐继续。")
+    if plan.get("settings_key") != bgm_settings_key(options):
+        raise ValueError("自动配乐设置已改变或旧记录尚未更新，请从4. 从配乐继续；已有配音和镜头会复用。")
+    duration = float(plan.get("duration", 0))
+    frames = _samples(directory / "bgm.wav")
+    if not math.isfinite(duration) or duration <= 0 or not frames or abs(duration-seconds) > .05 or abs(frames/RATE-seconds) > .05:
+        raise ValueError("完整背景音乐与当前配音时长不符，请从4. 从配乐继续。")
+    return plan
 
 
 def bgm_libraries(options):
@@ -88,10 +130,12 @@ def eligible_tracks(options, store=None):
 
 def validate_bgm(options):
     options = bgm_options(options)
+    if options["bgm_volume"] == 0 or options["bgm_mode"] == "none":
+        return options
     if options["bgm_mode"] == "auto":
         eligible_tracks(options)
-    elif options.get("bgm_path") and not Path(options["bgm_path"]).is_file():
-        raise ValueError("背景音乐文件不存在。")
+    elif not options.get("bgm_path") or not Path(options["bgm_path"]).is_file():
+        raise ValueError("请在BGM配乐设置中选择一个存在的音乐文件。")
     return options
 
 
@@ -419,7 +463,7 @@ def prepare_bgm(plan, audio_path, directory, options, stop=None, progress=None):
         temporary.replace(output)
         manifest = {"key": key, "samples": total, "rate": RATE}
         write_json(folder / "manifest.json", manifest)
-    plan.update(render_ready=True, audio_path=str(output), render_key=key)
+    plan.update(render_ready=True, audio_path=str(output), render_key=key, settings_key=bgm_settings_key(options))
     preview = directory / "bgm.mp3"
     preview_key = stable_hash((key, options["bgm_volume"]))
     if manifest.get("preview_key") != preview_key or not preview.is_file() or not preview.stat().st_size:

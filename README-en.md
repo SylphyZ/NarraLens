@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.9**
+**Manuscript-driven video production · v2.10.10**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.9 provides seven workspaces:
+Version 2.10.10 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -166,6 +166,18 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `refresh-progress`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.10: apply the current BGM choice when generation starts
+
+Existing projects now capture the current BGM panel values when generation, resume or a numbered stage starts, saving only supported music settings for that run. Choices survive panel folding; later UI edits do not alter an active run. Existing shots, narration and subtitles are reused. No separate BGM save action or project copy is required, and the BGM-only fork button has been removed.
+
+All four sources are supported: automatic library selection, one manually selected track, a file path, and no music. Muting/no music skips BGM work; an empty audible manual source reports an error. Failed startup validation preserves the saved configuration. Resource claims follow the currently selected music libraries.
+
+Stage five remains composition-only without new model calls. Automatic music must already be rendered for the current production settings; missing, changed or unbound legacy plans require ordinary resume or stage four, retaining reusable planning caches. Volume-only changes can reuse the rendered music and remix it.
+
+Stage-button previews inspect local artifacts while execution retains full source validation. On the local sample, preview time fell from about 30 seconds to 0.04 seconds, avoiding a long wait with only captions visible.
+
+Validation covered all source modes, run snapshots, resource conflicts, cache mismatch and UI controls, plus actual mixing of synthetic audio/video. No real music was selected for the user and no existing output was regenerated. After upgrading, select BGM and use the existing generation controls.
 
 ## Version 2.10.9: viewpoint-led editing and source statistics
 

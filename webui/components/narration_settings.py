@@ -23,7 +23,7 @@ from app.services.narration_task import (
 )
 from app.services.narration_alignment import LEGACY_MODE, LONG_MODE
 from app.services import narration_agent
-from app.services.narration_bgm import bgm_libraries
+from app.services.narration_bgm import bgm_libraries, with_bgm_selection
 from app.services.narration_motion import (
     TEMPLATES, PLACEMENTS, MIN_SECONDS, text_anchors, manual_motion_entries, inspect_manual_motion_ranges, motion_entry_from_animation,
 )
@@ -38,17 +38,20 @@ from webui.components.model_settings import seed_model_choices, selected_models 
 from app.services.model_profiles import resolve_models, project_bindings, production_voice, public_values
 
 
-def _start_task(task_id, *, start_stage="auto"):
+def _start_task(task_id, *, start_stage="auto", bgm_selection=None):
+    bgm_selection = deepcopy(bgm_selection)
     def work(stop):
         try:
-            run_task(task_id, stop, start_stage=start_stage)
+            run_task(task_id, stop, start_stage=start_stage, bgm_selection=bgm_selection)
         except Exception as exc:
             state = read_task(task_id) or {"id": task_id}
-            state.update(state="failed", message=str(exc))
+            state.update(state="paused" if isinstance(exc, runner.JobCancelled) else "failed", message=str(exc))
             write_json(task_directory(task_id) / "state.json", state)
     saved = read_json(task_directory(task_id) / "settings.json")
+    options = with_bgm_selection(saved["options"], bgm_selection)
+    music_libraries = bgm_libraries(options) if start_stage != "render" and options["bgm_volume"] > 0 else []
     resources = tuple(["narration:" + task_id, *["library:" + identifier for identifier in library_ids(saved)]]
-                      + ["audio-library:" + identifier for identifier in bgm_libraries(saved["options"])])
+                      + ["audio-library:" + identifier for identifier in music_libraries])
     if not runner.start("narration:" + task_id, work, resources=resources):
         raise ValueError("视频或音频素材库、关联任务正在运行，请等待任务结束。")
 
@@ -1171,7 +1174,6 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
         options, voice_profile = _project_values(text, prefix, saved_settings)
         has_scenes = bool(_library_counts(tuple(selected_libraries))[3])
         models = workspace_models(prefix)
-        music_options = {key: value for key, value in options.items() if key.startswith("bgm_")}
         motion_settings = {key: value for key, value in options.items() if key.startswith("motion_")}
         music_busy = runner.library_busy(bgm_libraries(options), prefix="audio-library:")
         busy = runner.library_busy(selected_libraries) or music_busy
@@ -1210,17 +1212,6 @@ def _render_project_forks(tr, task_id, text, saved_settings, missing_libraries, 
                 except (OSError, ValueError) as exc:
                     st.error(str(exc))
             st.caption(tr("使用该历史任务原文、上方多选的视频素材库和输出设置创建新任务；有效的规划、配音及对齐缓存会复用。"))
-            if st.button(tr("仅更新 BGM，复用配音并创建副本"), disabled=task_busy or music_busy or bool(missing_libraries), key="bgm_fork_narration_" + task_id):
-                try:
-                    recorded_voice = production_voice(saved_settings["voice"])
-                    bgm_fork_options = {key: value for key, value in saved_settings["options"].items() if not key.startswith("bgm_")}
-                    bgm_fork_options.update(music_options)
-                    child_id = fork_task(task_id, bgm_fork_options, recorded_voice, models)
-                    st.session_state["active_narration_task"] = child_id
-                    _start_task(child_id)
-                    _navigate("narration_progress", child_id)
-                except ValueError as exc:
-                    st.error(str(exc))
             st.caption(tr("更换视频素材库会重新匹配画面，原任务及成片保留；原视频素材库的分析无需重做。"))
             keep_audio = st.checkbox(tr("沿用历史任务配音设置"), value=remembered_widget_value("fork_keep_audio_" + task_id, True), key="fork_keep_audio_" + task_id,
                 help=tr("沿用原音色、配音方式、分块和对齐设置，减少重新配音；取消后使用上方当前配音配置。"))
@@ -1299,31 +1290,34 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
                 st.error(str(exc))
         return
     task_libraries = library_ids(saved_settings)
-    task_busy = _project_busy(task_id, saved_settings)
+    selection = bgm_values(prefix)
+    options = with_bgm_selection(saved_settings["options"], selection)
+    task_busy = runner.running("narration:" + task_id) or runner.library_busy(task_libraries)
+    music_busy = options["bgm_volume"] > 0 and runner.library_busy(bgm_libraries(options), prefix="audio-library:")
     if not task_busy:
-        st.caption(tr("推进使用项目保存的视频素材库、原文、音色和输出设置。"))
+        st.caption(tr("生成和继续使用当前BGM配乐设置；视频素材库、原文、音色和输出样式沿用项目保存设置。"))
         original_has_scenes = not missing_libraries and bool(_library_counts(tuple(task_libraries))[3])
         if not original_has_scenes and not missing_libraries:
             st.caption(tr("项目素材库尚无可用分析场景；请先在视频素材库完成分析。已有完整时间轴可使用第5步仅合成。"))
         def continue_from(stage="auto"):
             try:
-                _start_task(task_id, start_stage=stage)
+                _start_task(task_id, start_stage=stage, bgm_selection=bgm_values(prefix))
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
         action = "开始生成" if state["state"] == "pending" else "复用缓存重新合成" if state["state"] == "complete" else "继续生成"
-        if st.button(tr(action), type="primary", disabled=bool(missing_libraries or missing_music) or not original_has_scenes, key="resume_narration_" + task_id):
+        if st.button(tr(action), type="primary", disabled=bool(missing_libraries) or music_busy or not original_has_scenes, key="resume_narration_" + task_id):
             continue_from()
         stage_key = "narration_resume_stages_" + task_id
         with remembered_expander(tr("按阶段继续"), key=stage_key) as panel:
             if not panel.open:
                 return
             st.caption(tr("从所选阶段执行到成片，复用已保存结果；有效缓存仍会复用。"))
-            st.caption(tr("第5步使用已有配音、字幕、镜头、动画缓存和完成的配乐，无需TTS、模型或本地对齐凭据。"))
+            st.caption(tr("第5步只合成，复用与当前设置相符的已完成配乐，无需TTS、模型或对齐凭据；自动配乐变更或未完成时请用第4步。"))
             if audio_mode(saved_settings["options"]) == LEGACY_MODE:
                 st.caption(tr("原模式的字幕处理复用配音时记录的字幕时间，不重新进行本地语音对齐。"))
             try:
-                stages = resume_stage_status(task_id)
+                stages = resume_stage_status(task_id, bgm_selection=selection)
             except (OSError, ValueError) as exc:
                 st.warning(tr("无法读取前序结果：") + str(exc))
                 stages = {}
@@ -1332,7 +1326,7 @@ def _render_project_continue(tr, task_id, saved_settings, missing_libraries, mis
                 columns = st.columns(2)
                 for column, (stage, label) in zip(columns, entries[offset:offset + 2]):
                     status = stages.get(stage, {"ready": False, "reason": "前序结果不可读。"})
-                    disabled = bool(missing_libraries) or (bool(missing_music) and stage != "render") or not status["ready"]
+                    disabled = bool(missing_libraries) or (music_busy and stage != "render") or not status["ready"]
                     with column:
                         if st.button(tr(label), disabled=disabled, key="resume_narration_" + stage + "_" + task_id,
                                      help=tr(status["reason"]), width="stretch"):
@@ -1528,9 +1522,9 @@ def render_project_progress(tr):
     if missing_libraries:
         st.warning(tr("项目的视频素材库已删除；可选择现存素材库创建复用副本。"))
     if missing_music:
-        st.warning(tr("项目的音频素材库已删除；已完成BGM仍可从第5步复用，可修改配乐创建副本。"))
+        st.warning(tr("项目保存的音频素材库已删除；可在BGM设置选择可用来源后继续，或从第5步复用匹配的已完成配乐。"))
     if task_busy and not runner.running("narration:" + task_id):
-        st.info(tr("关联素材库正在被其他任务使用，请等待结束后继续制作。"))
+        st.info(tr("关联素材库正在使用，生成按钮会根据当前选择判断是否可启动。"))
     _render_task_status(task_id, tr)
     if state.get("subtitle_timing") == "text_estimate":
         st.caption(tr("此项目已关闭本地对齐，字幕时间为文字估算。"))

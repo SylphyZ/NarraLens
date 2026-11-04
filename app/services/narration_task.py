@@ -25,7 +25,9 @@ from app.services.library.indexer import audit_subtitles
 from app.services.narration_planner import (
     BOUNDARY_ALIGNMENT_VERSION, plan_document, plan_subtitles, plan_visual_units, revise_visual_requirements, validate_visual_plan,
 )
-from app.services.narration_bgm import bgm_libraries, bgm_options, plan_bgm, prepare_bgm, validate_bgm
+from app.services.narration_bgm import (
+    BGM_FIELDS, bgm_libraries, bgm_options, with_bgm_selection, completed_bgm, plan_bgm, prepare_bgm, validate_bgm,
+)
 from app.services.narration_motion import (
     motion_options, validate_motion, plan_motion, prepare_motion, load_motion_assets,
     manual_motion_entries, motion_config_key,
@@ -68,7 +70,7 @@ def _resume_level(stage):
     return list(RESUME_STAGES).index(stage) + 1
 
 
-def _resume_checkpoint(directory, settings, text, level):
+def _resume_checkpoint(directory, settings, text, level, *, preview=False):
     """Read previous stages without regenerating them or touching source media."""
     from app.models.timeline import NarrationSegment, VisualShot
     from app.services.narration_audio import _samples, duration
@@ -182,29 +184,28 @@ def _resume_checkpoint(directory, settings, text, level):
                 assets[identifier].update({key: source[key] for key in ("fingerprint", "fps", "duration")})
         for asset in load_motion_assets(directory, shots, plan_key=timeline.get("motion", {}).get("plan_key")):
             assets[asset["id"]] = asset
-        validate_timeline(segments, shots, list(assets.values()), policy=policy)
+        if not preview:
+            validate_timeline(segments, shots, list(assets.values()), policy=policy)
         result.update(shots=shots, timeline=timeline)
     if level == 5 and options.get("bgm_mode") == "auto" and options.get("bgm_volume", .15) > 0:
-        music = saved("bgm_plan.json", "自动配乐")
-        if not music.get("render_ready") or not (directory / "bgm.wav").is_file() or not 0 < music["duration"] < float("inf") or \
-                abs(music["duration"] - seconds) > .05 or abs(duration(directory / "bgm.wav") - seconds) > .05:
-            raise ValueError("完整背景音乐尚未完成，请先从配乐继续。")
-        result["music"] = music
-    elif level == 5 and options.get("bgm_path") and options.get("bgm_volume", .15) > 0 and not Path(options["bgm_path"]).is_file():
-        raise ValueError("保存的背景音乐文件不存在，请调整配乐并创建副本。")
+        result["music"] = completed_bgm(directory, options, seconds)
+    elif level == 5 and options.get("bgm_mode") in {"path", "library"} and options.get("bgm_volume", .15) > 0:
+        if not options.get("bgm_path") or (not preview and not Path(options["bgm_path"]).is_file()):
+            raise ValueError("请在BGM配乐设置中选择一个存在的音乐文件。")
     return result
 
 
-def resume_stage_status(task_id):
-    """The UI and runner use the same prerequisites; this function only reads."""
+def resume_stage_status(task_id, *, bgm_selection=None):
+    """Preview local prerequisites; execution retains the full source/timeline validation."""
     directory = task_directory(task_id)
     settings = read_json(directory / "settings.json")
+    settings = {**settings, "options": with_bgm_selection(settings["options"], bgm_selection)}
     with (directory / "input.txt").open("r", encoding="utf-8", newline="") as source:
         text = source.read()
     result = {}
     for stage in RESUME_STAGES:
         try:
-            _resume_checkpoint(directory, settings, text, _resume_level(stage))
+            _resume_checkpoint(directory, settings, text, _resume_level(stage), preview=True)
             result[stage] = {"ready": True, "reason": "复用前序结果，从此阶段继续到成片；有效缓存仍会复用。"}
         except (OSError, ValueError, KeyError, TypeError, EOFError, wave.Error, ZeroDivisionError) as exc:
             result[stage] = {"ready": False, "reason": str(exc) if isinstance(exc, ValueError) else
@@ -622,14 +623,24 @@ def fork_task(task_id, options, voice_profile, model_profile, *, selected_librar
         return child_id
 
 
-def run_task(task_id, stop=None, *, start_stage="auto"):
+def run_task(task_id, stop=None, *, start_stage="auto", bgm_selection=None):
     with project_lock(task_id), library_operation(task_id, prefix="narration:"):
+        check_cancel(stop)
         directory = task_directory(task_id)
         settings = read_json(directory / "settings.json")
-        with library_operation(library_ids(settings)), library_operation(bgm_libraries(settings["options"]), prefix="audio-library:"):
-            if not settings.get("generation_started"):
-                settings["generation_started"] = True
-                write_json(directory / "settings.json", settings)
+        options = with_bgm_selection(settings["options"], bgm_selection)
+        music_libraries = bgm_libraries(options) if start_stage != "render" and options["bgm_volume"] > 0 else []
+        with library_operation(library_ids(settings)), library_operation(music_libraries, prefix="audio-library:"):
+            if bgm_selection is not None:
+                if start_stage == "render" and options["bgm_mode"] == "auto" and options["bgm_volume"] > 0:
+                    from app.services.narration_audio import _samples
+                    completed_bgm(directory, options, _samples(directory / "narration.wav") / 24000)
+                else:
+                    validate_bgm(options)
+            check_cancel(stop)
+            updated = {**settings, "options": options, "generation_started": True}
+            if updated != settings:
+                _write_project_settings(directory, settings, updated)
             return _run_task(task_id, stop, start_stage=start_stage)
 
 
@@ -972,7 +983,8 @@ def _run_task(task_id, stop, *, start_stage="auto"):
     legacy_voice = history.get("settings", {}).get("voice", {})
     legacy_profiles = [legacy_voice] if legacy_voice.get("engine") else []
     write_json(directory / "model-runs" / (str(time.time_ns()) + ".json"),
-               {"schema": 1, "time": time.time(), "start_stage": start_stage, **public_values(resolved)})
+               {"schema": 1, "time": time.time(), "start_stage": start_stage,
+                "bgm": {key: options[key] for key in BGM_FIELDS if key in options}, **public_values(resolved)})
     cache_source = task_directory(settings["parent_task_id"]) / "audio" if level <= 1 and settings.get("parent_task_id") else None
     model_calls = 0
     usage = ModelUsage(directory)
@@ -1182,6 +1194,8 @@ def _run_task(task_id, stop, *, start_stage="auto"):
                         asset["duration"] = source["duration"]  # Actual indexed video duration, not container padding.
             validate_timeline(segments, shots, assets, policy=timeline["visual_policy"])
         render_options = dict(options)
+        if options["bgm_volume"] == 0:
+            render_options["bgm_path"] = ""
         render_start = 80 if level == 5 else 75
         if level <= 4 and options["bgm_mode"] == "auto" and options["bgm_volume"] > 0:
             update("自动配乐", 74, "根据大段主题和情绪选择已分析音乐，不重新上传音乐")
