@@ -20,6 +20,13 @@ class MediaHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Players may cancel a range request during seeking, refresh or teardown.
+            self.close_connection = True
+
     def do_HEAD(self):
         self._serve(False)
 
@@ -65,18 +72,15 @@ class MediaHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", 'attachment; filename="final.mp4"')
         self.end_headers()
         if body:
-            try:
-                with path.open("rb") as source:
-                    source.seek(start)
-                    remaining = end - start + 1
-                    while remaining:
-                        chunk = source.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        remaining -= len(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            with path.open("rb") as source:
+                source.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
 
 
 def video_url(task_id):

@@ -2,7 +2,7 @@
 
 > Turn your manuscript into a video.
 
-**Manuscript-driven video production · v2.10.10**
+**Manuscript-driven video production · v2.10.11**
 
 [简体中文](README.md) · User guide · [MIT license](LICENSE)
 
@@ -43,7 +43,7 @@ Thanks to the original NarratoAI authors and contributors. Their copyright notic
 
 ## Workspaces
 
-Version 2.10.10 provides seven workspaces:
+Version 2.10.11 provides seven workspaces:
 
 | Workspace | Purpose |
 |---|---|
@@ -166,6 +166,14 @@ Tasks live in `storage/agent_analysis_tasks/TASK_ID/`. Original videos remain re
 External agents use the generated `task_cli.py` inside their task folder. It is already bound to the task, so omit `--task`. Commands include `batch`, `submit-batch`, `prefetch`, `worksets`, `instructions`, `share-evidence`, `describe`, `refresh-progress`, `overview`, `ranges`, `view`, `capture`, `references`, `submit`, `stop` and `resume`. TASK.md includes the actual interpreter and commands; keep the task folder as the working directory. The lower-level module entry remains available for host tools. CLI submission saves drafts; the WebUI performs library imports.
 
 Local preparation and checks do not call models. The external agent uses its own model and account; cloud models still require a network connection. This version uses manual task handoff and does not include an MCP server or a client-specific agent launcher. A stop flag prevents subsequent local tool operations; stop external model requests in the agent application.
+
+## Version 2.10.11: disconnected video-preview requests
+
+The local media server handles aborted connections, resets and broken pipes across the request lifecycle, including response headers and video data. Canceled range requests end their connection without a server traceback. Other I/O and programming errors remain visible.
+
+GET, HEAD, Range, downloads and access-token behavior are unchanged. Validation covered 15 injected disconnect cases, three actual loopback client aborts and successful requests afterward. Restart the WebUI to load the handler; existing videos need no regeneration.
+
+The `jieba` warning about deprecated `pkg_resources` is separate. This release neither changes the environment nor suppresses that warning.
 
 ## Version 2.10.10: apply the current BGM choice when generation starts
 
